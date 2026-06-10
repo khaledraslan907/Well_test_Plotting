@@ -253,3 +253,11 @@ Limitations:
 - Operation notes can now be applied to all selected wells or a specific well.
 - This allows different notes at the same time for different wells, such as `Well_1 choke 10%` and `Well_2 choke 50%`.
 - Chart title is smaller and clearer to avoid clipping.
+
+
+## Fixed v18 additions
+
+- Fixes Excel parsing error:
+  - `sequence item X: expected str instance, float found`
+- The parser now safely converts all multi-row header fragments to strings before joining them.
+- This protects files where merged/unit header rows contain numeric values.

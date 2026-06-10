@@ -338,10 +338,14 @@ def build_combined_headers(raw_df: pd.DataFrame, header_row: int, max_header_row
             if part and part.lower() != "nan" and part not in parts:
                 parts.append(part)
 
+        # Safety: some Excel templates may pass numeric/float objects into
+        # the combined header parts through merged or unit rows. Convert again
+        # before joining to avoid: sequence item X: expected str instance, float found.
+        parts = [str(p).strip() for p in parts if str(p).strip() and str(p).strip().lower() != "nan"]
         header = " ".join(parts).strip() or f"Column_{c + 1}"
         # compact repeated whitespace and obvious duplicate fragments
-        header = re.sub(r"\s+", " ", header)
-        headers.append(header)
+        header = re.sub(r"\s+", " ", str(header))
+        headers.append(str(header))
 
     return make_unique(headers), header_rows
 
@@ -353,13 +357,17 @@ def make_unique(names: Iterable[object]) -> List[str]:
     out: List[str] = []
 
     for n in names:
+        # Safety against float/numeric headers from Excel merged/unit rows.
         name = str(n).strip() if str(n).strip() else "unnamed"
+        name = re.sub(r"\s+", " ", name)
+        if name.lower() == "nan":
+            name = "unnamed"
         if name in seen:
             seen[name] += 1
             name = f"{name}.{seen[name]}"
         else:
             seen[name] = 0
-        out.append(name)
+        out.append(str(name))
 
     return out
 
@@ -376,7 +384,7 @@ def table_from_raw(raw_df: pd.DataFrame) -> pd.DataFrame:
     data_start = max(header_rows) + 1
 
     df = raw_df.iloc[data_start:].copy()
-    df.columns = headers[: df.shape[1]]
+    df.columns = [str(h) for h in headers[: df.shape[1]]]
     df = df.dropna(how="all")
     return df
 
