@@ -962,6 +962,9 @@ def guess_well_from_name(name: str) -> Optional[str]:
         m = re.search(pat, s_clean, flags=re.I)
         if m:
             well = normalize_well_name(m.group(1))
+            # Avoid false matches created by spreadsheet column labels plus dates, e.g. "Y2 06-06".
+            if well and re.fullmatch(r"[XYZ]\d+[- ]\d{1,2}[-_/]\d{1,2}", well):
+                continue
             if well:
                 return well
 
@@ -1185,6 +1188,251 @@ def standardize_dataframe(
 
     return out
 
+
+def dataframe_quality_score(df: pd.DataFrame) -> int:
+    """Score parsed tables so the Excel loader can keep the best fallback parse.
+
+    A table with real datetime/time columns and multiple numeric columns should beat
+    a loose headerless parse. This is only used internally to choose between attempts.
+    """
+    if df is None or df.empty:
+        return -10_000
+    numeric_cols = available_numeric_columns(df)
+    if not numeric_cols:
+        return -10_000
+
+    score = len(df) + len(numeric_cols) * 20
+    if "datetime" in df.columns:
+        score += int(pd.to_datetime(df["datetime"], errors="coerce").notna().sum()) * 5
+    if "time_text" in df.columns:
+        score += int(df["time_text"].astype(str).str.strip().ne("").sum()) * 3
+    if any(not str(c).startswith("raw__") for c in numeric_cols):
+        score += 40
+    return score
+
+
+def dataframe_key(df: pd.DataFrame) -> tuple:
+    """Return a loose de-duplication key for repeated parsing attempts."""
+    if df is None or df.empty:
+        return (0, "", "")
+    sheet = str(df["sheet"].iloc[0]) if "sheet" in df.columns and len(df) else ""
+    well = str(df["well"].iloc[0]) if "well" in df.columns and len(df) else ""
+    dt_min = ""
+    dt_max = ""
+    if "datetime" in df.columns:
+        dt = pd.to_datetime(df["datetime"], errors="coerce").dropna()
+        if not dt.empty:
+            dt_min = str(dt.min())
+            dt_max = str(dt.max())
+    return (len(df), sheet, well, dt_min, dt_max)
+
+
+def parse_datetime_value_count(series: pd.Series) -> int:
+    """Count values that contain both date and time information."""
+    parsed = parse_datetime_series(series)
+    raw = series.astype(str).str.strip()
+    raw_has_date_and_time = raw.str.contains(r"\d{1,4}[-/]\d{1,2}[-/]\d{1,4}.*\d{1,2}[:.]\d{2}|\d{1,2}[:.]\d{2}.*\d{1,4}[-/]\d{1,2}[-/]\d{1,4}", regex=True, na=False)
+
+    import datetime as _dt
+    object_has_time = series.map(
+        lambda x: isinstance(x, (pd.Timestamp, _dt.datetime)) and (x.hour != 0 or x.minute != 0 or x.second != 0)
+        if not pd.isna(x) else False
+    )
+    return int((parsed.notna() & (raw_has_date_and_time | object_has_time)).sum())
+
+
+def parse_date_value_count(series: pd.Series) -> int:
+    return int(parse_date_series(series).notna().sum())
+
+
+def parse_time_value_count(series: pd.Series) -> int:
+    parsed = parse_time_series(series)
+    # Treat pure dates parsed as midnight as weak time evidence unless the raw value had ':' or was an Excel time fraction.
+    raw = series.astype(str).str.strip()
+    raw_time_like = raw.str.contains(r"\d{1,2}[:.]\d{2}", regex=True, na=False)
+    excel_fraction_time = series.map(lambda x: isinstance(x, (int, float, np.number)) and not isinstance(x, bool) and 0 <= float(x) < 1 if not pd.isna(x) else False)
+    return int((parsed.notna() & (raw_time_like | excel_fraction_time)).sum())
+
+
+def best_value_column(raw_df: pd.DataFrame, kind: str, exclude: Optional[set] = None) -> Optional[object]:
+    """Detect date/time/datetime columns from cell values, not only from headers."""
+    exclude = exclude or set()
+    best_col = None
+    best_score = 0
+    for col in raw_df.columns:
+        if col in exclude:
+            continue
+        s = raw_df[col].dropna()
+        if s.empty:
+            continue
+        sample = s.head(80)
+        if kind == "datetime":
+            score = parse_datetime_value_count(sample)
+        elif kind == "date":
+            score = parse_date_value_count(sample)
+        else:
+            score = parse_time_value_count(sample)
+        # Require at least two useful values so metadata cells are not mistaken for a series.
+        if score >= 2 and score > best_score:
+            best_score = score
+            best_col = col
+    return best_col
+
+
+def standardize_loose_timeseries(
+    raw_df: pd.DataFrame,
+    source_name: str = "",
+    sheet_name: str = "",
+    default_well: Optional[str] = None,
+) -> pd.DataFrame:
+    """Last-resort Excel parser for sheets whose headers are blank/merged/not recognized.
+
+    It detects date/time columns from the actual values and keeps every numeric column as
+    a raw plotting series. This prevents valid field Excel sheets from being rejected just
+    because their header text does not match the alias list yet.
+    """
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame()
+
+    df = raw_df.copy().dropna(how="all").dropna(axis=1, how="all")
+    if df.empty:
+        return pd.DataFrame()
+
+    # If the first non-empty row is mostly text, use it as labels for nicer raw column names.
+    first_row = df.iloc[0]
+    text_cells = sum((not is_numeric_like(v)) and bool(normalize_text(v)) for v in first_row.tolist())
+    non_empty = sum(bool(normalize_text(v)) for v in first_row.tolist())
+    first_row_is_data = row_looks_like_data(first_row) or (
+        parse_date_value_count(pd.Series(first_row.tolist())) >= 1
+        and parse_time_value_count(pd.Series(first_row.tolist())) >= 1
+        and sum(is_numeric_like(v) for v in first_row.tolist()) >= 1
+    )
+    if not first_row_is_data and non_empty >= 2 and text_cells >= max(2, non_empty // 2):
+        labels = make_unique([safe_text(v) or f"Column_{i + 1}" for i, v in enumerate(first_row.tolist())])
+        df = df.iloc[1:].copy()
+        df.columns = labels[: df.shape[1]]
+    else:
+        df.columns = [f"Column_{i + 1}" for i in range(df.shape[1])]
+
+    df = df.dropna(how="all")
+    if df.empty:
+        return pd.DataFrame()
+
+    datetime_col = best_value_column(df, "datetime")
+    used = set([datetime_col]) if datetime_col is not None else set()
+    date_col = None if datetime_col is not None else best_value_column(df, "date", used)
+    if date_col is not None:
+        used.add(date_col)
+    time_col = best_value_column(df, "time", used)
+    if time_col is not None:
+        used.add(time_col)
+
+    out = pd.DataFrame(index=df.index)
+    out["source"] = source_name
+    out["sheet"] = sheet_name
+    out["well"] = default_well or guess_well_from_name(f"{source_name} {sheet_name}") or "Unknown"
+
+    if datetime_col is not None:
+        out["datetime"] = parse_datetime_series(df[datetime_col])
+    if date_col is not None:
+        out["date"] = parse_date_series(df[date_col]).ffill().bfill()
+    if time_col is not None:
+        parsed_time = parse_time_series(df[time_col])
+        out["time_text"] = parsed_time.dt.strftime("%H:%M")
+        out.loc[parsed_time.isna(), "time_text"] = ""
+    else:
+        parsed_time = None
+
+    if ("datetime" not in out.columns or out["datetime"].isna().all()) and (date_col is not None or time_col is not None):
+        out["datetime"] = combine_date_time(out.get("date"), df[time_col] if time_col is not None else None, out.get("datetime"))
+
+    if "datetime" in out.columns and out["datetime"].notna().any():
+        if "date" not in out.columns:
+            out["date"] = out["datetime"].dt.floor("D")
+        if "time_text" not in out.columns:
+            out["time_text"] = out["datetime"].dt.strftime("%H:%M")
+
+    # Keep all numeric columns except detected date/time columns. Use header labels when possible.
+    for col in df.columns:
+        if col in used:
+            continue
+        nums = df[col].map(extract_number).astype(float)
+        if nums.notna().sum() < 2:
+            continue
+        raw_name = raw_output_column_name(col, out.columns)
+        out[raw_name] = nums
+
+    numeric_cols = [c for c in out.columns if c not in BASE_NON_PLOT_COLS]
+    if not numeric_cols:
+        return pd.DataFrame()
+
+    useful = out[numeric_cols].notna().any(axis=1)
+    if "datetime" in out.columns and out["datetime"].notna().sum() >= 2:
+        useful &= out["datetime"].notna()
+    elif "time_text" in out.columns and out["time_text"].astype(str).str.strip().ne("").sum() >= 2:
+        useful &= out["time_text"].astype(str).str.strip().ne("")
+
+    out = out.loc[useful].copy()
+    if out.empty:
+        return pd.DataFrame()
+
+    if "datetime" in out.columns and "well" in out.columns:
+        out = out.drop_duplicates(subset=["well", "datetime"], keep="first")
+
+    sort_cols = ["well"] + (["datetime"] if "datetime" in out.columns else [])
+    return out.sort_values(sort_cols, na_position="last").reset_index(drop=True)
+
+
+def parse_excel_sheet_attempts(raw: pd.DataFrame, source_name: str, sheet_name: str, default_well: Optional[str]) -> List[pd.DataFrame]:
+    """Try several Excel interpretations and return valid time-series candidates."""
+    attempts: List[pd.DataFrame] = []
+
+    def add_candidate(candidate: pd.DataFrame):
+        if candidate is not None and not candidate.empty and is_valid_timeseries(candidate):
+            attempts.append(candidate)
+
+    # Existing smart multi-row header parser.
+    table = table_from_raw(raw)
+    add_candidate(standardize_dataframe(table, source_name=source_name, sheet_name=sheet_name, default_well=default_well))
+
+    # Common case: Excel already has a simple first-row header. Try it explicitly.
+    df0 = raw.copy().dropna(how="all").dropna(axis=1, how="all")
+    if not df0.empty and len(df0) >= 2:
+        headers = make_unique([safe_text(v) or f"Column_{i + 1}" for i, v in enumerate(df0.iloc[0].tolist())])
+        direct = df0.iloc[1:].copy()
+        direct.columns = headers[: direct.shape[1]]
+        add_candidate(standardize_dataframe(direct, source_name=source_name, sheet_name=sheet_name, default_well=default_well))
+
+    # Scan possible header rows. This helps when title/metadata rows are above the actual table.
+    max_scan = min(60, len(raw))
+    for header_row in range(max_scan):
+        row = raw.iloc[header_row]
+        if row_looks_like_data(row):
+            continue
+        score = header_score(row)
+        if score < 4:
+            continue
+        candidate_raw = raw.iloc[header_row:].dropna(how="all").dropna(axis=1, how="all")
+        if candidate_raw.empty or len(candidate_raw) < 3:
+            continue
+        headers = make_unique([safe_text(v) or f"Column_{i + 1}" for i, v in enumerate(candidate_raw.iloc[0].tolist())])
+        candidate = candidate_raw.iloc[1:].copy()
+        candidate.columns = headers[: candidate.shape[1]]
+        add_candidate(standardize_dataframe(candidate, source_name=source_name, sheet_name=sheet_name, default_well=default_well))
+
+    # Last-resort value-based parser. This catches headerless or unrecognized templates.
+    add_candidate(standardize_loose_timeseries(raw, source_name=source_name, sheet_name=sheet_name, default_well=default_well))
+
+    # De-duplicate and keep the strongest parse for this sheet.
+    unique: Dict[tuple, pd.DataFrame] = {}
+    for cand in attempts:
+        key = dataframe_key(cand)
+        if key not in unique or dataframe_quality_score(cand) > dataframe_quality_score(unique[key]):
+            unique[key] = cand
+
+    return sorted(unique.values(), key=dataframe_quality_score, reverse=True)
+
+
 def is_valid_timeseries(df: pd.DataFrame) -> bool:
     if df is None or df.empty:
         return False
@@ -1317,10 +1565,15 @@ def load_tabular_file(uploaded_file) -> List[pd.DataFrame]:
         for sheet in xls.sheet_names:
             raw = pd.read_excel(xls, sheet_name=sheet, header=None)
             default_well = extract_well_from_raw(raw, source_name=name, sheet_name=sheet)
-            table = table_from_raw(raw)
-            std = standardize_dataframe(table, source_name=name, sheet_name=sheet, default_well=default_well)
-            if is_valid_timeseries(std):
-                tables.append(std)
+            sheet_candidates = parse_excel_sheet_attempts(
+                raw,
+                source_name=name,
+                sheet_name=sheet,
+                default_well=default_well,
+            )
+            if sheet_candidates:
+                # Keep only the best interpretation for each sheet to avoid duplicate plots.
+                tables.append(sheet_candidates[0])
 
         tables = filter_preferred_tables(tables)
 
