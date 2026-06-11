@@ -1,5 +1,6 @@
 
 import re
+import warnings
 from typing import Dict, Iterable, List, Optional
 
 import numpy as np
@@ -500,6 +501,8 @@ def best_canonical_name(column_name: str) -> Optional[str]:
         return "date"
     if re.fullmatch(r"(time|test time|hour|hh:mm:ss?|hh mm)", c) or ("time" in c and ("hh:mm" in c or "hh mm" in c)):
         return "time"
+    if c in {"hhmm", "hh mm", "time hh mm", "time hh:mm"}:
+        return "time"
 
     if re.fullmatch(r"well( name| no\.?)?", c) or c in {"well_name", "wellname"}:
         return "well"
@@ -544,7 +547,7 @@ def best_canonical_name(column_name: str) -> Optional[str]:
         return "gross_rate_bpd"
 
     # Fluid properties before rates because parent words can include "oil".
-    if "bs and w" in c or "bs&w" in original or "bsw" in c or "water cut" in c or re.fullmatch(r"wc %?", c):
+    if "bs and w" in c or "bs&w" in original or "bsw" in c or "water cut" in c or "watercut" in c or re.fullmatch(r"wc %?", c):
         return "bsw_pct"
     if "fw" == c or re.fullmatch(r"fw %?", c) or " lab data fw " in f" {c} ":
         return "fw_pct"
@@ -749,7 +752,9 @@ def parse_date_series(series: pd.Series) -> pd.Series:
             return pd.Timestamp(x.date())
         if isinstance(x, _dt.date):
             return pd.Timestamp(x)
-        return pd.to_datetime(x, errors="coerce", dayfirst=True)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            return pd.to_datetime(x, errors="coerce", dayfirst=True)
 
     return series.map(one)
 
@@ -781,7 +786,9 @@ def parse_time_series(series: pd.Series) -> pd.Series:
             ss = int(m.group(3) or 0)
             return pd.Timestamp("1900-01-01") + pd.Timedelta(hours=hh, minutes=mm, seconds=ss)
 
-        return pd.to_datetime(s, errors="coerce")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            return pd.to_datetime(s, errors="coerce")
 
     return series.map(one)
 
@@ -789,14 +796,21 @@ def parse_time_series(series: pd.Series) -> pd.Series:
 
 
 def parse_datetime_series(series: pd.Series) -> pd.Series:
-    """Parse mixed datetime values safely. ISO yyyy-mm-dd strings should not use dayfirst=True."""
+    """Parse mixed datetime values safely without flooding Streamlit logs with pandas warnings.
+
+    ISO yyyy-mm-dd strings must not use dayfirst=True. Other field formats such
+    as 10-06-2026 are parsed with dayfirst=True. Any unparseable values become NaT.
+    """
     out = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
     str_s = series.astype(str).str.strip()
     iso_mask = str_s.str.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}", na=False)
-    if iso_mask.any():
-        out.loc[iso_mask] = pd.to_datetime(series.loc[iso_mask], errors="coerce", dayfirst=False)
-    if (~iso_mask).any():
-        out.loc[~iso_mask] = pd.to_datetime(series.loc[~iso_mask], errors="coerce", dayfirst=True)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        if iso_mask.any():
+            out.loc[iso_mask] = pd.to_datetime(series.loc[iso_mask], errors="coerce", dayfirst=False)
+        if (~iso_mask).any():
+            out.loc[~iso_mask] = pd.to_datetime(series.loc[~iso_mask], errors="coerce", dayfirst=True)
     return out
 
 def combine_date_time(
@@ -1104,11 +1118,22 @@ def standardize_dataframe(
         else:
             out[canon] = clean_numeric_series(df[col], canon)
 
-    # Fallback: keep all numeric columns not yet recognized by aliases.
-    # This makes unseen company templates usable immediately; user can still plot
-    # the raw columns while we later add clean aliases.
+    # Fallback: keep numeric columns not yet recognized by aliases only when the
+    # table is mostly unknown. If a TMU template already produced many canonical
+    # fields (WHP, FLP, Sep P, Gas rate, Oil rate, etc.), keeping every extra
+    # helper/calculation/unit column creates confusing labels such as
+    # "Raw: Column" or "Raw: Psig" and can even cause the Excel loader to choose
+    # a lower-quality unit-row parse. Unknown templates still get raw columns.
+    mapped_numeric_count = sum(
+        1 for canon, _ in mapping
+        if canon not in {"well", "date", "time", "datetime", "note"}
+    )
+    keep_raw_fallback = mapped_numeric_count < 6
+
     for col in df.columns:
         if col in mapped_source_cols:
+            continue
+        if not keep_raw_fallback:
             continue
         if not is_useful_raw_numeric_column(col, df[col]):
             continue
@@ -1197,26 +1222,67 @@ def standardize_dataframe(
 
 
 def dataframe_quality_score(df: pd.DataFrame) -> int:
-    """Score parsed tables so the Excel loader can keep the best fallback parse.
+    """Score parsed tables so the Excel loader keeps the real operational table.
 
-    A table with real datetime/time columns and multiple numeric columns should beat
-    a loose headerless parse. This is only used internally to choose between attempts.
+    The old scoring over-valued the number of numeric columns. In wide TMU
+    spreadsheets, a bad unit-row parse can create dozens of raw columns such as
+    raw__psig/raw__column and beat the proper multi-row header parse. This scorer
+    now strongly prefers:
+      - recognized canonical TMU columns,
+      - real calendar datetimes (not 1900 time-only placeholders),
+      - date + time together,
+      - fewer raw fallback columns.
     """
     if df is None or df.empty:
         return -10_000
+
     numeric_cols = available_numeric_columns(df)
     if not numeric_cols:
         return -10_000
 
-    score = len(df) + len(numeric_cols) * 20
-    if "datetime" in df.columns:
-        score += int(pd.to_datetime(df["datetime"], errors="coerce").notna().sum()) * 5
-    if "time_text" in df.columns:
-        score += int(df["time_text"].astype(str).str.strip().ne("").sum()) * 3
-    if any(not str(c).startswith("raw__") for c in numeric_cols):
-        score += 40
-    return score
+    canonical_cols = [c for c in numeric_cols if not str(c).startswith("raw__")]
+    raw_cols = [c for c in numeric_cols if str(c).startswith("raw__")]
 
+    score = 0
+    score += min(len(df), 500) * 4
+    score += len(canonical_cols) * 300
+    score += len(raw_cols) * 5
+
+    # Penalize raw-only parses. They are useful as a fallback, but should not win
+    # over a table where columns have been identified as WHP, FLP, gas rate, etc.
+    if not canonical_cols:
+        score -= 700
+    if raw_cols and len(raw_cols) > max(5, len(canonical_cols) * 2):
+        score -= (len(raw_cols) - max(5, len(canonical_cols) * 2)) * 20
+
+    if "datetime" in df.columns:
+        dt = pd.to_datetime(df["datetime"], errors="coerce")
+        valid_dt = dt.dropna()
+        score += int(valid_dt.size) * 12
+        real_dt_count = int((valid_dt.dt.year > 1970).sum()) if not valid_dt.empty else 0
+        score += real_dt_count * 45
+        # Time-only fallback creates dates around 1900. It can be plotted, but it
+        # must never beat a parse with real file dates.
+        if valid_dt.size and real_dt_count == 0:
+            score -= 900
+
+    if "date" in df.columns:
+        dates = pd.to_datetime(df["date"], errors="coerce").dropna()
+        real_date_count = int((dates.dt.year > 1970).sum()) if not dates.empty else 0
+        score += real_date_count * 25
+
+    if "time_text" in df.columns:
+        score += int(df["time_text"].astype(str).str.strip().ne("").sum()) * 5
+
+    # Prefer the common field-test columns that users expect to see by name.
+    priority_cols = {
+        "choke_pct", "whp_psi", "flp_psi", "flt_c", "sep_p_psi",
+        "gas_rate_mmscfd", "oil_rate_stbd", "water_rate_bpd", "gross_rate_bpd",
+        "bsw_pct", "salinity_kppm",
+    }
+    score += sum(1 for c in priority_cols if c in df.columns) * 150
+
+    return int(score)
 
 def dataframe_key(df: pd.DataFrame) -> tuple:
     """Return a loose de-duplication key for repeated parsing attempts."""
