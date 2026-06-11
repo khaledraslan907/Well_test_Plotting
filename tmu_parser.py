@@ -804,6 +804,14 @@ def combine_date_time(
     time_series: Optional[pd.Series] = None,
     datetime_series: Optional[pd.Series] = None,
 ) -> pd.Series:
+    """Build a real datetime column from any available date/time inputs.
+
+    Important fix: Excel files often contain monthly/daily production history with a
+    Date column only and no separate Time column. Older versions returned all NaT
+    when time_series was missing, causing duplicate-removal to collapse the whole
+    sheet into one row and the workbook was rejected as "no usable time-series".
+    Date-only rows are now valid readings at midnight (00:00).
+    """
     idx = None
     for s in [date_series, time_series, datetime_series]:
         if s is not None:
@@ -814,30 +822,28 @@ def combine_date_time(
         return pd.Series(dtype="datetime64[ns]")
 
     if datetime_series is not None:
-        dt = pd.to_datetime(datetime_series, errors="coerce", dayfirst=True)
+        dt = parse_datetime_series(datetime_series)
     else:
-        dt = pd.Series(pd.NaT, index=idx)
+        dt = pd.Series(pd.NaT, index=idx, dtype="datetime64[ns]")
 
-    if date_series is None or time_series is None:
-        return dt
-
-    dates = parse_date_series(date_series)
-    times = parse_time_series(time_series)
+    dates = parse_date_series(date_series) if date_series is not None else pd.Series(pd.NaT, index=idx, dtype="datetime64[ns]")
+    times = parse_time_series(time_series) if time_series is not None else pd.Series(pd.NaT, index=idx, dtype="datetime64[ns]")
 
     out = []
     for d, t, existing in zip(dates, times, dt):
         if pd.notna(existing):
-            out.append(existing)
+            out.append(pd.Timestamp(existing))
         elif pd.notna(d) and pd.notna(t):
             out.append(pd.Timestamp(d.date()) + pd.Timedelta(hours=t.hour, minutes=t.minute, seconds=t.second))
         elif pd.notna(d):
+            # Date-only production-history sheets are valid time series.
             out.append(pd.Timestamp(d.date()))
         elif pd.notna(t):
             out.append(pd.Timestamp("1900-01-01") + pd.Timedelta(hours=t.hour, minutes=t.minute, seconds=t.second))
         else:
             out.append(pd.NaT)
 
-    return pd.Series(out, index=idx)
+    return pd.Series(out, index=idx, dtype="datetime64[ns]")
 
 
 
@@ -1179,7 +1185,8 @@ def standardize_dataframe(
 
     # Remove duplicate readings at the same well/datetime. This also cleans old dashboard-exported CSVs
     # that may contain a duplicated Final Average row with a copied timestamp.
-    if "datetime" in out.columns and "well" in out.columns:
+    if "datetime" in out.columns and "well" in out.columns and out["datetime"].notna().any():
+        # Do not let all-NaT datetimes collapse a valid table to one row.
         out = out.drop_duplicates(subset=["well", "datetime"], keep="first")
 
     out["well"] = out["well"].astype(str).str.strip().replace("", "Unknown")
@@ -1376,7 +1383,8 @@ def standardize_loose_timeseries(
     if out.empty:
         return pd.DataFrame()
 
-    if "datetime" in out.columns and "well" in out.columns:
+    if "datetime" in out.columns and "well" in out.columns and out["datetime"].notna().any():
+        # Do not let all-NaT datetimes collapse a valid table to one row.
         out = out.drop_duplicates(subset=["well", "datetime"], keep="first")
 
     sort_cols = ["well"] + (["datetime"] if "datetime" in out.columns else [])
