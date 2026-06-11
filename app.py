@@ -1,8 +1,10 @@
 
 import io
+import json
 import re
 import zipfile
 import traceback
+from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -11,10 +13,13 @@ import streamlit as st
 
 from tmu_parser import (
     apply_fill_method,
+    apply_user_column_mappings,
     available_numeric_columns,
+    canonical_key,
     column_label,
     load_tabular_file,
     parse_many_tmu_messages,
+    standard_column_options,
 )
 
 
@@ -107,6 +112,116 @@ st.set_page_config(
 
 MIN_DATE_ALLOWED = pd.Timestamp("1900-01-01").date()
 MAX_DATE_ALLOWED = pd.Timestamp("2100-12-31").date()
+
+# User-taught column aliases are stored beside app.py. This makes the app learn
+# new company abbreviations without editing Python code every time.
+USER_ALIAS_FILE = Path(__file__).with_name("user_column_aliases.json")
+
+
+def load_saved_aliases() -> dict:
+    try:
+        if USER_ALIAS_FILE.exists():
+            data = json.loads(USER_ALIAS_FILE.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def save_aliases(alias_map: dict) -> None:
+    safe = {str(k): str(v) for k, v in alias_map.items() if v and v != "__keep__"}
+    USER_ALIAS_FILE.write_text(json.dumps(safe, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def alias_display_name(key: str, labels: dict) -> str:
+    if key == "__keep__":
+        return "Keep as detected"
+    if key == "__drop__":
+        return "Ignore / hide this column"
+    return labels.get(key, key)
+
+
+def editable_column_mapping_panel(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """Interactive review step that lets users teach new column names.
+
+    The parser still auto-detects columns first.  This panel is the safety net for
+    any new company abbreviation, such as Pi, Pd, AMp, Freq, Ti, Tm, Vx, etc.
+    """
+    saved_aliases = load_saved_aliases()
+    labels = standard_column_options(include_meta=False)
+    options = ["__keep__", "__drop__"] + list(labels.keys())
+
+    # Apply already-saved aliases immediately.
+    df_after_saved = apply_user_column_mappings(df, saved_aliases)
+
+    numeric = available_numeric_columns(df_after_saved)
+    raw_cols = [c for c in numeric if str(c).startswith("raw__")]
+
+    with st.expander("Column mapping review / teach new names", expanded=bool(raw_cols)):
+        st.caption(
+            "Use this when a new customer template has abbreviations the parser has not seen before. "
+            "Map Raw columns to standard fields, then save the aliases so future uploads are detected automatically."
+        )
+
+        if saved_aliases:
+            st.success(f"Loaded {len(saved_aliases)} saved column alias(es).")
+
+        show_all = st.checkbox(
+            "Show all numeric columns, not only Raw unknown columns",
+            value=False,
+            help="Normally you only need to map Raw columns. Use this to override any auto-detected column.",
+        )
+
+        cols_to_review = numeric if show_all else raw_cols
+        runtime_aliases = {}
+
+        if not cols_to_review:
+            st.info("No unknown Raw numeric columns were found in this upload. The parser recognized the detected plot columns.")
+        else:
+            st.write("Map detected upload columns to standard app fields:")
+            for col in cols_to_review:
+                current_saved = saved_aliases.get(str(col)) or saved_aliases.get(canonical_key(col)) or "__keep__"
+                if current_saved not in options:
+                    current_saved = "__keep__"
+                selected = st.selectbox(
+                    f"{column_label(col)}  →",
+                    options,
+                    index=options.index(current_saved),
+                    format_func=lambda x, labels=labels: alias_display_name(x, labels),
+                    key=f"map_col_{canonical_key(col)}",
+                )
+                if selected != "__keep__":
+                    # Store both the current parsed column name and its normalized alias key.
+                    runtime_aliases[str(col)] = selected
+                    runtime_aliases[canonical_key(col)] = selected
+
+        applied_aliases = {**saved_aliases, **runtime_aliases}
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            if st.button("Save mappings for future uploads", disabled=not applied_aliases):
+                save_aliases(applied_aliases)
+                st.success("Saved. These aliases will be applied automatically on the next upload.")
+        with c2:
+            if st.button("Clear saved mappings", disabled=not USER_ALIAS_FILE.exists()):
+                try:
+                    USER_ALIAS_FILE.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                st.success("Saved aliases cleared. Refresh or upload again to reload clean detection.")
+        with c3:
+            st.caption(f"Alias file: {USER_ALIAS_FILE.name}")
+
+        if applied_aliases:
+            preview_rows = []
+            for k, v in sorted(applied_aliases.items()):
+                if k.startswith("raw__") or k in [canonical_key(c) for c in cols_to_review]:
+                    preview_rows.append({"Alias/header key": k, "Mapped to": alias_display_name(v, labels)})
+            if preview_rows:
+                st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, height=160)
+
+    df_final = apply_user_column_mappings(df_after_saved, runtime_aliases)
+    return df_final, {**saved_aliases, **runtime_aliases}
 
 
 def parse_time_value(typed_text, fallback_time):
@@ -344,6 +459,9 @@ if "datetime" in data.columns:
     data["datetime"] = pd.to_datetime(data["datetime"], errors="coerce")
 if "date" in data.columns:
     data["date"] = pd.to_datetime(data["date"], errors="coerce")
+
+# Learn/apply user mappings before feature lists and plots are built.
+data, active_column_aliases = editable_column_mapping_panel(data)
 
 
 def parse_manual_events(text, reference_start=None):
@@ -622,7 +740,7 @@ with st.expander("Detected columns from uploaded files", expanded=False):
     if any(str(c).startswith("raw__") for c in numeric_cols):
         st.info(
             "Raw fallback columns mean the parser found a numeric time-series column but did not know its header alias yet. "
-            "The column is still plottable, but add its header text to best_canonical_name() if you want a standard label."
+            "Use the Column mapping review panel above to map it once and save the alias for future uploads."
         )
 
 # Sidebar filters
