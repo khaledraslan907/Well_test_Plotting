@@ -272,7 +272,7 @@ st.markdown(
 )
 
 st.title("TMU Production Test Dashboard")
-st.caption("Parser build: v19")
+st.caption("Parser build: v20 Excel fallback")
 st.caption(
     "Upload Excel / CSV / Word / PDF files, paste WhatsApp reports, clean the data, compare wells, "
     "and export clear production-test plots."
@@ -316,7 +316,7 @@ if uploaded_files:
             if parsed_tables:
                 frames.extend(parsed_tables)
             else:
-                errors.append(f"{f.name}: no usable time-series table detected")
+                errors.append(f"{f.name}: no usable time-series table detected. The file may be blank, or it has no date/time plus numeric readings after all Excel fallback parsers were tried.")
         except Exception as e:
             errors.append(f"{f.name}: {e}")
             with st.expander(f"Technical error details for {f.name}", expanded=False):
