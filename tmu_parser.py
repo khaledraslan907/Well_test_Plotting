@@ -101,6 +101,19 @@ COLUMN_LABELS = {
     "water_sg": "Water SG",
     "water_ph": "Water pH",
     "pump_freq_hz": "Pump Frequency (Hz)",
+    "pump_intake_pressure_psi": "Pi / Intake Pressure (psi)",
+    "pump_discharge_pressure_psi": "Pd / Discharge Pressure (psi)",
+    "motor_current_amp": "Motor Current (A)",
+    "motor_ama_amp": "AMA / Motor Current (A)",
+    "intake_temp_c": "Intake Temperature (°C)",
+    "intake_temp_f": "Intake Temperature (°F)",
+    "motor_temp_c": "Motor Temperature (°C)",
+    "motor_temp_f": "Motor Temperature (°F)",
+    "motor_load_pct": "Motor Load (%)",
+    "vibration_x": "Vibration X",
+    "vibration_y": "Vibration Y",
+    "vibration_z": "Vibration Z",
+    "drive_freq_hz": "Drive Frequency (Hz)",
     "us_press_psi": "Upstream Pressure (psi)",
     "us_temp_c": "Upstream Temp (°C)",
     "ds_press_psi": "Downstream Pressure (psi)",
@@ -148,6 +161,32 @@ def clean_header(s: object) -> str:
     s = re.sub(r"[^a-z0-9/%.\- =]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
+
+def canonical_key(s: object) -> str:
+    """Normalize a user/company header into a stable alias key.
+
+    This is used by the Streamlit column-mapping UI.  Example:
+    "W.H.P (psig)" and "WHP psig" become comparable keys.
+    """
+    c = clean_header(s)
+    c = c.replace(" and ", " ")
+    c = re.sub(r"[^a-z0-9]+", "_", c).strip("_")
+    return c
+
+
+def standard_column_options(include_meta: bool = False) -> Dict[str, str]:
+    """Return canonical parser fields for the user-facing mapping UI."""
+    labels = dict(COLUMN_LABELS)
+    if include_meta:
+        labels.update({
+            "well": "Well Name",
+            "date": "Date",
+            "time": "Time",
+            "datetime": "Date & Time",
+            "note": "Note / Event",
+        })
+    return dict(sorted(labels.items(), key=lambda kv: kv[1].lower()))
 
 
 def is_datetime_like(x: object) -> bool:
@@ -478,6 +517,14 @@ def canonical_candidate_score(canon: str, column_name: str) -> int:
         score += 20
     if canon == "datetime" and ("date" in c and "time" in c):
         score += 20
+    if canon == "pump_intake_pressure_psi" and re.search(r"\b(pi|intake)\b", c):
+        score += 30
+    if canon == "pump_discharge_pressure_psi" and re.search(r"\b(pd|discharge|disch)\b", c):
+        score += 30
+    if canon == "motor_current_amp" and ("amp" in c or "current" in c or re.fullmatch(r"cur\.?", c)):
+        score += 30
+    if canon == "pump_freq_hz" and ("freq" in c or "hz" in c):
+        score += 30
 
     if canon in {"oil_rate_stbd", "water_rate_bpd", "gross_rate_bpd", "gas_rate_mmscfd"}:
         if "cum" in c or "volume" in c:
@@ -628,6 +675,39 @@ def best_canonical_name(column_name: str) -> Optional[str]:
         return "gross_rate_bpd"
     if re.search(r"\brate\b", c) and "bbl/d" in c and "oil" not in c and "gas" not in c and "gross" not in c:
         return "water_rate_bpd"
+
+    # ESP / artificial-lift short aliases.  These are intentionally handled
+    # before generic pressure/temperature rules because headers like Pi/Pd/Amp/Freq
+    # are short and may otherwise remain raw fallback columns.  The strict fullmatch
+    # rules avoid misclassifying broad text.
+    if re.fullmatch(r"(pi|p/i|p int|pint|pump intake p|pump intake pressure|intake pressure|intake p|pin|pi psi|pi psig)", c):
+        return "pump_intake_pressure_psi"
+    if re.fullmatch(r"(pd|p/d|p dis|pdis|pump discharge p|pump discharge pressure|discharge pressure|disch pressure|discharge p|pd psi|pd psig)", c):
+        return "pump_discharge_pressure_psi"
+    if re.fullmatch(r"(amp|amps|ampere|amperage|current|motor current|pump current|run current|cur|cur\.?|i)", c) or ("amp" in c and "temp" not in c):
+        return "motor_current_amp"
+    if re.fullmatch(r"(ama|a m a)", c):
+        return "motor_ama_amp"
+    if re.fullmatch(r"(freq|frequency|hz|run freq|run frequency|operating freq|operating frequency|pump freq|pump frequency)", c):
+        return "pump_freq_hz"
+    if re.fullmatch(r"(drive freq|drive frequency|vsd freq|vfd freq|vfd frequency|speed hz)", c):
+        return "drive_freq_hz"
+    if re.fullmatch(r"(ti|t/i|intake temp|intake temperature|pump intake temp|pump intake temperature|ti c|ti deg c)", c):
+        return "intake_temp_c"
+    if re.fullmatch(r"(ti f|ti deg f|intake temp f|intake temperature f)", c):
+        return "intake_temp_f"
+    if re.fullmatch(r"(tm|t/m|motor temp|motor temperature|motor winding temp|tm c|tm deg c)", c):
+        return "motor_temp_c"
+    if re.fullmatch(r"(tm f|tm deg f|motor temp f|motor temperature f)", c):
+        return "motor_temp_f"
+    if re.fullmatch(r"(motor load|load pct|load %|motor load %)", c):
+        return "motor_load_pct"
+    if re.fullmatch(r"(vx|vib x|vibration x|x vibration)", c):
+        return "vibration_x"
+    if re.fullmatch(r"(vy|vib y|vibration y|y vibration)", c):
+        return "vibration_y"
+    if re.fullmatch(r"(vz|vib z|vibration z|z vibration)", c):
+        return "vibration_z"
 
     # Pressures / DP.
     if re.search(r"\bflp\b|flow line pressure|flowline pressure", c):
@@ -1935,6 +2015,54 @@ def apply_fill_method(df: pd.DataFrame, numeric_cols: List[str], method: str) ->
             pieces.append(g)
         out = pd.concat(pieces, ignore_index=True)
 
+    return out
+
+
+def apply_user_column_mappings(df: pd.DataFrame, mapping: Optional[Dict[str, str]] = None) -> pd.DataFrame:
+    """Apply user-confirmed column mappings after auto parsing.
+
+    mapping keys may be actual DataFrame column names (for example raw__amp) or
+    normalized alias keys from canonical_key(). Values are canonical parser names
+    such as motor_current_amp, pump_intake_pressure_psi, or the special value
+    __drop__ to hide a column.
+
+    If target already exists, non-null values from the source fill gaps only; this
+    prevents a manual alias from overwriting a stronger auto-detected column.
+    """
+    if df is None or df.empty or not mapping:
+        return df
+
+    out = df.copy()
+    options = standard_column_options(include_meta=False)
+    drop_cols = []
+
+    for col in list(out.columns):
+        key_candidates = [str(col), canonical_key(col)]
+        target = None
+        for key in key_candidates:
+            if key in mapping:
+                target = mapping.get(key)
+                break
+        if not target or target in {"__keep__", "Keep as-is"}:
+            continue
+        if target == "__drop__":
+            drop_cols.append(col)
+            continue
+        if target not in options:
+            continue
+        if col in BASE_NON_PLOT_COLS:
+            continue
+
+        vals = clean_numeric_series(out[col], target)
+        if target in out.columns:
+            out[target] = pd.to_numeric(out[target], errors="coerce").combine_first(vals)
+        else:
+            out[target] = vals
+        if col != target:
+            drop_cols.append(col)
+
+    if drop_cols:
+        out = out.drop(columns=[c for c in drop_cols if c in out.columns], errors="ignore")
     return out
 
 

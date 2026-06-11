@@ -11,16 +11,144 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
-from tmu_parser import (
-    apply_fill_method,
-    apply_user_column_mappings,
-    available_numeric_columns,
-    canonical_key,
-    column_label,
-    load_tabular_file,
-    parse_many_tmu_messages,
-    standard_column_options,
-)
+# Import parser module safely.  Streamlit Cloud often shows a redacted ImportError
+# if app.py was updated but tmu_parser.py is still an older file.  This block keeps
+# the app running and shows a clear message instead of a redacted crash.
+try:
+    import tmu_parser as _tmu_parser
+except Exception as _parser_import_error:
+    st.set_page_config(page_title="TMU Production Test Dashboard", page_icon="📈", layout="wide")
+    st.error("Could not import tmu_parser.py. Make sure app.py and tmu_parser.py are in the same folder and were both updated from the same ZIP package.")
+    st.code("""
+Required files in the same folder:
+- app.py
+- tmu_parser.py
+- requirements.txt
+
+On Streamlit Cloud: commit/push all three files, then reboot the app.
+""".strip())
+    st.exception(_parser_import_error)
+    st.stop()
+
+# Required parser functions from every supported parser build.
+_missing_required = [
+    name for name in [
+        "apply_fill_method", "available_numeric_columns", "column_label",
+        "load_tabular_file", "parse_many_tmu_messages",
+    ]
+    if not hasattr(_tmu_parser, name)
+]
+if _missing_required:
+    st.set_page_config(page_title="TMU Production Test Dashboard", page_icon="📈", layout="wide")
+    st.error("Your tmu_parser.py is older than app.py. Update tmu_parser.py from the latest package.")
+    st.code("Missing parser functions: " + ", ".join(_missing_required))
+    st.stop()
+
+apply_fill_method = _tmu_parser.apply_fill_method
+available_numeric_columns = _tmu_parser.available_numeric_columns
+column_label = _tmu_parser.column_label
+load_tabular_file = _tmu_parser.load_tabular_file
+parse_many_tmu_messages = _tmu_parser.parse_many_tmu_messages
+
+
+def canonical_key(s: object) -> str:
+    """Stable normalized key for user-taught aliases.
+
+    Local fallback is kept here so the generic mapping panel still works if an
+    older parser file is accidentally deployed.
+    """
+    if hasattr(_tmu_parser, "canonical_key"):
+        return _tmu_parser.canonical_key(s)
+    txt = "" if s is None else str(s).strip().lower()
+    txt = txt.replace("&", " and ")
+    txt = re.sub(r"[^a-z0-9]+", "_", txt)
+    return re.sub(r"_+", "_", txt).strip("_")
+
+
+def standard_column_options(include_meta: bool = False) -> dict:
+    """Return standard fields available in the mapping dropdown."""
+    if hasattr(_tmu_parser, "standard_column_options"):
+        return _tmu_parser.standard_column_options(include_meta=include_meta)
+
+    labels = dict(getattr(_tmu_parser, "COLUMN_LABELS", {}))
+    # Fallback list for older parser builds.  These are safe internal names used
+    # by this app; users can map new customer abbreviations to any of them.
+    labels.update({
+        "choke_pct": "Choke (%)",
+        "choke_size_64": "Choke Size (64ths)",
+        "whp_psi": "WHP (psi)",
+        "flp_psi": "FLP (psi)",
+        "flow_press_psi": "Flow Pressure (psi)",
+        "flow_temp_c": "Flow Temp (°C)",
+        "sep_p_psi": "Separator Pressure (psi)",
+        "pumping_pressure_psi": "Pumping Pressure (psi)",
+        "gas_rate_mmscfd": "Total Gas Rate (MMSCF/D)",
+        "gas_formation_mmscfd": "Formation Gas Rate (MMSCF/D)",
+        "gross_rate_bpd": "Gross Rate (BBL/D)",
+        "oil_rate_stbd": "Oil Rate (STB/D)",
+        "water_rate_bpd": "Water Rate (BBL/D)",
+        "bsw_pct": "BS&W (%)",
+        "wlr_s_pct": "WLR (%)",
+        "salinity_kppm": "Salinity (K ppm NaCl)",
+        "gor_scf_bbl": "GOR (scf/bbl)",
+        "h2s_ppm": "H2S (ppm)",
+        "co2_mole_pct": "CO2 (mole %)",
+        "oil_api": "Oil Gravity (API)",
+        "gas_sg": "Gas Specific Gravity",
+        "pump_freq_hz": "Pump Frequency (Hz)",
+        "motor_current_amp": "Motor Current (A)",
+        "ama_current_amp": "AMA / Motor Current (A)",
+        "pi_psi": "Pi / Intake Pressure (psi)",
+        "pd_psi": "Pd / Discharge Pressure (psi)",
+        "ti_f": "Ti / Intake Temperature (°F)",
+        "tm_f": "Tm / Motor Temperature (°F)",
+        "vx": "Vibration X",
+        "vy": "Vibration Y",
+        "vz": "Vibration Z",
+    })
+    if include_meta:
+        labels.update({"well": "Well", "date": "Date", "time": "Time", "datetime": "Date/Time"})
+    return dict(sorted(labels.items(), key=lambda kv: kv[1].lower()))
+
+
+def _to_numeric_for_mapping(series: pd.Series) -> pd.Series:
+    """Convert mapped raw numeric columns safely."""
+    return pd.to_numeric(
+        series.astype(str)
+        .str.replace(",", "", regex=False)
+        .str.replace("%", "", regex=False)
+        .str.extract(r"([-+]?\d+(?:\.\d+)?)", expand=False),
+        errors="coerce",
+    )
+
+
+def apply_user_column_mappings(df: pd.DataFrame, mapping: dict | None = None) -> pd.DataFrame:
+    """Apply user-taught aliases; fallback for older parser builds."""
+    if hasattr(_tmu_parser, "apply_user_column_mappings"):
+        return _tmu_parser.apply_user_column_mappings(df, mapping)
+
+    if not mapping or df is None or df.empty:
+        return df
+    out = df.copy()
+    drop_cols = []
+    for col in list(out.columns):
+        target = mapping.get(str(col)) or mapping.get(canonical_key(col))
+        if not target or target == "__keep__":
+            continue
+        if target == "__drop__":
+            drop_cols.append(col)
+            continue
+        if col == target:
+            continue
+        vals = _to_numeric_for_mapping(out[col])
+        if target in out.columns:
+            out[target] = pd.to_numeric(out[target], errors="coerce").combine_first(vals)
+        else:
+            out[target] = vals
+        drop_cols.append(col)
+    if drop_cols:
+        out = out.drop(columns=[c for c in drop_cols if c in out.columns], errors="ignore")
+    return out
 
 
 FEATURE_COLORS = {
