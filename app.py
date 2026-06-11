@@ -1830,6 +1830,102 @@ if selected_features and not filtered.empty:
         zip_buffer.seek(0)
         return zip_buffer.getvalue()
 
+
+    def plotly_static_image_bytes(fig_obj, fmt, width, height, scale=1):
+        """Return Plotly static-image bytes, or (None, error_message) if Kaleido/Chrome is unavailable."""
+        try:
+            kwargs = {"format": fmt, "width": width, "height": height}
+            if fmt == "png":
+                kwargs["scale"] = scale
+            return fig_obj.to_image(**kwargs), None
+        except Exception as e:
+            return None, str(e)
+
+
+    def matplotlib_overview_export_bytes(df, features, fmt="png"):
+        """Kaleido-free fallback for PNG/PDF export.
+
+        It creates a static report-style chart directly with Matplotlib, so the
+        dashboard can still export PNG/PDF on machines where Plotly Kaleido or
+        Chrome is not installed.
+        """
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+
+        if df.empty or not features:
+            raise ValueError("No filtered data/features available for export.")
+
+        series_values = sorted(df["series_label"].dropna().astype(str).unique()) if "series_label" in df.columns else (
+            sorted(df["well"].dropna().astype(str).unique()) if "well" in df.columns else ["All"]
+        )
+
+        n_features = max(1, len(features))
+        n_points = max_points_per_trace(df)
+        width_in = max(16.0, min(30.0, n_points * 0.20))
+        height_in = max(7.0, 3.9 * n_features)
+        fig_m, axes = plt.subplots(n_features, 1, figsize=(width_in, height_in), dpi=170, squeeze=False)
+        axes = axes.flatten()
+        fig_m.suptitle(chart_title_from_data(df), fontsize=20, fontweight="bold", y=0.995)
+
+        for ax, feature in zip(axes, features):
+            for wi, series_label in enumerate(series_values):
+                group_col = "series_label" if "series_label" in df.columns else "well"
+                g = df[df[group_col].astype(str) == series_label].copy()
+                if g.empty or feature not in g.columns:
+                    continue
+
+                sort_col = "plot_x" if "plot_x" in g.columns else ("datetime" if "datetime" in g.columns else None)
+                if sort_col:
+                    g = g.sort_values(sort_col)
+                else:
+                    g = g.reset_index(drop=True)
+
+                y = pd.to_numeric(g[feature], errors="coerce")
+                if y.notna().sum() == 0:
+                    continue
+
+                if x_axis_mode == "Real calendar time" and "datetime" in g.columns and g["datetime"].notna().any():
+                    x = pd.to_datetime(g["datetime"], errors="coerce")
+                elif "plot_x" in g.columns and g["plot_x"].notna().any():
+                    x = pd.to_numeric(g["plot_x"], errors="coerce")
+                else:
+                    x = pd.Series(range(1, len(g) + 1), index=g.index)
+
+                color = feature_color(feature, wi)
+                ax.plot(x, y, marker="o" if show_points else None, markersize=4, linewidth=2.1, color=color, label=series_label if len(series_values) > 1 else None)
+
+            if feature in custom_y_ranges:
+                ax.set_ylim(custom_y_ranges[feature][0], custom_y_ranges[feature][1])
+            ax.set_ylabel(column_label(feature), fontsize=12, fontweight="bold")
+            ax.grid(True, which="major", alpha=0.28)
+            ax.tick_params(axis="both", labelsize=10)
+
+            if x_axis_mode == "Real calendar time" and "datetime" in df.columns and df["datetime"].notna().any():
+                ax.xaxis.set_major_formatter(mdates.DateFormatter("%d-%b\n%H:%M"))
+                ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=6, maxticks=12))
+            elif x_axis_mode.startswith("Compressed"):
+                tick_settings = compressed_axis_tick_kwargs(df)
+                if tick_settings:
+                    ax.set_xticks(tick_settings.get("tickvals", []))
+                    ax.set_xticklabels([str(t).replace("<br>", "\n") for t in tick_settings.get("ticktext", [])], rotation=0)
+                for x_sep in compressed_separator_positions(df):
+                    ax.axvline(x_sep, color="#64748b", linestyle=":", linewidth=1.3, alpha=0.75)
+
+            if len(series_values) > 1:
+                ax.legend(fontsize=9, loc="best")
+
+        axes[-1].set_xlabel(x_axis_title_from_mode(x_axis_mode), fontsize=12, fontweight="bold")
+        fig_m.tight_layout(rect=[0.02, 0.02, 0.98, 0.975])
+
+        output = io.BytesIO()
+        if fmt == "pdf":
+            fig_m.savefig(output, format="pdf", bbox_inches="tight")
+        else:
+            fig_m.savefig(output, format="png", dpi=190, bbox_inches="tight")
+        plt.close(fig_m)
+        output.seek(0)
+        return output.getvalue()
+
     d1, d2, d3, d4 = st.columns(4)
 
     with d1:
@@ -1857,40 +1953,55 @@ if selected_features and not filtered.empty:
 
     export_height = max(1000, 390 * len(selected_features))
 
-    try:
-        png_bytes = fig.to_image(
-            format="png",
-            width=export_width,
-            height=export_height,
-            scale=2,
-        )
+    png_bytes, png_error = plotly_static_image_bytes(
+        fig, "png", width=export_width, height=export_height, scale=2
+    )
+    png_label = "Download readable chart PNG"
+    if png_bytes is None:
+        try:
+            png_bytes = matplotlib_overview_export_bytes(filtered, selected_features, fmt="png")
+            png_label = "Download readable chart PNG"
+            with d3:
+                st.caption("Plotly/Kaleido PNG export was unavailable, so a Matplotlib PNG fallback was used.")
+        except Exception as fallback_error:
+            with d3:
+                st.error("PNG export failed.")
+                st.caption(f"Plotly/Kaleido error: {png_error}")
+                st.caption(f"Matplotlib fallback error: {fallback_error}")
+
+    if png_bytes is not None:
         with d3:
             st.download_button(
-                "Download readable chart PNG",
+                png_label,
                 data=png_bytes,
                 file_name="tmu_chart_readable.png",
                 mime="image/png",
             )
-    except Exception:
-        with d3:
-            st.caption("PNG export needs kaleido installed.")
 
-    try:
-        pdf_bytes = fig.to_image(
-            format="pdf",
-            width=export_width,
-            height=export_height,
-        )
+    pdf_bytes, pdf_error = plotly_static_image_bytes(
+        fig, "pdf", width=export_width, height=export_height
+    )
+    pdf_label = "Download readable chart PDF"
+    if pdf_bytes is None:
+        try:
+            pdf_bytes = matplotlib_overview_export_bytes(filtered, selected_features, fmt="pdf")
+            pdf_label = "Download readable chart PDF"
+            with d4:
+                st.caption("Plotly/Kaleido PDF export was unavailable, so a Matplotlib PDF fallback was used.")
+        except Exception as fallback_error:
+            with d4:
+                st.error("PDF export failed.")
+                st.caption(f"Plotly/Kaleido error: {pdf_error}")
+                st.caption(f"Matplotlib fallback error: {fallback_error}")
+
+    if pdf_bytes is not None:
         with d4:
             st.download_button(
-                "Download readable chart PDF",
+                pdf_label,
                 data=pdf_bytes,
                 file_name="tmu_chart_readable.pdf",
                 mime="application/pdf",
             )
-    except Exception:
-        with d4:
-            st.caption("PDF export needs kaleido installed.")
 
     st.markdown("#### Human-readable report exports")
     st.caption(
