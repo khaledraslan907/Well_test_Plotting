@@ -1,26 +1,38 @@
-Parser validation workflow
-==========================
+TMU Dashboard Parser Validation
+===============================
 
-This parser is robust, but no parser can guarantee perfect parsing for every possible customer file.
-Use these checks before deployment:
+This package includes a stronger parser for mixed TMU / well-test files.
 
-1) Check one or two files:
-   python parser_selftest.py "7-B15-42(10-6-2026).xlsx"
+Supported upload types
+----------------------
+- Excel: .xlsx, .xls
+- CSV: .csv
+- Text / WhatsApp messages: .txt and pasted text
+- Word: .docx
+- PDF: .pdf, including EXPRO MPFM Data & Events reports when text is extractable
 
-2) Check a full folder recursively:
-   python bulk_parser_check.py "C:/path/to/customer/files" --out parser_validation_report.csv
+What the parser does
+--------------------
+1. Tries multiple interpretations of each sheet/table.
+2. Detects DATE, TIME and DATETIME columns from both headers and actual cell values.
+3. Combines date + time correctly, including midnight rollover.
+4. Accepts date-only production-history files as valid time series at 00:00.
+5. Uses a canonical alias map to rename common fields such as WHP, FLP, Sep P, Gas Rate, Oil Rate, Water Rate, BS&W, Salinity, MPFM QOil/QWat/QGas, Pump P, N2 Rate, etc.
+6. Rejects non-data text/PDF files that do not contain numeric operational readings with date/time evidence.
+7. Keeps unknown numeric fields only as Raw columns when the template is genuinely unknown; known templates avoid confusing Raw: Psig / Raw: Column labels.
 
-3) Read parser_validation_report.csv:
-   - OK = parsed with recognized standard column names.
-   - OK_WITH_RAW_FALLBACK = parsed, but at least one header is unknown. The column is still usable/plotable.
-   - NOT_PARSED = no usable date/time + numeric time-series was found.
-   - ERROR = library/file read problem.
+Important limitation
+--------------------
+No parser can guarantee every possible customer format. The parser needs extractable text/table data and at least a date/time or date-only series plus numeric readings. Scanned PDFs/images, protected workbooks, corrupted files, or summary-only documents may still need manual conversion or a new alias rule.
 
-4) For OK_WITH_RAW_FALLBACK:
-   Add the new header wording to best_canonical_name() in tmu_parser.py so it receives a clean label.
+Bulk validation
+---------------
+Run this before deployment or when receiving a new customer file batch:
 
-Supported input types:
-   .xlsx, .xls, .csv, .txt, .docx, .pdf, and pasted WhatsApp TMU messages.
+python bulk_parser_check.py "C:/path/to/customer/files" --out parser_validation_report.csv
 
-Expected limitation:
-   Scanned/image-only PDFs, photos, protected/corrupted workbooks, and files without any date/time plus numeric readings cannot be parsed reliably without OCR or manual mapping.
+Statuses:
+- OK: parsed and column names mapped correctly.
+- OK_WITH_RAW_FALLBACK: parsed, but some headers need alias-map additions for cleaner names.
+- NOT_PARSED: no usable time-series was found.
+- ERROR: file read/library issue.

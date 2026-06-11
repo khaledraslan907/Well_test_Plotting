@@ -1508,16 +1508,46 @@ def parse_excel_sheet_attempts(raw: pd.DataFrame, source_name: str, sheet_name: 
 
 
 def is_valid_timeseries(df: pd.DataFrame) -> bool:
+    """Return True only for real plottable time-series tables.
+
+    A table must have at least one numeric reading column and repeated date/time
+    evidence.  This prevents non-data text/PDF files from being accepted just
+    because a few numbers were found somewhere in the document.
+    """
     if df is None or df.empty:
         return False
     numeric_cols = available_numeric_columns(df)
     if len(numeric_cols) == 0:
         return False
-    if "datetime" in df.columns and df["datetime"].notna().sum() >= 2:
+    if "datetime" in df.columns and pd.to_datetime(df["datetime"], errors="coerce").notna().sum() >= 2:
         return True
-    if "time_text" in df.columns and (df["time_text"].astype(str).str.len() > 0).sum() >= 2:
+    if "time_text" in df.columns and df["time_text"].astype(str).str.strip().ne("").sum() >= 2:
         return True
-    return len(df) >= 3
+    if "date" in df.columns and pd.to_datetime(df["date"], errors="coerce").notna().sum() >= 2:
+        return True
+    return False
+
+
+def is_usable_single_message_table(df: pd.DataFrame) -> bool:
+    """Allow one-row WhatsApp/TMU messages while rejecting random text/PDF pages.
+
+    WhatsApp reports are often one reading only, so they cannot pass the stricter
+    repeated-time-series test.  They still must contain at least one numeric
+    operational field and at least one usable date/time marker.
+    """
+    if df is None or df.empty:
+        return False
+    if not available_numeric_columns(df):
+        return False
+    has_dt = "datetime" in df.columns and pd.to_datetime(df["datetime"], errors="coerce").notna().any()
+    has_date = "date" in df.columns and pd.to_datetime(df["date"], errors="coerce").notna().any()
+    has_time = "time_text" in df.columns and df["time_text"].astype(str).str.strip().ne("").any()
+    return bool(has_dt or has_date or has_time)
+
+
+def filter_usable_tables(tables: List[pd.DataFrame]) -> List[pd.DataFrame]:
+    """Final safety filter for all upload types."""
+    return [t for t in tables if is_valid_timeseries(t) or is_usable_single_message_table(t)]
 
 
 
@@ -1678,7 +1708,7 @@ def load_tabular_file(uploaded_file) -> List[pd.DataFrame]:
     elif suffix == "txt":
         text = uploaded_file.getvalue().decode("utf-8", errors="ignore")
         msg_rows = parse_many_tmu_messages(text, source_name=name)
-        if not msg_rows.empty:
+        if is_usable_single_message_table(msg_rows):
             tables.append(msg_rows)
 
     elif suffix == "docx":
@@ -1688,7 +1718,7 @@ def load_tabular_file(uploaded_file) -> List[pd.DataFrame]:
             doc = Document(uploaded_file)
             text = "\n".join(safe_text(p.text) for p in doc.paragraphs)
             msg_rows = parse_many_tmu_messages(text, source_name=name)
-            if not msg_rows.empty:
+            if is_usable_single_message_table(msg_rows):
                 tables.append(msg_rows)
 
             for i, t in enumerate(doc.tables):
@@ -1730,13 +1760,13 @@ def load_tabular_file(uploaded_file) -> List[pd.DataFrame]:
                     tables = [expro_rows]
                 else:
                     msg_rows = parse_many_tmu_messages(all_text, source_name=name)
-                    if not msg_rows.empty:
+                    if is_usable_single_message_table(msg_rows):
                         tables.append(msg_rows)
                     tables = filter_preferred_tables(tables)
         except Exception as e:
             raise RuntimeError(f"Could not read PDF file {name}: {e}")
 
-    return tables
+    return filter_usable_tables(tables)
 
 
 def value_by_patterns(text: str, patterns: List[str]) -> Optional[str]:

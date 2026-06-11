@@ -272,7 +272,6 @@ st.markdown(
 )
 
 st.title("TMU Production Test Dashboard")
-st.caption("Parser build: v23 robust column detection")
 st.caption(
     "Upload Excel / CSV / Word / PDF files, paste WhatsApp reports, clean the data, compare wells, "
     "and export clear production-test plots."
