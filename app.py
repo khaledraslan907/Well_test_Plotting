@@ -203,6 +203,12 @@ def feature_color(feature_name: str, fallback_index: int = 0) -> str:
 def well_color(index: int) -> str:
     return WELL_COLORS[index % len(WELL_COLORS)]
 
+def is_aligned_elapsed_mode(x_axis_mode: str) -> bool:
+    return str(x_axis_mode or "").startswith("Aligned elapsed")
+
+def is_compressed_real_date_mode(x_axis_mode: str) -> bool:
+    return str(x_axis_mode or "").startswith("Compressed real dates")
+
 def chart_title_from_data(df, custom_title: str = "") -> str:
     """Default chart title: well name(s) only.
 
@@ -444,6 +450,30 @@ def compressed_axis_tick_kwargs(df, max_ticks_per_series=4, max_total_ticks=22):
     ticktext = [t for _, t in tick_pairs]
     return {"tickmode": "array", "tickvals": tickvals, "ticktext": ticktext, "tickangle": 0}
 
+
+def elapsed_axis_tick_kwargs(df, max_ticks=10):
+    """Readable ticks for aligned elapsed-hour comparison charts."""
+    if df.empty or "plot_x" not in df.columns:
+        return {}
+    vals = pd.to_numeric(df["plot_x"], errors="coerce").dropna()
+    if vals.empty:
+        return {}
+    xmax = float(vals.max())
+    if xmax <= 0:
+        return {"tickmode": "array", "tickvals": [0], "ticktext": ["0 h"]}
+    if xmax <= 8:
+        step = 1
+    elif xmax <= 24:
+        step = 2
+    elif xmax <= 72:
+        step = 6
+    elif xmax <= 240:
+        step = 24
+    else:
+        step = max(24, round(xmax / max_ticks))
+    tickvals = list(np.arange(0, xmax + step, step))[: max_ticks + 2]
+    ticktext = [f"{int(v)} h" if abs(v - int(v)) < 1e-9 else f"{v:.1f} h" for v in tickvals]
+    return {"tickmode": "array", "tickvals": tickvals, "ticktext": ticktext, "tickangle": 0}
 
 def compressed_separator_positions(df):
     """Positions between compressed tests to visually separate them."""
@@ -736,7 +766,7 @@ def add_plot_axis_columns(df, x_axis_mode, trace_grouping="Auto"):
     out["series_label"] = out["series_group_key"].map(label_map)
     out["plot_x"] = None
 
-    group_col = "series_group_key" if x_axis_mode.startswith("Compressed") else "series_label"
+    group_col = "series_group_key" if (is_compressed_real_date_mode(x_axis_mode) or is_aligned_elapsed_mode(x_axis_mode)) else "series_label"
     groups = []
     for label, idx in out.groupby(group_col, dropna=False).groups.items():
         g = out.loc[idx]
@@ -753,21 +783,32 @@ def add_plot_axis_columns(df, x_axis_mode, trace_grouping="Auto"):
 
         if x_axis_mode == "Real calendar time":
             out.loc[g.index, "plot_x"] = g["datetime"] if sort_col else range(1, len(g) + 1)
+        elif is_aligned_elapsed_mode(x_axis_mode):
+            # Best for comparing two or more wells/tests: each series starts at 0 hours.
+            # This prevents one long test from squeezing a short test into a cluster.
+            if sort_col:
+                elapsed = (g["datetime"] - g["datetime"].min()).dt.total_seconds() / 3600.0
+                out.loc[g.index, "plot_x"] = elapsed.astype(float)
+            else:
+                out.loc[g.index, "plot_x"] = pd.Series(range(0, len(g)), index=g.index, dtype=float)
         else:
             if sort_col:
                 elapsed = (g["datetime"] - g["datetime"].min()).dt.total_seconds() / 3600.0
                 out.loc[g.index, "plot_x"] = current_offset + elapsed
                 span = float(elapsed.max()) if len(elapsed) else 0.0
-                current_offset += max(span, max(len(g) - 1, 1) * 0.05) + max(span * 0.08, 1.0)
+                # Use a little extra gap, but not so much that short tests become unreadable.
+                current_offset += max(span, max(len(g) - 1, 1) * 0.08) + max(span * 0.10, 1.5)
             else:
                 seq = pd.Series(range(1, len(g) + 1), index=g.index, dtype=float)
                 out.loc[g.index, "plot_x"] = current_offset + seq
-                current_offset += float(len(g)) + 1.0
+                current_offset += float(len(g)) + 1.5
     return out
 
 
 def x_axis_title_from_mode(x_axis_mode):
-    if x_axis_mode.startswith("Compressed"):
+    if is_aligned_elapsed_mode(x_axis_mode):
+        return "Elapsed test time from each selected test start (hours)"
+    if is_compressed_real_date_mode(x_axis_mode):
         return "Compressed real-date timeline — empty gaps removed"
     return "Time"
 
@@ -911,12 +952,25 @@ with st.sidebar:
 
     x_axis_mode = st.selectbox(
         "X-axis display mode",
-        ["Real calendar time", "Compressed real dates - remove empty gaps"],
+        [
+            "Real calendar time",
+            "Compressed real dates - remove empty gaps",
+            "Aligned elapsed time - best for comparing wells",
+        ],
         index=0,
         help=(
             "Real calendar time keeps true dates and gaps. "
-            "Compressed real dates removes long empty gaps between tests, keeps real date/time labels, "
-            "and adds dotted separators between test periods."
+            "Compressed real dates removes long empty gaps between test periods. "
+            "Aligned elapsed time starts every well/test at 0 hours, which is best for comparing two wells or several tests without squeezing one curve into a cluster."
+        ),
+    )
+    chart_view_mode = st.selectbox(
+        "Chart screen layout",
+        ["Auto / desktop", "Mobile-friendly", "Wide report view"],
+        index=0,
+        help=(
+            "Mobile-friendly reduces tick and value-label crowding on phones. "
+            "Wide report view gives larger panels on desktop and exports."
         ),
     )
     trace_grouping = "Auto"
@@ -1324,16 +1378,25 @@ with st.expander("Detected data preview", expanded=False):
 
 if selected_features and not filtered.empty:
     st.subheader("Interactive plot")
+    series_count_for_hint = filtered["series_label"].dropna().astype(str).nunique() if "series_label" in filtered.columns else 1
+    if series_count_for_hint > 1 and is_compressed_real_date_mode(x_axis_mode):
+        st.info("For two wells or several test dates, use 'Aligned elapsed time - best for comparing wells' if one curve is squeezed into a small cluster.")
     if x_axis_mode == "Real calendar time":
         axis_tick_settings = x_axis_tick_kwargs(x_axis_scale)
-    elif x_axis_mode.startswith("Compressed"):
-        axis_tick_settings = compressed_axis_tick_kwargs(filtered)
+    elif is_aligned_elapsed_mode(x_axis_mode):
+        axis_tick_settings = elapsed_axis_tick_kwargs(filtered, max_ticks=8 if chart_view_mode == "Mobile-friendly" else 12)
+    elif is_compressed_real_date_mode(x_axis_mode):
+        axis_tick_settings = compressed_axis_tick_kwargs(
+            filtered,
+            max_ticks_per_series=2 if chart_view_mode == "Mobile-friendly" else 3,
+            max_total_ticks=10 if chart_view_mode == "Mobile-friendly" else 16,
+        )
     else:
         axis_tick_settings = {}
     x_axis_title = x_axis_title_from_mode(x_axis_mode)
 
     def add_compressed_test_separators_to_plotly(fig, features):
-        if not x_axis_mode.startswith("Compressed"):
+        if not is_compressed_real_date_mode(x_axis_mode):
             return fig
 
         for x_sep in compressed_separator_positions(filtered):
@@ -1444,6 +1507,8 @@ if selected_features and not filtered.empty:
         return fig
 
     def x_values(df):
+        if x_axis_mode == "Real calendar time" and "datetime" in df.columns and df["datetime"].notna().any():
+            return df["datetime"]
         if "plot_x" in df.columns and df["plot_x"].notna().any():
             return df["plot_x"]
         if "datetime" in df.columns and df["datetime"].notna().any():
@@ -1542,9 +1607,10 @@ if selected_features and not filtered.empty:
             idxs.add(int(y.idxmax()))
 
         if multi_series and value_label_mode != "All values - use wide export":
-            # Comparison view: prevent label collision by keeping only a few markers.
+            # Comparison/mobile view: prevent label collision by keeping only key markers.
+            divisions = 3 if chart_view_mode == "Mobile-friendly" else 5
             if n > 12:
-                idxs.update(range(0, n, max(1, n // 5)))
+                idxs.update(range(0, n, max(1, n // divisions)))
             return {i for i in idxs if 0 <= i < n}
 
         if y.notna().any():
@@ -1664,10 +1730,12 @@ if selected_features and not filtered.empty:
                 )
 
             n_points = max_points_per_trace(df)
-            fig.update_layout(
-                height=max(700, 360 * len(features)),
-                width=max(1400, min(2600, n_points * 42)),
-                title=dict(text=chart_title_from_data(df, custom_chart_title), font=dict(size=30, color="#0f172a", family="Arial Black, Arial, sans-serif")),
+            mobile_view = chart_view_mode == "Mobile-friendly"
+            wide_view = chart_view_mode == "Wide report view"
+            panel_height = 330 if mobile_view else (440 if wide_view else 380)
+            layout_kwargs = dict(
+                height=max(620, panel_height * len(features)),
+                title=dict(text=chart_title_from_data(df, custom_chart_title), font=dict(size=26 if mobile_view else 30, color="#0f172a", family="Arial Black, Arial, sans-serif")),
                 hovermode="x unified",
                 margin=dict(l=85, r=50, t=115, b=80),
                 uniformtext_minsize=8,
@@ -1685,6 +1753,21 @@ if selected_features and not filtered.empty:
                 title_x=0.5,
                 title_xanchor="center",
             )
+            if not mobile_view:
+                layout_kwargs["width"] = max(1400, min(3200 if wide_view else 2600, n_points * (52 if wide_view else 42)))
+            if mobile_view and show_chart_legend:
+                layout_kwargs["legend"] = dict(
+                    orientation="h",
+                    yanchor="bottom",
+                    y=1.02,
+                    xanchor="left",
+                    x=0,
+                    font=dict(size=12, color="#111827"),
+                    bgcolor="rgba(255,255,255,0.90)",
+                    bordercolor="#e5e7eb",
+                    borderwidth=1,
+                )
+            fig.update_layout(**layout_kwargs)
             # Show readable time ticks on EVERY subplot, not only the bottom one.
             for r in range(1, len(features) + 1):
                 fig.update_xaxes(
@@ -1694,9 +1777,9 @@ if selected_features and not filtered.empty:
                     gridcolor="#dddddd",
                     zeroline=False,
                     showticklabels=True,
-                    tickfont=dict(size=16, color="#111827"),
+                    tickfont=dict(size=11 if chart_view_mode == "Mobile-friendly" else 15, color="#111827"),
                     title_text=x_axis_title if r == len(features) else "",
-                    title_font=dict(size=20, color="#111827"),
+                    title_font=dict(size=16 if chart_view_mode == "Mobile-friendly" else 20, color="#111827"),
                     automargin=True,
                     **axis_tick_settings,
                 )
@@ -1706,8 +1789,8 @@ if selected_features and not filtered.empty:
                     showgrid=True,
                     gridcolor="#eeeeee",
                     zeroline=False,
-                    title_font=dict(size=17, color="#111827"),
-                    tickfont=dict(size=14, color="#111827"),
+                    title_font=dict(size=14 if chart_view_mode == "Mobile-friendly" else 17, color="#111827"),
+                    tickfont=dict(size=11 if chart_view_mode == "Mobile-friendly" else 14, color="#111827"),
                     automargin=True,
                 )
 
@@ -1797,7 +1880,15 @@ if selected_features and not filtered.empty:
         return fig
 
     fig = build_figure(filtered, selected_features, plot_mode)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        config={
+            "responsive": True,
+            "displaylogo": False,
+            "toImageButtonOptions": {"format": "png", "scale": 3},
+        },
+    )
 
     with st.expander("Filtered data used by current plot", expanded=False):
         st.caption("Filtered data = only the rows currently feeding the chart after your sidebar selections.")
@@ -1823,8 +1914,9 @@ if selected_features and not filtered.empty:
             idxs.add(int(y.idxmax()))
 
         if multi_series and value_label_mode != "All values - use wide export":
+            divisions = 4 if chart_view_mode == "Mobile-friendly" else 6
             if n > 12:
-                idxs.update(range(0, n, max(1, n // 5)))
+                idxs.update(range(0, n, max(1, n // divisions)))
             return {i for i in idxs if 0 <= i < n}
 
         if y.notna().any():
@@ -1973,11 +2065,16 @@ if selected_features and not filtered.empty:
                     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
                     ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=8, maxticks=16))
                     fig_m.autofmt_xdate(rotation=0)
-                elif x_axis_mode.startswith("Compressed"):
-                    tick_settings = compressed_axis_tick_kwargs(df)
+                elif is_aligned_elapsed_mode(x_axis_mode):
+                    tick_settings = elapsed_axis_tick_kwargs(df)
                     if tick_settings:
                         ax.set_xticks(tick_settings.get("tickvals", []))
-                        ax.set_xticklabels([str(t).replace("<br>", "\n") for t in tick_settings.get("ticktext", [])], rotation=0)
+                        ax.set_xticklabels(tick_settings.get("ticktext", []), rotation=0)
+                elif is_compressed_real_date_mode(x_axis_mode):
+                    tick_settings = compressed_axis_tick_kwargs(df, max_ticks_per_series=3, max_total_ticks=14)
+                    if tick_settings:
+                        ax.set_xticks(tick_settings.get("tickvals", []))
+                        ax.set_xticklabels([str(t).replace("<br>", "\n") for t in tick_settings.get("ticktext", [])], rotation=30, ha="right")
                     for x_sep in compressed_separator_positions(df):
                         ax.axvline(x_sep, color="#64748b", linestyle=":", linewidth=1.5, alpha=0.75)
 
@@ -2106,11 +2203,16 @@ if selected_features and not filtered.empty:
                     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
                     ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=8, maxticks=16))
                     fig_m.autofmt_xdate(rotation=0)
-                elif x_axis_mode.startswith("Compressed"):
-                    tick_settings = compressed_axis_tick_kwargs(df)
+                elif is_aligned_elapsed_mode(x_axis_mode):
+                    tick_settings = elapsed_axis_tick_kwargs(df)
                     if tick_settings:
                         ax.set_xticks(tick_settings.get("tickvals", []))
-                        ax.set_xticklabels([str(t).replace("<br>", "\n") for t in tick_settings.get("ticktext", [])], rotation=0)
+                        ax.set_xticklabels(tick_settings.get("ticktext", []), rotation=0)
+                elif is_compressed_real_date_mode(x_axis_mode):
+                    tick_settings = compressed_axis_tick_kwargs(df, max_ticks_per_series=3, max_total_ticks=14)
+                    if tick_settings:
+                        ax.set_xticks(tick_settings.get("tickvals", []))
+                        ax.set_xticklabels([str(t).replace("<br>", "\n") for t in tick_settings.get("ticktext", [])], rotation=30, ha="right")
                     for x_sep in compressed_separator_positions(df):
                         ax.axvline(x_sep, color="#64748b", linestyle=":", linewidth=1.5, alpha=0.75)
 
@@ -2154,11 +2256,20 @@ if selected_features and not filtered.empty:
         if x_axis_mode == "Real calendar time" and "datetime" in df_for_ticks.columns and df_for_ticks["datetime"].notna().any():
             ax.xaxis.set_major_formatter(mdates.DateFormatter("%d-%b\n%H:%M"))
             ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=6, maxticks=12))
-        elif x_axis_mode.startswith("Compressed"):
-            tick_settings = compressed_axis_tick_kwargs(df_for_ticks, max_ticks_per_series=3, max_total_ticks=18)
+        elif is_aligned_elapsed_mode(x_axis_mode):
+            tick_settings = elapsed_axis_tick_kwargs(df_for_ticks, max_ticks=8 if chart_view_mode == "Mobile-friendly" else 12)
             if tick_settings:
                 ax.set_xticks(tick_settings.get("tickvals", []))
-                ax.set_xticklabels([str(t).replace("<br>", "\n") for t in tick_settings.get("ticktext", [])], rotation=0)
+                ax.set_xticklabels(tick_settings.get("ticktext", []), rotation=0)
+        elif is_compressed_real_date_mode(x_axis_mode):
+            tick_settings = compressed_axis_tick_kwargs(
+                df_for_ticks,
+                max_ticks_per_series=2 if chart_view_mode == "Mobile-friendly" else 3,
+                max_total_ticks=10 if chart_view_mode == "Mobile-friendly" else 14,
+            )
+            if tick_settings:
+                ax.set_xticks(tick_settings.get("tickvals", []))
+                ax.set_xticklabels([str(t).replace("<br>", "\n") for t in tick_settings.get("ticktext", [])], rotation=30, ha="right")
             for x_sep in compressed_separator_positions(df_for_ticks):
                 ax.axvline(x_sep, color="#64748b", linestyle=":", linewidth=1.4, alpha=0.70)
 
@@ -2219,11 +2330,21 @@ if selected_features and not filtered.empty:
 
         n_features = max(1, len(features))
         n_points = max_points_per_trace(df)
-        width_in = max(18.0, min(34.0, n_points * (0.34 if len(series_values) > 1 else 0.27)))
-        height_in = max(7.0, 4.6 * n_features)
-        fig_m, axes = plt.subplots(n_features, 1, figsize=(width_in, height_in), dpi=220, squeeze=False)
+        if chart_view_mode == "Mobile-friendly":
+            width_in = max(15.0, min(24.0, n_points * (0.26 if len(series_values) > 1 else 0.22)))
+            height_in = max(8.0, 5.8 * n_features)
+            title_fs = 22
+        elif chart_view_mode == "Wide report view":
+            width_in = max(24.0, min(46.0, n_points * (0.56 if len(series_values) > 1 else 0.42)))
+            height_in = max(8.0, 6.2 * n_features)
+            title_fs = 28
+        else:
+            width_in = max(20.0, min(40.0, n_points * (0.48 if len(series_values) > 1 else 0.34)))
+            height_in = max(8.0, 5.6 * n_features)
+            title_fs = 25
+        fig_m, axes = plt.subplots(n_features, 1, figsize=(width_in, height_in), dpi=240, squeeze=False)
         axes = axes.flatten()
-        fig_m.suptitle(chart_title_from_data(df, custom_chart_title), fontsize=24, fontweight="bold", y=0.995)
+        fig_m.suptitle(chart_title_from_data(df, custom_chart_title), fontsize=title_fs, fontweight="bold", y=0.995)
 
         group_col = "series_label" if "series_label" in df.columns else "well"
         for ax, feature in zip(axes, features):
@@ -2291,7 +2412,7 @@ if selected_features and not filtered.empty:
         if fmt == "pdf":
             fig_m.savefig(output, format="pdf", bbox_inches="tight")
         else:
-            fig_m.savefig(output, format="png", dpi=260, bbox_inches="tight")
+            fig_m.savefig(output, format="png", dpi=320, bbox_inches="tight")
         plt.close(fig_m)
         output.seek(0)
         return output.getvalue()
