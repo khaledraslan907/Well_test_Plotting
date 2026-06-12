@@ -532,9 +532,9 @@ with st.sidebar:
     whatsapp_text = st.text_area(
         "Paste one or many TMU WhatsApp messages",
         height=260,
-        placeholder="""PICO TMU-02
+        placeholder="""TMU-01
 Date :06-06-2026
-Well name : B3C18-7
+Well name : Well_1
 Time @ 10:30
 Choke = 100%
 W.H.P =60 PSI
