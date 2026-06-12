@@ -203,33 +203,30 @@ def feature_color(feature_name: str, fallback_index: int = 0) -> str:
 def well_color(index: int) -> str:
     return WELL_COLORS[index % len(WELL_COLORS)]
 
-def chart_title_from_data(df) -> str:
+def chart_title_from_data(df, custom_title: str = "") -> str:
+    """Default chart title: well name(s) only.
+
+    Dates are intentionally not included because field reports usually need the
+    well name in the main title and the date/time on the x-axis.  The user can
+    override the title from the sidebar.
+    """
+    custom_title = str(custom_title or "").strip()
+    if custom_title:
+        return custom_title
+
     if "well" not in df.columns or df.empty:
         return "Well Production Test"
 
-    wells = [str(w) for w in df["well"].dropna().astype(str).unique()]
+    wells = [str(w).strip() for w in df["well"].dropna().astype(str).unique()]
     wells = [w for w in wells if w and w.lower() != "unknown"]
 
     if len(wells) == 1:
-        title = f"Well {wells[0]}"
-    elif len(wells) > 1:
-        shown = " vs ".join(wells[:4])
-        suffix = "" if len(wells) <= 4 else f" +{len(wells) - 4} more"
-        title = f"Well Comparison: {shown}{suffix}"
-    else:
-        title = "Well Production Test"
-
-    if "datetime" in df.columns and df["datetime"].notna().any():
-        start_dt = df["datetime"].min()
-        end_dt = df["datetime"].max()
-        if pd.notna(start_dt) and pd.notna(end_dt):
-            if start_dt.date() == end_dt.date():
-                title += f" | {start_dt:%d-%b-%Y}"
-            elif start_dt.year == end_dt.year:
-                title += f" | {start_dt:%d-%b} to {end_dt:%d-%b-%Y}"
-            else:
-                title += f" | {start_dt:%d-%b-%Y} to {end_dt:%d-%b-%Y}"
-    return title
+        return f"Well {wells[0]}"
+    if len(wells) > 1:
+        shown = " vs ".join(wells[:5])
+        suffix = "" if len(wells) <= 5 else f" +{len(wells) - 5} more"
+        return shown + suffix
+    return "Well Production Test"
 
 
 st.set_page_config(
@@ -404,16 +401,25 @@ def feature_key_text(feature_name):
     return re.sub(r"[^A-Za-z0-9_]+", "_", str(feature_name))
 
 
-def compressed_axis_tick_kwargs(df, max_ticks_per_series=6):
-    """Build readable real-date tick labels for compressed timelines."""
+def compressed_axis_tick_kwargs(df, max_ticks_per_series=4, max_total_ticks=22):
+    """Build readable real-date tick labels for compressed timelines.
+
+    For multi-well / multi-test comparisons, too many compressed tick labels make
+    the chart unreadable.  This caps labels per series and globally, while the
+    hover still carries the exact timestamp for every point.
+    """
     if df.empty or "plot_x" not in df.columns or "datetime" not in df.columns:
         return {}
 
-    tickvals = []
-    ticktext = []
+    tick_pairs = []
     group_col = "series_label" if "series_label" in df.columns else "well"
+    groups = list(df.dropna(subset=["plot_x", "datetime"]).groupby(group_col, dropna=False))
+    if len(groups) > 3:
+        max_ticks_per_series = 3
+    elif len(groups) > 1:
+        max_ticks_per_series = min(max_ticks_per_series, 4)
 
-    for _, g in df.dropna(subset=["plot_x", "datetime"]).groupby(group_col, dropna=False):
+    for _, g in groups:
         g = g.sort_values("plot_x").reset_index(drop=True)
         if g.empty:
             continue
@@ -426,10 +432,17 @@ def compressed_axis_tick_kwargs(df, max_ticks_per_series=6):
 
         for i in idxs:
             dt = pd.Timestamp(g.loc[i, "datetime"])
-            tickvals.append(g.loc[i, "plot_x"])
-            ticktext.append(dt.strftime("%d-%b-%Y<br>%H:%M"))
+            tick_pairs.append((float(g.loc[i, "plot_x"]), dt.strftime("%d-%b<br>%H:%M")))
 
-    return {"tickmode": "array", "tickvals": tickvals, "ticktext": ticktext}
+    # Sort and decimate globally if needed.
+    tick_pairs = sorted(tick_pairs, key=lambda x: x[0])
+    if len(tick_pairs) > max_total_ticks:
+        step = max(1, round(len(tick_pairs) / max_total_ticks))
+        tick_pairs = tick_pairs[::step]
+
+    tickvals = [v for v, _ in tick_pairs]
+    ticktext = [t for _, t in tick_pairs]
+    return {"tickmode": "array", "tickvals": tickvals, "ticktext": ticktext, "tickangle": 0}
 
 
 def compressed_separator_positions(df):
@@ -532,9 +545,9 @@ with st.sidebar:
     whatsapp_text = st.text_area(
         "Paste one or many TMU WhatsApp messages",
         height=260,
-        placeholder="""TMU-01
+        placeholder="""PICO TMU-02
 Date :06-06-2026
-Well name : Well_1
+Well name : B3C18-7
 Time @ 10:30
 Choke = 100%
 W.H.P =60 PSI
@@ -876,7 +889,7 @@ with st.sidebar:
     st.header("3) Time scale")
     time_filter_mode = st.selectbox(
         "Time range control",
-        ["Slider", "Manual calendar/time", "Full range"],
+        ["Slider", "Manual calendar/time"],
         index=0,
         help="Use Manual calendar/time for long tests where a slider is difficult.",
     )
@@ -936,6 +949,13 @@ with st.sidebar:
         format_func=column_label,
     )
 
+    custom_chart_title = st.text_input(
+        "Chart title",
+        value="",
+        placeholder="Leave blank to use well name(s) only",
+        help="Optional. If blank, the title will be Well name only, without date.",
+    )
+
     custom_y_ranges = {}
     with st.expander("Y-axis scale per graph", expanded=False):
         use_custom_y_scale = st.checkbox(
@@ -974,7 +994,7 @@ with st.sidebar:
 
     fill_method = st.selectbox(
         "Handle missing values",
-        ["No fill", "Forward fill", "Forward + backward fill", "Linear interpolation by row", "Time interpolation"],
+        ["No fill", "Linear interpolation by row"],
         index=0,
         help="This only affects the plotted/filtered copy, not the originally detected data.",
     )
@@ -987,7 +1007,7 @@ with st.sidebar:
 
     plot_mode = st.selectbox(
         "Plot style",
-        ["Separate panels like report", "Overlay normalized", "Overlay actual values"],
+        ["Separate panels like report", "Overlay actual values"],
         index=0,
     )
 
@@ -1135,28 +1155,30 @@ with st.sidebar:
         events_df_sidebar = pd.DataFrame(st.session_state.manual_events_table)
         events_df_sidebar["datetime"] = pd.to_datetime(events_df_sidebar["datetime"])
         events_df_sidebar = events_df_sidebar.sort_values("datetime").reset_index(drop=True)
-        st.dataframe(
-            events_df_sidebar.assign(datetime=events_df_sidebar["datetime"].dt.strftime("%Y-%m-%d %H:%M")),
-            use_container_width=True,
-            height=140,
-        )
+        display_events = events_df_sidebar.copy()
+        display_events["datetime"] = display_events["datetime"].dt.strftime("%Y-%m-%d %H:%M")
+        display_events.insert(0, "No.", range(1, len(display_events) + 1))
+        st.dataframe(display_events, use_container_width=True, height=150)
 
-        remove_event_idx = st.number_input(
-            "Remove point note number",
-            min_value=1,
-            max_value=len(st.session_state.manual_events_table),
-            value=1,
-            step=1,
+        event_options = {
+            f"{i + 1}) {row['datetime']:%Y-%m-%d %H:%M} | {row.get('target', 'All selected wells')} | {row['label']}": i
+            for i, row in events_df_sidebar.iterrows()
+        }
+        selected_event_labels = st.multiselect(
+            "Select point notes to remove",
+            list(event_options.keys()),
+            key="selected_point_notes_to_remove",
         )
-
         ce1, ce2 = st.columns(2)
         with ce1:
-            if st.button("Remove point note"):
-                events_df_sidebar = events_df_sidebar.drop(index=remove_event_idx - 1).reset_index(drop=True)
-                st.session_state.manual_events_table = events_df_sidebar.to_dict("records")
-                st.rerun()
+            if st.button("Remove selected point notes"):
+                remove_idxs = {event_options[x] for x in selected_event_labels}
+                if remove_idxs:
+                    events_df_sidebar = events_df_sidebar.drop(index=list(remove_idxs)).reset_index(drop=True)
+                    st.session_state.manual_events_table = events_df_sidebar.to_dict("records")
+                    st.rerun()
         with ce2:
-            if st.button("Clear point notes"):
+            if st.button("Remove all point notes"):
                 st.session_state.manual_events_table = []
                 st.rerun()
 
@@ -1169,27 +1191,30 @@ with st.sidebar:
         display_intervals = intervals_df_sidebar.copy()
         display_intervals["start"] = display_intervals["start"].dt.strftime("%Y-%m-%d %H:%M")
         display_intervals["end"] = display_intervals["end"].dt.strftime("%Y-%m-%d %H:%M")
-        st.dataframe(display_intervals, use_container_width=True, height=140)
+        display_intervals.insert(0, "No.", range(1, len(display_intervals) + 1))
+        st.dataframe(display_intervals, use_container_width=True, height=150)
 
-        remove_interval_idx = st.number_input(
-            "Remove interval note number",
-            min_value=1,
-            max_value=len(st.session_state.operation_intervals_table),
-            value=1,
-            step=1,
+        interval_options = {
+            f"{i + 1}) {row['start']:%Y-%m-%d %H:%M} → {row['end']:%Y-%m-%d %H:%M} | {row.get('target', 'All selected wells')} | {row['label']}": i
+            for i, row in intervals_df_sidebar.iterrows()
+        }
+        selected_interval_labels = st.multiselect(
+            "Select interval notes to remove",
+            list(interval_options.keys()),
+            key="selected_interval_notes_to_remove",
         )
-
         ci1, ci2 = st.columns(2)
         with ci1:
-            if st.button("Remove interval note"):
-                intervals_df_sidebar = intervals_df_sidebar.drop(index=remove_interval_idx - 1).reset_index(drop=True)
-                st.session_state.operation_intervals_table = intervals_df_sidebar.to_dict("records")
-                st.rerun()
+            if st.button("Remove selected interval notes"):
+                remove_idxs = {interval_options[x] for x in selected_interval_labels}
+                if remove_idxs:
+                    intervals_df_sidebar = intervals_df_sidebar.drop(index=list(remove_idxs)).reset_index(drop=True)
+                    st.session_state.operation_intervals_table = intervals_df_sidebar.to_dict("records")
+                    st.rerun()
         with ci2:
-            if st.button("Clear interval notes"):
+            if st.button("Remove all interval notes"):
                 st.session_state.operation_intervals_table = []
                 st.rerun()
-
 
 filtered = data.copy()
 if selected_wells:
@@ -1359,22 +1384,26 @@ if selected_features and not filtered.empty:
             except Exception:
                 x_mid = x0
 
-            # Center the note between start/end and show left/right arrows.
-            try:
-                fig.add_annotation(
-                    x=x_mid,
-                    y=1.055,
-                    xref="x",
-                    yref="paper",
-                    text=f"←  {label}  →",
-                    showarrow=False,
-                    bgcolor="rgba(255,255,255,0.96)",
-                    bordercolor="#92400e",
-                    borderwidth=1,
-                    font=dict(size=16, color="#111827"),
-                )
-            except Exception:
-                pass
+            # Put the interval note inside every subplot, like point notes.
+            # This is clearer than one shared label at the top of the full figure.
+            for r in range(1, len(features) + 1):
+                try:
+                    xref = f"x{r if r > 1 else ''}"
+                    yref = f"y{r if r > 1 else ''} domain"
+                    fig.add_annotation(
+                        x=x_mid,
+                        y=0.96,
+                        xref=xref,
+                        yref=yref,
+                        text=f"← {label} →",
+                        showarrow=False,
+                        bgcolor="rgba(255,255,255,0.96)",
+                        bordercolor="#92400e",
+                        borderwidth=1,
+                        font=dict(size=14, color="#111827"),
+                    )
+                except Exception:
+                    pass
         return fig
 
     def add_manual_events_to_plotly(fig, features):
@@ -1494,23 +1523,36 @@ if selected_features and not filtered.empty:
         return txt
 
     def report_label_indices(g, feature):
-        """Meaningful labels for dense field reports: first/last, hourly points, min/max, and zero/bypass values."""
+        """Meaningful labels for dense field reports.
+
+        For one well/test: first/last, hourly points, min/max, and zero values.
+        For comparison charts: much fewer labels to prevent unreadable overlap.
+        """
         n = len(g)
         idxs = {0, n - 1} if n else set()
 
         if n == 0 or feature not in g.columns:
             return idxs
 
-        y = pd.to_numeric(g[feature], errors="coerce")
+        y = pd.to_numeric(g[feature], errors="coerce").reset_index(drop=True)
+        multi_series = "series_label" in filtered.columns and filtered["series_label"].dropna().astype(str).nunique() > 1
+
         if y.notna().any():
-            idxs.add(int(y.idxmin() if isinstance(y.index, pd.RangeIndex) else y.reset_index(drop=True).idxmin()))
-            idxs.add(int(y.idxmax() if isinstance(y.index, pd.RangeIndex) else y.reset_index(drop=True).idxmax()))
-            zero_positions = list(y.reset_index(drop=True)[y.reset_index(drop=True).abs() < 1e-12].index)
+            idxs.add(int(y.idxmin()))
+            idxs.add(int(y.idxmax()))
+
+        if multi_series and value_label_mode != "All values - use wide export":
+            # Comparison view: prevent label collision by keeping only a few markers.
+            if n > 12:
+                idxs.update(range(0, n, max(1, n // 5)))
+            return {i for i in idxs if 0 <= i < n}
+
+        if y.notna().any():
+            zero_positions = list(y[y.abs() < 1e-12].index)
             idxs.update(zero_positions[:10])
 
         if "datetime" in g.columns and g["datetime"].notna().any():
             dt = pd.to_datetime(g["datetime"], errors="coerce")
-            # Prefer full-hour labels. If no full hours exist, use half-hour labels.
             hourly = list(dt.reset_index(drop=True)[(dt.dt.minute == 0) & dt.notna()].index)
             if len(hourly) < 3:
                 hourly = list(dt.reset_index(drop=True)[(dt.dt.minute.isin([0, 30])) & dt.notna()].index)
@@ -1518,7 +1560,6 @@ if selected_features and not filtered.empty:
         else:
             idxs.update(label_indices(n, "Auto sparse - recommended"))
 
-        # Safety limit: if the selected period is very long, keep labels readable.
         if len(idxs) > 45:
             idxs = set(sorted(idxs)[::max(1, len(idxs) // 45)])
             idxs.update({0, n - 1})
@@ -1626,7 +1667,7 @@ if selected_features and not filtered.empty:
             fig.update_layout(
                 height=max(700, 360 * len(features)),
                 width=max(1400, min(2600, n_points * 42)),
-                title=dict(text=chart_title_from_data(df), font=dict(size=30, color="#0f172a", family="Arial Black, Arial, sans-serif")),
+                title=dict(text=chart_title_from_data(df, custom_chart_title), font=dict(size=30, color="#0f172a", family="Arial Black, Arial, sans-serif")),
                 hovermode="x unified",
                 margin=dict(l=85, r=50, t=115, b=80),
                 uniformtext_minsize=8,
@@ -1686,17 +1727,10 @@ if selected_features and not filtered.empty:
                 y = g[feature].astype(float)
                 plot_name = f"{series_label} - {column_label(feature)}"
 
-                if mode == "Overlay normalized":
-                    if y.notna().sum() and y.max() != y.min():
-                        y = (y - y.min()) / (y.max() - y.min()) * 100
-                    else:
-                        y = y * 0
-                    y_title = "Normalized scale, 0–100"
-                else:
-                    y_title = "Actual values"
+                y_title = "Actual values"
 
                 series_idx = series_values.index(series_label)
-                color = well_color(series_idx) if mode != "Overlay actual values" else feature_color(feature, series_idx)
+                color = feature_color(feature, series_idx)
                 fig.add_trace(
                     go.Scatter(
                         x=x_values(g),
@@ -1711,7 +1745,7 @@ if selected_features and not filtered.empty:
         fig.update_layout(
             height=850,
             width=1700,
-            title=dict(text=chart_title_from_data(df), font=dict(size=30, color="#0f172a", family="Arial Black, Arial, sans-serif")),
+            title=dict(text=chart_title_from_data(df, custom_chart_title), font=dict(size=30, color="#0f172a", family="Arial Black, Arial, sans-serif")),
             yaxis_title=y_title,
             xaxis_title=x_axis_title,
             hovermode="x unified",
@@ -1782,10 +1816,18 @@ if selected_features and not filtered.empty:
         n = len(g2)
         idxs = {0, n - 1} if n else set()
 
-        y = pd.to_numeric(g2[feature], errors="coerce")
+        y = pd.to_numeric(g2[feature], errors="coerce").reset_index(drop=True)
+        multi_series = "series_label" in filtered.columns and filtered["series_label"].dropna().astype(str).nunique() > 1
         if y.notna().any():
             idxs.add(int(y.idxmin()))
             idxs.add(int(y.idxmax()))
+
+        if multi_series and value_label_mode != "All values - use wide export":
+            if n > 12:
+                idxs.update(range(0, n, max(1, n // 5)))
+            return {i for i in idxs if 0 <= i < n}
+
+        if y.notna().any():
             zero_positions = list(y[y.abs() < 1e-12].index)
             idxs.update(zero_positions[:12])
 
@@ -1820,7 +1862,7 @@ if selected_features and not filtered.empty:
         with PdfPages(output) as pdf:
             for feature in features:
                 fig_m, ax = plt.subplots(figsize=(16.5, 9.3), dpi=160)
-                title = f"{chart_title_from_data(df)}\\n{column_label(feature)}"
+                title = f"{chart_title_from_data(df, custom_chart_title)}\n{column_label(feature)}"
                 ax.set_title(title, fontsize=22, fontweight="bold", pad=18)
 
                 for wi, series_label in enumerate(series_values):
@@ -1962,7 +2004,7 @@ if selected_features and not filtered.empty:
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
             for feature in features:
                 fig_m, ax = plt.subplots(figsize=(17.5, 9.8), dpi=190)
-                ax.set_title(f"{chart_title_from_data(df)}\\n{column_label(feature)}", fontsize=24, fontweight="bold", pad=18)
+                ax.set_title(f"{chart_title_from_data(df, custom_chart_title)}\n{column_label(feature)}", fontsize=24, fontweight="bold", pad=18)
 
                 for wi, series_label in enumerate(series_values):
                     g = df[df["series_label"].astype(str) == series_label].sort_values(
@@ -2100,15 +2142,73 @@ if selected_features and not filtered.empty:
             return None, str(e)
 
 
-    def matplotlib_overview_export_bytes(df, features, fmt="png"):
-        """Kaleido-free fallback for PNG/PDF export.
+    def _matplotlib_x_values(g):
+        if x_axis_mode == "Real calendar time" and "datetime" in g.columns and g["datetime"].notna().any():
+            return pd.to_datetime(g["datetime"], errors="coerce")
+        if "plot_x" in g.columns and g["plot_x"].notna().any():
+            return pd.to_numeric(g["plot_x"], errors="coerce")
+        return pd.Series(range(1, len(g) + 1), index=g.index)
 
-        It creates a static report-style chart directly with Matplotlib, so the
-        dashboard can still export PNG/PDF on machines where Plotly Kaleido or
-        Chrome is not installed.
-        """
-        import matplotlib.pyplot as plt
+    def _apply_matplotlib_x_axis(ax, df_for_ticks):
         import matplotlib.dates as mdates
+        if x_axis_mode == "Real calendar time" and "datetime" in df_for_ticks.columns and df_for_ticks["datetime"].notna().any():
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%d-%b\n%H:%M"))
+            ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=6, maxticks=12))
+        elif x_axis_mode.startswith("Compressed"):
+            tick_settings = compressed_axis_tick_kwargs(df_for_ticks, max_ticks_per_series=3, max_total_ticks=18)
+            if tick_settings:
+                ax.set_xticks(tick_settings.get("tickvals", []))
+                ax.set_xticklabels([str(t).replace("<br>", "\n") for t in tick_settings.get("ticktext", [])], rotation=0)
+            for x_sep in compressed_separator_positions(df_for_ticks):
+                ax.axvline(x_sep, color="#64748b", linestyle=":", linewidth=1.4, alpha=0.70)
+
+    def _apply_matplotlib_notes(ax):
+        # Interval notes: start/end lines + a centered label inside each chart.
+        if plot_intervals:
+            ymin_i, ymax_i = ax.get_ylim()
+            y_span = ymax_i - ymin_i if ymax_i != ymin_i else 1.0
+            y_note = ymax_i - 0.06 * y_span
+            for interval in plot_intervals:
+                x0 = interval["x0"]
+                x1 = interval["x1"]
+                ax.axvline(x0, color="#92400e", linestyle="--", linewidth=1.8, alpha=0.90)
+                ax.axvline(x1, color="#92400e", linestyle="--", linewidth=1.8, alpha=0.90)
+                try:
+                    x_mid = x0 + (x1 - x0) / 2
+                except Exception:
+                    x_mid = x0
+                ax.text(
+                    x_mid,
+                    y_note,
+                    f"← {interval['label']} →",
+                    fontsize=10.5,
+                    fontweight="bold",
+                    ha="center",
+                    va="center",
+                    color="#111827",
+                    bbox=dict(boxstyle="round,pad=0.22", fc="white", ec="#92400e", alpha=0.95),
+                )
+
+        # Point notes: vertical line and small vertical label in every chart.
+        if plot_events:
+            for event in plot_events:
+                ax.axvline(event["plot_x"], color="#111827", linestyle="--", linewidth=1.5, alpha=0.75)
+                ax.text(
+                    event["plot_x"],
+                    0.98,
+                    event["label"],
+                    transform=ax.get_xaxis_transform(),
+                    rotation=90,
+                    va="top",
+                    ha="right",
+                    fontsize=9.5,
+                    color="#111827",
+                    bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="#111827", alpha=0.75),
+                )
+
+    def matplotlib_overview_export_bytes(df, features, fmt="png"):
+        """High-resolution single report chart export with labels and notes."""
+        import matplotlib.pyplot as plt
 
         if df.empty or not features:
             raise ValueError("No filtered data/features available for export.")
@@ -2119,162 +2219,146 @@ if selected_features and not filtered.empty:
 
         n_features = max(1, len(features))
         n_points = max_points_per_trace(df)
-        width_in = max(16.0, min(30.0, n_points * 0.20))
-        height_in = max(7.0, 3.9 * n_features)
-        fig_m, axes = plt.subplots(n_features, 1, figsize=(width_in, height_in), dpi=170, squeeze=False)
+        width_in = max(18.0, min(34.0, n_points * (0.34 if len(series_values) > 1 else 0.27)))
+        height_in = max(7.0, 4.6 * n_features)
+        fig_m, axes = plt.subplots(n_features, 1, figsize=(width_in, height_in), dpi=220, squeeze=False)
         axes = axes.flatten()
-        fig_m.suptitle(chart_title_from_data(df), fontsize=20, fontweight="bold", y=0.995)
+        fig_m.suptitle(chart_title_from_data(df, custom_chart_title), fontsize=24, fontweight="bold", y=0.995)
 
+        group_col = "series_label" if "series_label" in df.columns else "well"
         for ax, feature in zip(axes, features):
             for wi, series_label in enumerate(series_values):
-                group_col = "series_label" if "series_label" in df.columns else "well"
                 g = df[df[group_col].astype(str) == series_label].copy()
                 if g.empty or feature not in g.columns:
                     continue
-
                 sort_col = "plot_x" if "plot_x" in g.columns else ("datetime" if "datetime" in g.columns else None)
-                if sort_col:
-                    g = g.sort_values(sort_col)
-                else:
-                    g = g.reset_index(drop=True)
+                g = g.sort_values(sort_col).reset_index(drop=True) if sort_col else g.reset_index(drop=True)
 
                 y = pd.to_numeric(g[feature], errors="coerce")
                 if y.notna().sum() == 0:
                     continue
+                x = _matplotlib_x_values(g)
 
-                if x_axis_mode == "Real calendar time" and "datetime" in g.columns and g["datetime"].notna().any():
-                    x = pd.to_datetime(g["datetime"], errors="coerce")
-                elif "plot_x" in g.columns and g["plot_x"].notna().any():
-                    x = pd.to_numeric(g["plot_x"], errors="coerce")
-                else:
-                    x = pd.Series(range(1, len(g) + 1), index=g.index)
+                color = well_color(wi) if len(series_values) > 1 else feature_color(feature, wi)
+                ax.plot(
+                    x,
+                    y,
+                    marker="o" if show_points else None,
+                    markersize=4.8,
+                    linewidth=2.4,
+                    color=color,
+                    label=series_label if len(series_values) > 1 else None,
+                )
 
-                color = feature_color(feature, wi)
-                ax.plot(x, y, marker="o" if show_points else None, markersize=4, linewidth=2.1, color=color, label=series_label if len(series_values) > 1 else None)
+                idxs = chart_label_indices_for_export(g, feature)
+                for i in sorted(idxs):
+                    if i >= len(g) or pd.isna(y.iloc[i]):
+                        continue
+                    ax.annotate(
+                        format_plot_value(feature, y.iloc[i]),
+                        (x.iloc[i], y.iloc[i]),
+                        textcoords="offset points",
+                        xytext=(0, 11 if i % 2 == 0 else -16),
+                        ha="center",
+                        fontsize=10.5,
+                        color=color,
+                        fontweight="bold",
+                        bbox=dict(boxstyle="round,pad=0.10", fc="white", ec="none", alpha=0.72),
+                    )
 
             if feature in custom_y_ranges:
                 ax.set_ylim(custom_y_ranges[feature][0], custom_y_ranges[feature][1])
-            ax.set_ylabel(column_label(feature), fontsize=12, fontweight="bold")
+            else:
+                vals = pd.to_numeric(df[feature], errors="coerce").dropna()
+                if not vals.empty:
+                    ymin = float(vals.min())
+                    ymax = float(vals.max())
+                    pad = max((ymax - ymin) * 0.22, max(abs(ymax), 1) * 0.03, 0.5)
+                    ax.set_ylim(ymin - pad, ymax + pad)
+
+            _apply_matplotlib_notes(ax)
+            ax.set_ylabel(column_label(feature), fontsize=14, fontweight="bold")
             ax.grid(True, which="major", alpha=0.28)
-            ax.tick_params(axis="both", labelsize=10)
-
-            if x_axis_mode == "Real calendar time" and "datetime" in df.columns and df["datetime"].notna().any():
-                ax.xaxis.set_major_formatter(mdates.DateFormatter("%d-%b\n%H:%M"))
-                ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=6, maxticks=12))
-            elif x_axis_mode.startswith("Compressed"):
-                tick_settings = compressed_axis_tick_kwargs(df)
-                if tick_settings:
-                    ax.set_xticks(tick_settings.get("tickvals", []))
-                    ax.set_xticklabels([str(t).replace("<br>", "\n") for t in tick_settings.get("ticktext", [])], rotation=0)
-                for x_sep in compressed_separator_positions(df):
-                    ax.axvline(x_sep, color="#64748b", linestyle=":", linewidth=1.3, alpha=0.75)
-
+            ax.tick_params(axis="both", labelsize=11)
+            _apply_matplotlib_x_axis(ax, df)
             if len(series_values) > 1:
-                ax.legend(fontsize=9, loc="best")
+                ax.legend(fontsize=11, loc="best")
 
-        axes[-1].set_xlabel(x_axis_title_from_mode(x_axis_mode), fontsize=12, fontweight="bold")
+        axes[-1].set_xlabel(x_axis_title_from_mode(x_axis_mode), fontsize=14, fontweight="bold")
         fig_m.tight_layout(rect=[0.02, 0.02, 0.98, 0.975])
 
         output = io.BytesIO()
         if fmt == "pdf":
             fig_m.savefig(output, format="pdf", bbox_inches="tight")
         else:
-            fig_m.savefig(output, format="png", dpi=190, bbox_inches="tight")
+            fig_m.savefig(output, format="png", dpi=260, bbox_inches="tight")
         plt.close(fig_m)
         output.seek(0)
         return output.getvalue()
 
-    # Keep only chart export buttons in the main view. The cleaned Excel and filtered CSV buttons were removed.
-    d3, d4 = st.columns(2)
+    def human_readable_multi_png_bytes(df, features):
+        """One phone-friendly high-resolution PNG containing one large panel per feature."""
+        return matplotlib_overview_export_bytes(df, features, fmt="png")
 
-    # Wide export prevents label overlap when there are many readings.
-    n_export_points = max_points_per_trace(filtered)
-    if value_label_mode == "All values - use wide export":
-        export_width = max(2200, min(4200, n_export_points * 55))
-    else:
-        export_width = max(2000, min(3600, n_export_points * 42))
+    st.subheader("Chart downloads")
 
-    export_height = max(1000, 390 * len(selected_features))
+    dl1, dl2 = st.columns(2)
+    dl3, dl4 = st.columns(2)
 
-    png_bytes, png_error = plotly_static_image_bytes(
-        fig, "png", width=export_width, height=export_height, scale=2
-    )
-    png_label = "Download readable chart PNG"
-    if png_bytes is None:
-        try:
-            png_bytes = matplotlib_overview_export_bytes(filtered, selected_features, fmt="png")
-            png_label = "Download readable chart PNG"
-            with d3:
-                st.caption("Plotly/Kaleido PNG export was unavailable, so a Matplotlib PNG fallback was used.")
-        except Exception as fallback_error:
-            with d3:
-                st.error("PNG export failed.")
-                st.caption(f"Plotly/Kaleido error: {png_error}")
-                st.caption(f"Matplotlib fallback error: {fallback_error}")
-
-    if png_bytes is not None:
-        with d3:
+    try:
+        single_png = matplotlib_overview_export_bytes(filtered, selected_features, fmt="png")
+        with dl1:
             st.download_button(
-                png_label,
-                data=png_bytes,
-                file_name="tmu_chart_readable.png",
+                "Download single chart PNG",
+                data=single_png,
+                file_name="tmu_single_chart.png",
                 mime="image/png",
             )
+    except Exception as e:
+        with dl1:
+            st.error("PNG export failed.")
+            st.caption(str(e))
 
-    pdf_bytes, pdf_error = plotly_static_image_bytes(
-        fig, "pdf", width=export_width, height=export_height
-    )
-    pdf_label = "Download readable chart PDF"
-    if pdf_bytes is None:
-        try:
-            pdf_bytes = matplotlib_overview_export_bytes(filtered, selected_features, fmt="pdf")
-            pdf_label = "Download readable chart PDF"
-            with d4:
-                st.caption("Plotly/Kaleido PDF export was unavailable, so a Matplotlib PDF fallback was used.")
-        except Exception as fallback_error:
-            with d4:
-                st.error("PDF export failed.")
-                st.caption(f"Plotly/Kaleido error: {pdf_error}")
-                st.caption(f"Matplotlib fallback error: {fallback_error}")
-
-    if pdf_bytes is not None:
-        with d4:
-            st.download_button(
-                pdf_label,
-                data=pdf_bytes,
-                file_name="tmu_chart_readable.pdf",
-                mime="application/pdf",
-            )
-
-    st.markdown("#### Human-readable report exports")
-    st.caption(
-        "Use these when the overview PNG/PDF is still too crowded. "
-        "They create one large chart per selected feature, so text and values are readable."
-    )
-
-    hr1, hr2 = st.columns(2)
     try:
-        with hr1:
+        single_pdf = matplotlib_overview_export_bytes(filtered, selected_features, fmt="pdf")
+        with dl2:
             st.download_button(
-                "Download multi-page readable PDF",
-                data=human_readable_pdf_bytes(filtered, selected_features),
-                file_name="tmu_human_readable_report.pdf",
+                "Download single chart PDF",
+                data=single_pdf,
+                file_name="tmu_single_chart.pdf",
                 mime="application/pdf",
             )
     except Exception as e:
-        with hr1:
-            st.caption(f"Human-readable PDF export error: {e}")
+        with dl2:
+            st.error("PDF export failed.")
+            st.caption(str(e))
 
     try:
-        with hr2:
+        multi_png = human_readable_multi_png_bytes(filtered, selected_features)
+        with dl3:
             st.download_button(
-                "Download readable PNGs ZIP",
-                data=human_readable_png_zip_bytes(filtered, selected_features),
-                file_name="tmu_readable_png_charts.zip",
-                mime="application/zip",
+                "Download separate charts PNGs",
+                data=multi_png,
+                file_name="tmu_multi_charts.png",
+                mime="image/png",
             )
     except Exception as e:
-        with hr2:
-            st.caption(f"Readable PNG ZIP export error: {e}")
+        with dl3:
+            st.error("Multi-chart PNG export failed.")
+            st.caption(str(e))
+
+    try:
+        multi_pdf = human_readable_pdf_bytes(filtered, selected_features)
+        with dl4:
+            st.download_button(
+                "Download multi-charts PDF",
+                data=multi_pdf,
+                file_name="tmu_multi_charts.pdf",
+                mime="application/pdf",
+            )
+    except Exception as e:
+        with dl4:
+            st.error("Multi-chart PDF export failed.")
+            st.caption(str(e))
 else:
     st.warning("Choose at least one feature to plot, and make sure the filters leave some rows.")
