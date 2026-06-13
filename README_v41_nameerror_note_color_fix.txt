@@ -1,0 +1,1 @@
+v41 fixes NameError: note_col was accidentally used as the global Plotly layout font color outside the note loop. It is now reset to #111827 while note-specific colors remain active for event/interval annotations.

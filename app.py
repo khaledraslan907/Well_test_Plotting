@@ -2006,7 +2006,7 @@ if selected_features and not filtered.empty:
                 uniformtext_mode="hide",
                 plot_bgcolor="white",
                 paper_bgcolor="white",
-                font=dict(color=note_col, size=15),
+                font=dict(color="#111827", size=15),
                 legend=dict(
                     font=dict(size=17, color="#111827"),
                     bgcolor="rgba(255,255,255,0.90)",
