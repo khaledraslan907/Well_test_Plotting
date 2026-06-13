@@ -769,8 +769,25 @@ def add_plot_axis_columns(df, x_axis_mode, trace_grouping="Auto", continuous_gap
     else:
         out["series_group_key"] = "All"
     out["series_label"] = out["series_group_key"]
+    out["series_segment_id"] = 0
     out["plot_x"] = None
     out.attrs["compressed_separators"] = []
+
+    if "datetime" in out.columns and out["datetime"].notna().any():
+        for _, idx in out.groupby("series_group_key", dropna=False).groups.items():
+            g0 = out.loc[idx].copy().sort_values("datetime")
+            seg_id = 0
+            prev_dt = None
+            for row_idx, dt in zip(g0.index, pd.to_datetime(g0["datetime"], errors="coerce")):
+                if pd.isna(dt):
+                    out.loc[row_idx, "series_segment_id"] = seg_id
+                    continue
+                if prev_dt is not None:
+                    diff_h = max((pd.Timestamp(dt) - pd.Timestamp(prev_dt)).total_seconds() / 3600.0, 0.0)
+                    if diff_h > max(float(continuous_gap_hours or 0), 0.0):
+                        seg_id += 1
+                out.loc[row_idx, "series_segment_id"] = seg_id
+                prev_dt = dt
 
     if x_axis_mode == "Real calendar time":
         if "datetime" in out.columns and out["datetime"].notna().any():
@@ -811,6 +828,41 @@ def x_axis_title_from_mode(x_axis_mode):
     if is_compressed_real_date_mode(x_axis_mode):
         return "Compressed real-date timeline — empty gaps removed"
     return "Time"
+
+
+def iter_plot_segments(g):
+    if g is None or g.empty:
+        return []
+    sort_col = "plot_x" if "plot_x" in g.columns else ("datetime" if "datetime" in g.columns else None)
+    if "series_segment_id" in g.columns:
+        segments = []
+        for _, seg in g.groupby("series_segment_id", dropna=False, sort=True):
+            seg2 = seg.sort_values(sort_col).reset_index(drop=True) if sort_col else seg.reset_index(drop=True)
+            if not seg2.empty:
+                segments.append(seg2)
+        return segments
+    return [g.sort_values(sort_col).reset_index(drop=True) if sort_col else g.reset_index(drop=True)]
+
+
+def interval_levels(intervals):
+    if not intervals:
+        return []
+    decorated = []
+    active_ends = []
+    for interval in sorted(intervals, key=lambda x: (x.get("x0", 0), x.get("x1", 0))):
+        x0 = interval.get("x0", 0)
+        x1 = interval.get("x1", x0)
+        level = 0
+        while level < len(active_ends) and x0 < active_ends[level]:
+            level += 1
+        if level == len(active_ends):
+            active_ends.append(x1)
+        else:
+            active_ends[level] = x1
+        item = dict(interval)
+        item["level"] = level
+        decorated.append(item)
+    return decorated
 
 
 def note_target_matches_series(target, series_label):
@@ -951,7 +1003,6 @@ with st.sidebar:
         [
             "Real calendar time",
             "Compressed real dates - remove empty gaps",
-            "Aligned elapsed time - best for comparing wells",
         ],
         index=0,
         help=(
@@ -1403,8 +1454,6 @@ with st.expander("Detected data preview", expanded=False):
 if selected_features and not filtered.empty:
     st.subheader("Interactive plot")
     series_count_for_hint = filtered["series_label"].dropna().astype(str).nunique() if "series_label" in filtered.columns else 1
-    if series_count_for_hint > 1 and is_compressed_real_date_mode(x_axis_mode):
-        st.info("Compressed real dates now uses one color per well and removes long empty gaps. For comparing two different wells by test duration, use 'Aligned elapsed time'.")
     if is_compressed_real_date_mode(x_axis_mode):
         st.caption(f"Continuous threshold: gaps ≤ {continuous_gap_hours:g} h stay continuous; longer gaps are compressed to {compressed_gap_hours:g} h visual space.")
     if x_axis_mode == "Real calendar time":
@@ -1452,10 +1501,11 @@ if selected_features and not filtered.empty:
         if not plot_intervals:
             return fig
 
-        for interval in plot_intervals:
+        for interval in interval_levels(plot_intervals):
             x0 = interval["x0"]
             x1 = interval["x1"]
             label = interval["label"]
+            level = interval.get("level", 0)
 
             # Draw only the interval start and end lines. No shaded background.
             for r in range(1, len(features) + 1):
@@ -1486,7 +1536,7 @@ if selected_features and not filtered.empty:
                     yref = f"y{r if r > 1 else ''} domain"
                     fig.add_annotation(
                         x=x_mid,
-                        y=0.96,
+                        y=max(0.58, 0.96 - 0.12 * level),
                         xref=xref,
                         yref=yref,
                         text=f"← {label} →",
@@ -1639,7 +1689,7 @@ if selected_features and not filtered.empty:
 
         if multi_series and value_label_mode != "All values - use wide export":
             # Comparison/mobile view: prevent label collision by keeping only key markers.
-            divisions = 3 if chart_view_mode == "Mobile-friendly" else 5
+            divisions = 2 if chart_view_mode == "Mobile-friendly" else 5
             if n > 12:
                 idxs.update(range(0, n, max(1, n // divisions)))
             return {i for i in idxs if 0 <= i < n}
@@ -1657,8 +1707,9 @@ if selected_features and not filtered.empty:
         else:
             idxs.update(label_indices(n, "Auto sparse - recommended"))
 
-        if len(idxs) > 45:
-            idxs = set(sorted(idxs)[::max(1, len(idxs) // 45)])
+        max_labels = 20 if chart_view_mode == "Mobile-friendly" else 45
+        if len(idxs) > max_labels:
+            idxs = set(sorted(idxs)[::max(1, len(idxs) // max_labels)])
             idxs.update({0, n - 1})
 
         return {i for i in idxs if 0 <= i < n}
@@ -1720,35 +1771,37 @@ if selected_features and not filtered.empty:
                 feature_data_for_range = []
 
                 for series_label in series_values:
-                    g = df[df["series_label"].astype(str) == series_label].sort_values(
-                        "plot_x" if "plot_x" in df.columns else ("datetime" if "datetime" in df.columns else df.index.name)
-                    )
-                    if g.empty or feature not in g.columns:
+                    g_all = df[df["series_label"].astype(str) == series_label].copy()
+                    if g_all.empty or feature not in g_all.columns:
                         continue
 
-                    text, textposition = build_text_and_positions(g, feature)
-                    feature_data_for_range.append(g[[feature]])
-
+                    feature_data_for_range.append(g_all[[feature]])
                     series_idx = series_values.index(series_label)
                     color = well_color(series_idx) if len(series_values) > 1 else feature_color(feature, series_idx)
-                    fig.add_trace(
-                        go.Scatter(
-                            x=x_values(g),
-                            y=g[feature],
-                            mode=line_mode + ("+text" if value_label_mode != "Off" else ""),
-                            text=text,
-                            textposition=textposition,
-                            textfont=dict(size=16, color=color, family="Arial, sans-serif"),
-                            cliponaxis=False,
-                            name=f"{series_label}",
-                            legendgroup=str(series_label),
-                            showlegend=(show_chart_legend and row_idx == 1),
-                            line=dict(color=color, width=3.0),
-                            marker=dict(color=color, size=8),
-                        ),
-                        row=row_idx,
-                        col=1,
-                    )
+                    first_segment = True
+                    for g in iter_plot_segments(g_all):
+                        if g.empty:
+                            continue
+                        text, textposition = build_text_and_positions(g, feature)
+                        fig.add_trace(
+                            go.Scatter(
+                                x=x_values(g),
+                                y=g[feature],
+                                mode=line_mode + ("+text" if value_label_mode != "Off" else ""),
+                                text=text,
+                                textposition=textposition,
+                                textfont=dict(size=13 if chart_view_mode == "Mobile-friendly" else 16, color=color, family="Arial, sans-serif"),
+                                cliponaxis=False,
+                                name=f"{series_label}",
+                                legendgroup=str(series_label),
+                                showlegend=(show_chart_legend and row_idx == 1 and first_segment),
+                                line=dict(color=color, width=3.0),
+                                marker=dict(color=color, size=6 if chart_view_mode == "Mobile-friendly" else 8),
+                            ),
+                            row=row_idx,
+                            col=1,
+                        )
+                        first_segment = False
 
                 y_range = padded_range(pd.concat(feature_data_for_range), feature) if feature_data_for_range else None
                 fig.update_yaxes(
@@ -1833,27 +1886,30 @@ if selected_features and not filtered.empty:
         fig = go.Figure()
         for feature in features:
             for series_label in series_values:
-                g = df[df["series_label"].astype(str) == series_label].copy()
-                if g.empty or feature not in g.columns:
+                g_all = df[df["series_label"].astype(str) == series_label].copy()
+                if g_all.empty or feature not in g_all.columns:
                     continue
 
-                y = g[feature].astype(float)
                 plot_name = f"{series_label} - {column_label(feature)}"
-
                 y_title = "Actual values"
-
                 series_idx = series_values.index(series_label)
                 color = feature_color(feature, series_idx)
-                fig.add_trace(
-                    go.Scatter(
-                        x=x_values(g),
-                        y=y,
-                        mode=line_mode,
-                        name=plot_name,
-                        line=dict(color=color, width=2.5),
-                        marker=dict(color=color, size=7),
+                first_segment = True
+                for g in iter_plot_segments(g_all):
+                    y = g[feature].astype(float)
+                    fig.add_trace(
+                        go.Scatter(
+                            x=x_values(g),
+                            y=y,
+                            mode=line_mode,
+                            name=plot_name,
+                            legendgroup=plot_name,
+                            showlegend=first_segment,
+                            line=dict(color=color, width=2.5),
+                            marker=dict(color=color, size=7),
+                        )
                     )
-                )
+                    first_segment = False
 
         fig.update_layout(
             height=850,
@@ -1984,48 +2040,53 @@ if selected_features and not filtered.empty:
 
         with PdfPages(output) as pdf:
             for feature in features:
-                fig_m, ax = plt.subplots(figsize=(16.5, 9.3), dpi=160)
+                fig_m, ax = plt.subplots(figsize=(18.5, 11.0), dpi=180)
                 title = f"{chart_title_from_data(df, custom_chart_title)}\n{column_label(feature)}"
                 ax.set_title(title, fontsize=22, fontweight="bold", pad=18)
 
                 for wi, series_label in enumerate(series_values):
-                    g = df[df["series_label"].astype(str) == series_label].sort_values(
-                        "plot_x" if "plot_x" in df.columns else ("datetime" if "datetime" in df.columns else df.index.name)
-                    ).reset_index(drop=True)
-                    if g.empty or feature not in g.columns:
+                    g_all = df[df["series_label"].astype(str) == series_label].copy()
+                    if g_all.empty or feature not in g_all.columns:
                         continue
-
-                    x = g["plot_x"] if "plot_x" in g.columns and g["plot_x"].notna().any() else (
-                        pd.to_datetime(g["datetime"], errors="coerce") if "datetime" in g.columns and g["datetime"].notna().any() else pd.Series(range(len(g)))
-                    )
-                    y = pd.to_numeric(g[feature], errors="coerce")
                     color = feature_color(feature, wi)
-
-                    ax.plot(
-                        x,
-                        y,
-                        marker="o",
-                        markersize=4.8,
-                        linewidth=2.4,
-                        color=color,
-                        label=series_label if len(series_values) > 1 else None,
-                    )
-
-                    idxs = chart_label_indices_for_export(g, feature)
-                    for i in sorted(idxs):
-                        if i >= len(g) or pd.isna(y.iloc[i]):
-                            continue
-                        ax.annotate(
-                            format_plot_value(feature, y.iloc[i]),
-                            (x.iloc[i], y.iloc[i]),
-                            textcoords="offset points",
-                            xytext=(0, 10 if i % 2 == 0 else -15),
-                            ha="center",
-                            fontsize=10.5,
-                            color=color,
-                            fontweight="bold",
-                            bbox=dict(boxstyle="round,pad=0.12", fc="white", ec="none", alpha=0.65),
+                    first_segment = True
+                    for g in iter_plot_segments(g_all):
+                        x = g["plot_x"] if "plot_x" in g.columns and g["plot_x"].notna().any() else (
+                            pd.to_datetime(g["datetime"], errors="coerce") if "datetime" in g.columns and g["datetime"].notna().any() else pd.Series(range(len(g)))
                         )
+                        y = pd.to_numeric(g[feature], errors="coerce")
+                        ax.plot(
+                            x,
+                            y,
+                            marker="o",
+                            markersize=4.6,
+                            linewidth=2.2,
+                            color=color,
+                            label=series_label if (len(series_values) > 1 and first_segment) else None,
+                        )
+
+                        idxs = chart_label_indices_for_export(g, feature)
+                        max_lbl = 16 if chart_view_mode == "Mobile-friendly" else 24
+                        if len(idxs) > max_lbl:
+                            keep = sorted(idxs)
+                            step = max(1, len(keep) // max_lbl)
+                            idxs = set(keep[::step])
+                            idxs.update({0, len(g) - 1})
+                        for i in sorted(idxs):
+                            if i >= len(g) or pd.isna(y.iloc[i]):
+                                continue
+                            ax.annotate(
+                                format_plot_value(feature, y.iloc[i]),
+                                (x.iloc[i], y.iloc[i]),
+                                textcoords="offset points",
+                                xytext=(0, 10 if i % 2 == 0 else -15),
+                                ha="center",
+                                fontsize=9.5,
+                                color=color,
+                                fontweight="bold",
+                                bbox=dict(boxstyle="round,pad=0.12", fc="white", ec="none", alpha=0.65),
+                            )
+                        first_segment = False
 
                 if feature in custom_y_ranges:
                     ax.set_ylim(custom_y_ranges[feature][0], custom_y_ranges[feature][1])
@@ -2043,8 +2104,8 @@ if selected_features and not filtered.empty:
                 if plot_intervals:
                     ymin_i, ymax_i = ax.get_ylim()
                     y_span = ymax_i - ymin_i if ymax_i != ymin_i else 1.0
-                    y_note = ymax_i - 0.04 * y_span
-                    for interval in plot_intervals:
+                    base_y_note = ymax_i - 0.04 * y_span
+                    for interval in interval_levels(plot_intervals):
                         x0 = interval["x0"]
                         x1 = interval["x1"]
                         ax.axvline(x0, color="#92400e", linestyle="--", linewidth=1.8, alpha=0.90)
@@ -2053,6 +2114,7 @@ if selected_features and not filtered.empty:
                             x_mid = x0 + (x1 - x0) / 2
                         except Exception:
                             x_mid = x0
+                        y_note = base_y_note - interval.get("level", 0) * 0.08 * y_span
                         try:
                             ax.annotate(
                                 "",
@@ -2187,7 +2249,7 @@ if selected_features and not filtered.empty:
                     ymin_i, ymax_i = ax.get_ylim()
                     y_span = ymax_i - ymin_i if ymax_i != ymin_i else 1.0
                     y_note = ymax_i - 0.04 * y_span
-                    for interval in plot_intervals:
+                    for interval in interval_levels(plot_intervals):
                         x0 = interval["x0"]
                         x1 = interval["x1"]
                         ax.axvline(x0, color="#92400e", linestyle="--", linewidth=1.8, alpha=0.90)
@@ -2464,8 +2526,55 @@ if selected_features and not filtered.empty:
         return output.getvalue()
 
     def human_readable_multi_png_bytes(df, features):
-        """One phone-friendly high-resolution PNG containing one large panel per feature."""
-        return matplotlib_overview_export_bytes(df, features, fmt="png")
+        """One phone-friendly high-resolution PNG with larger per-feature panels than the overview export."""
+        import matplotlib.pyplot as plt
+        if df.empty or not features:
+            raise ValueError("No filtered data/features available for export.")
+        series_values = sorted(df["series_label"].dropna().astype(str).unique()) if "series_label" in df.columns else (
+            sorted(df["well"].dropna().astype(str).unique()) if "well" in df.columns else ["All"]
+        )
+        n_features = max(1, len(features))
+        width_in = 18.0 if chart_view_mode == "Mobile-friendly" else 20.0
+        height_in = max(8.5, 7.0 * n_features)
+        fig_m, axes = plt.subplots(n_features, 1, figsize=(width_in, height_in), dpi=220, squeeze=False)
+        axes = axes.flatten()
+        fig_m.suptitle(chart_title_from_data(df, custom_chart_title), fontsize=22, fontweight="bold", y=0.995)
+        for ax, feature in zip(axes, features):
+            for wi, series_label in enumerate(series_values):
+                g_all = df[df[("series_label")].astype(str) == series_label].copy()
+                if g_all.empty or feature not in g_all.columns:
+                    continue
+                color = well_color(wi) if len(series_values) > 1 else feature_color(feature, wi)
+                first_segment = True
+                for g in iter_plot_segments(g_all):
+                    x = _matplotlib_x_values(g)
+                    y = pd.to_numeric(g[feature], errors="coerce")
+                    ax.plot(x, y, marker="o" if show_points else None, markersize=4.0, linewidth=2.2, color=color, label=series_label if (len(series_values) > 1 and first_segment) else None)
+                    idxs = chart_label_indices_for_export(g, feature)
+                    max_lbl = 12 if chart_view_mode == "Mobile-friendly" else 18
+                    if len(idxs) > max_lbl:
+                        keep = sorted(idxs)
+                        step = max(1, len(keep) // max_lbl)
+                        idxs = set(keep[::step])
+                        idxs.update({0, len(g) - 1})
+                    for i in sorted(idxs):
+                        if i >= len(g) or pd.isna(y.iloc[i]):
+                            continue
+                        ax.annotate(format_plot_value(feature, y.iloc[i]), (x.iloc[i], y.iloc[i]), textcoords="offset points", xytext=(0, 9 if i % 2 == 0 else -14), ha="center", fontsize=9.0, color=color, fontweight="bold", bbox=dict(boxstyle="round,pad=0.10", fc="white", ec="none", alpha=0.70))
+                    first_segment = False
+            vals = pd.to_numeric(df[feature], errors="coerce").dropna()
+            if not vals.empty:
+                ymin = float(vals.min()); ymax = float(vals.max()); pad = max((ymax-ymin)*0.22, max(abs(ymax),1)*0.03, 0.5); ax.set_ylim(ymin-pad, ymax+pad)
+            ax.set_ylabel(column_label(feature), fontsize=13, fontweight="bold")
+            _apply_matplotlib_notes(ax)
+            ax.grid(True, which="major", alpha=0.28)
+            ax.tick_params(axis="both", labelsize=10)
+            _apply_matplotlib_x_axis(ax, df)
+            if len(series_values) > 1:
+                ax.legend(fontsize=10, loc="best")
+        axes[-1].set_xlabel(x_axis_title_from_mode(x_axis_mode), fontsize=13, fontweight="bold")
+        fig_m.tight_layout(rect=[0.02, 0.02, 0.98, 0.975])
+        output = io.BytesIO(); fig_m.savefig(output, format="png", dpi=260, bbox_inches="tight"); plt.close(fig_m); output.seek(0); return output.getvalue()
 
 
     def _prepare_export(export_key, fmt_label, make_bytes_func, file_name, mime):
@@ -2522,7 +2631,7 @@ if selected_features and not filtered.empty:
             "multi_png",
             "separate charts PNGs",
             lambda: human_readable_multi_png_bytes(filtered, selected_features),
-            "tmu_multi_charts.png",
+            "tmu_separate_charts.png",
             "image/png",
         )
 
