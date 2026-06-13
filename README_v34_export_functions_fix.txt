@@ -1,1 +1,0 @@
-v35 UI cleanup: removed aligned elapsed option and old compressed-date message, separate charts PNGs now downloads a ZIP with one PNG per feature, and multi-charts PDF uses a larger page with sparser value labels for readability.
