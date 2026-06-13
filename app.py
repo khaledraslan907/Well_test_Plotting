@@ -1113,11 +1113,19 @@ with st.sidebar:
         format_func=column_label,
     )
 
+    if selected_wells:
+        if len(selected_wells) == 1:
+            auto_chart_header = f"Well {selected_wells[0]}"
+        else:
+            auto_chart_header = " vs ".join(selected_wells[:5]) + (f" +{len(selected_wells) - 5} more" if len(selected_wells) > 5 else "")
+    else:
+        auto_chart_header = "Well Production Test"
+
     custom_chart_title = st.text_input(
-        "Chart title",
-        value="",
-        placeholder="Leave blank to use well name(s) only",
-        help="Optional. If blank, the title will be Well name only, without date.",
+        "Chart header / title",
+        value=auto_chart_header,
+        help="Edit this header if you want a different title. The default uses well name(s) only, without date.",
+        key="chart_header_title_input",
     )
 
     custom_y_ranges = {}
@@ -1207,12 +1215,11 @@ with st.sidebar:
         index=0,
     )
 
-    note_color_theme = st.selectbox(
-        "Note color theme",
-        ["Automatic multi-color", "High contrast", "Oilfield earth tones", "Blue / green", "Monochrome dark"],
-        index=0,
-        help="Changes the colors used for event and interval notes in charts and exports.",
-    )
+    note_color_theme = "High contrast"
+
+    show_internal_names = False
+
+    st.header("5) Graph events")
 
     auto_hide_crowded_notes = st.checkbox(
         "Auto hide some notes when too crowded",
@@ -1232,10 +1239,6 @@ with st.sidebar:
         disabled=not auto_hide_crowded_notes,
         help="Used only when auto-hide is enabled.",
     )
-
-    show_internal_names = False
-
-    st.header("5) Graph events")
 
     st.caption("Select a start date/time and write a note. Add an optional end date/time only when the note should cover a period.")
 
@@ -1515,8 +1518,6 @@ with st.expander("Detected data preview", expanded=False):
 if selected_features and not filtered.empty:
     st.subheader("Interactive plot")
     series_count_for_hint = filtered["series_label"].dropna().astype(str).nunique() if "series_label" in filtered.columns else 1
-    if is_compressed_real_date_mode(x_axis_mode):
-        st.caption(f"Continuous threshold: gaps ≤ {continuous_gap_hours:g} h stay continuous; longer gaps are compressed to {compressed_gap_hours:g} h visual space.")
     if x_axis_mode == "Real calendar time":
         axis_tick_settings = x_axis_tick_kwargs(x_axis_scale)
     elif is_aligned_elapsed_mode(x_axis_mode):
