@@ -430,12 +430,21 @@ def compressed_axis_tick_kwargs(df, max_ticks_per_series=4, max_total_ticks=22):
     else:
         idxs = sorted(set(np.linspace(0, n - 1, max_total_ticks).round().astype(int).tolist()))
 
+    # Include year only when the displayed data spans more than one year.
+    # This keeps normal short tests clean, but prevents 2014 vs 2026 comparisons
+    # from looking like the same month/day.
+    years = pts["datetime"].dt.year.dropna().unique()
+    show_year = len(years) > 1 or (pts["datetime"].max() - pts["datetime"].min()).days >= 330
+
     tickvals = []
     ticktext = []
     for i in idxs:
         dt = pd.Timestamp(pts.loc[i, "datetime"])
         tickvals.append(float(pts.loc[i, "plot_x"]))
-        ticktext.append(dt.strftime("%d-%b<br>%H:%M"))
+        if show_year:
+            ticktext.append(dt.strftime("%d-%b-%Y<br>%H:%M"))
+        else:
+            ticktext.append(dt.strftime("%d-%b<br>%H:%M"))
 
     return {"tickmode": "array", "tickvals": tickvals, "ticktext": ticktext, "tickangle": 0}
 
@@ -845,11 +854,33 @@ def iter_plot_segments(g):
 
 
 def interval_levels(intervals):
+    """Assign visual rows for interval notes.
+
+    Longer/parent intervals are placed on the top row. Shorter intervals inside
+    them are placed underneath, so a main operation from 12:00-18:00 can sit
+    above two child steps from 12:00-15:00 and 15:00-18:00.
+    """
     if not intervals:
         return []
+    prepared = []
+    for interval in intervals:
+        x0 = interval.get("x0", 0)
+        x1 = interval.get("x1", x0)
+        try:
+            duration = abs(float(x1) - float(x0))
+        except Exception:
+            try:
+                duration = abs((x1 - x0).total_seconds())
+            except Exception:
+                duration = 0
+        item = dict(interval)
+        item["_duration"] = duration
+        prepared.append(item)
+
+    # Long intervals first, then early start. This gives parent intervals the top row.
     decorated = []
     active_ends = []
-    for interval in sorted(intervals, key=lambda x: (x.get("x0", 0), x.get("x1", 0))):
+    for interval in sorted(prepared, key=lambda x: (-x.get("_duration", 0), x.get("x0", 0), x.get("x1", 0))):
         x0 = interval.get("x0", 0)
         x1 = interval.get("x1", x0)
         level = 0
@@ -858,10 +889,14 @@ def interval_levels(intervals):
         if level == len(active_ends):
             active_ends.append(x1)
         else:
-            active_ends[level] = x1
-        item = dict(interval)
-        item["level"] = level
-        decorated.append(item)
+            active_ends[level] = max(active_ends[level], x1)
+        interval["level"] = level
+        decorated.append(interval)
+
+    # Draw from top to bottom, left to right.
+    decorated = sorted(decorated, key=lambda x: (x.get("level", 0), x.get("x0", 0), -x.get("_duration", 0)))
+    for item in decorated:
+        item.pop("_duration", None)
     return decorated
 
 
@@ -1172,6 +1207,32 @@ with st.sidebar:
         index=0,
     )
 
+    note_color_theme = st.selectbox(
+        "Note color theme",
+        ["Automatic multi-color", "High contrast", "Oilfield earth tones", "Blue / green", "Monochrome dark"],
+        index=0,
+        help="Changes the colors used for event and interval notes in charts and exports.",
+    )
+
+    auto_hide_crowded_notes = st.checkbox(
+        "Auto hide some notes when too crowded",
+        value=False,
+        help=(
+            "When enabled, the app keeps the most important/representative notes visible and hides extra notes "
+            "only on the chart/export. The full note list remains saved in the sidebar."
+        ),
+    )
+
+    max_visible_notes_per_chart = st.slider(
+        "Maximum visible notes per chart",
+        min_value=3,
+        max_value=20,
+        value=8,
+        step=1,
+        disabled=not auto_hide_crowded_notes,
+        help="Used only when auto-hide is enabled.",
+    )
+
     show_internal_names = False
 
     st.header("5) Graph events")
@@ -1475,6 +1536,119 @@ if selected_features and not filtered.empty:
         axis_tick_settings = {}
     x_axis_title = x_axis_title_from_mode(x_axis_mode)
 
+    NOTE_COLOR_PALETTES = {
+        "Automatic multi-color": [
+            "#92400e", "#1d4ed8", "#15803d", "#7c3aed", "#dc2626",
+            "#0f766e", "#c2410c", "#be185d", "#0369a1", "#4d7c0f",
+        ],
+        "High contrast": [
+            "#000000", "#d97706", "#2563eb", "#16a34a", "#dc2626",
+            "#9333ea", "#0891b2", "#db2777", "#65a30d", "#ea580c",
+        ],
+        "Oilfield earth tones": [
+            "#92400e", "#78350f", "#a16207", "#854d0e", "#7f1d1d",
+            "#166534", "#365314", "#475569", "#713f12", "#431407",
+        ],
+        "Blue / green": [
+            "#1d4ed8", "#0369a1", "#0f766e", "#15803d", "#4d7c0f",
+            "#0e7490", "#1e40af", "#065f46", "#2563eb", "#059669",
+        ],
+        "Monochrome dark": ["#111827"],
+    }
+
+    def note_palette():
+        return NOTE_COLOR_PALETTES.get(note_color_theme, NOTE_COLOR_PALETTES["Automatic multi-color"])
+
+    def note_color(idx):
+        palette = note_palette()
+        return palette[int(idx) % len(palette)]
+
+    def adaptive_note_font_sizes(total_note_count, mobile=False):
+        base_interval = 13 if not mobile else 11
+        base_event = 13 if not mobile else 11
+        if total_note_count >= 14:
+            base_interval -= 3
+            base_event -= 3
+        elif total_note_count >= 9:
+            base_interval -= 2
+            base_event -= 2
+        elif total_note_count >= 5:
+            base_interval -= 1
+            base_event -= 1
+        return max(base_interval, 8), max(base_event, 8)
+
+    def total_note_count():
+        return len(plot_intervals or []) + len(plot_events or [])
+
+    def note_event_levels(events, x_values=None, max_levels=4):
+        """Assign staggered rows for point-event labels so close labels do not overlap."""
+        if not events:
+            return []
+        try:
+            xs = []
+            for e in events:
+                try:
+                    xs.append(float(e.get("plot_x", 0)))
+                except Exception:
+                    pass
+            if x_values is not None:
+                try:
+                    xs += [float(v) for v in x_values if pd.notna(v)]
+                except Exception:
+                    pass
+            span = (max(xs) - min(xs)) if len(xs) >= 2 else 1.0
+            min_gap = max(span * 0.045, 0.5)
+        except Exception:
+            min_gap = 1.0
+
+        placed_until = [-1e18] * max_levels
+        decorated = []
+        sortable = []
+        for i, event in enumerate(events):
+            x = event.get("plot_x", 0)
+            try:
+                sx = float(x)
+            except Exception:
+                sx = float(i)
+            sortable.append((sx, i, dict(event)))
+        sortable.sort(key=lambda t: t[0])
+
+        for sx, _, event in sortable:
+            level = 0
+            while level < max_levels and sx - placed_until[level] < min_gap:
+                level += 1
+            if level >= max_levels:
+                level = max_levels - 1
+            placed_until[level] = sx
+            event["level"] = level
+            decorated.append(event)
+        return decorated
+
+    def _evenly_limit_items(items, max_items):
+        if not items or not auto_hide_crowded_notes:
+            return items
+        max_items = max(0, int(max_items or 0))
+        if max_items <= 0:
+            return []
+        if len(items) <= max_items:
+            return items
+        idxs = sorted(set(np.linspace(0, len(items) - 1, max_items).round().astype(int).tolist()))
+        return [items[i] for i in idxs]
+
+    def visible_intervals_for_notes():
+        intervals = interval_levels(plot_intervals)
+        if not auto_hide_crowded_notes:
+            return intervals
+        # Long parent intervals are already first from interval_levels(), so this keeps main events first.
+        return intervals[: int(max_visible_notes_per_chart)]
+
+    def visible_events_for_notes(x_values=None):
+        events = note_event_levels(plot_events, x_values=x_values, max_levels=4)
+        if not auto_hide_crowded_notes:
+            return events
+        remaining = int(max_visible_notes_per_chart) - len(visible_intervals_for_notes())
+        return _evenly_limit_items(events, max(0, remaining))
+
     def add_compressed_test_separators_to_plotly(fig, features):
         if not is_compressed_real_date_mode(x_axis_mode):
             return fig
@@ -1501,11 +1675,13 @@ if selected_features and not filtered.empty:
         if not plot_intervals:
             return fig
 
-        for interval in interval_levels(plot_intervals):
+        interval_font_size, _ = adaptive_note_font_sizes(total_note_count(), mobile=(chart_view_mode == "Mobile-friendly"))
+        for idx, interval in enumerate(visible_intervals_for_notes()):
             x0 = interval["x0"]
             x1 = interval["x1"]
             label = interval["label"]
             level = interval.get("level", 0)
+            note_col = note_color(idx)
 
             # Draw only the interval start and end lines. No shaded background.
             for r in range(1, len(features) + 1):
@@ -1515,7 +1691,7 @@ if selected_features and not filtered.empty:
                             x=x_val,
                             line_width=2.2,
                             line_dash="dash",
-                            line_color="#92400e",
+                            line_color=note_col,
                             opacity=0.90,
                             row=r,
                             col=1,
@@ -1528,23 +1704,24 @@ if selected_features and not filtered.empty:
             except Exception:
                 x_mid = x0
 
-            # Put the interval note inside every subplot, like point notes.
-            # This is clearer than one shared label at the top of the full figure.
+            # Put parent interval on the highest row and child intervals below it.
+            # Keep labels compact so nested events do not cover the curves.
             for r in range(1, len(features) + 1):
                 try:
                     xref = f"x{r if r > 1 else ''}"
                     yref = f"y{r if r > 1 else ''} domain"
+                    y_row = max(0.66, 0.96 - 0.10 * min(level, 3))
                     fig.add_annotation(
                         x=x_mid,
-                        y=max(0.58, 0.96 - 0.12 * level),
+                        y=y_row,
                         xref=xref,
                         yref=yref,
-                        text=f"← {label} →",
+                        text=label,
                         showarrow=False,
-                        bgcolor="rgba(255,255,255,0.96)",
-                        bordercolor="#92400e",
+                        bgcolor="rgba(255,255,255,0.98)",
+                        bordercolor=note_col,
                         borderwidth=1,
-                        font=dict(size=14, color="#111827"),
+                        font=dict(size=interval_font_size, color=note_col),
                     )
                 except Exception:
                     pass
@@ -1555,32 +1732,36 @@ if selected_features and not filtered.empty:
 
         if not plot_events:
             return fig
-        for event in plot_events:
+        _, event_font_size = adaptive_note_font_sizes(total_note_count(), mobile=(chart_view_mode == "Mobile-friendly"))
+        decorated_events = visible_events_for_notes(x_values=(filtered["plot_x"] if "plot_x" in filtered.columns else None))
+        for idx, event in enumerate(decorated_events):
             x = event["plot_x"]
             label = event["label"]
+            level = int(event.get("level", 0))
+            note_col = note_color(idx + len(plot_intervals or []))
             for r in range(1, len(features) + 1):
                 try:
                     fig.add_vline(
                         x=x,
                         line_width=2,
                         line_dash="dash",
-                        line_color="#111827",
+                        line_color=note_col,
                         opacity=0.75,
                         row=r,
                         col=1,
                     )
                     fig.add_annotation(
                         x=x,
-                        y=1,
+                        y=max(0.58, 0.98 - 0.08 * min(level, 4)),
                         xref=f"x{r if r > 1 else ''}",
                         yref=f"y{r if r > 1 else ''} domain",
                         text=label,
                         showarrow=False,
                         xanchor="left",
                         yanchor="top",
-                        font=dict(size=13, color="#111827"),
-                        bgcolor="rgba(255,255,255,0.85)",
-                        bordercolor="#111827",
+                        font=dict(size=event_font_size, color=note_col),
+                        bgcolor="rgba(255,255,255,0.88)",
+                        bordercolor=note_col,
                         borderwidth=1,
                     )
                 except Exception:
@@ -1825,7 +2006,7 @@ if selected_features and not filtered.empty:
                 uniformtext_mode="hide",
                 plot_bgcolor="white",
                 paper_bgcolor="white",
-                font=dict(color="#111827", size=15),
+                font=dict(color=note_col, size=15),
                 legend=dict(
                     font=dict(size=17, color="#111827"),
                     bgcolor="rgba(255,255,255,0.90)",
@@ -2101,56 +2282,11 @@ if selected_features and not filtered.empty:
                 ax.set_ylabel(column_label(feature), fontsize=15, fontweight="bold")
                 ax.set_xlabel(x_axis_title, fontsize=15, fontweight="bold")
 
-                if plot_intervals:
-                    ymin_i, ymax_i = ax.get_ylim()
-                    y_span = ymax_i - ymin_i if ymax_i != ymin_i else 1.0
-                    base_y_note = ymax_i - 0.04 * y_span
-                    for interval in interval_levels(plot_intervals):
-                        x0 = interval["x0"]
-                        x1 = interval["x1"]
-                        ax.axvline(x0, color="#92400e", linestyle="--", linewidth=1.8, alpha=0.90)
-                        ax.axvline(x1, color="#92400e", linestyle="--", linewidth=1.8, alpha=0.90)
-                        try:
-                            x_mid = x0 + (x1 - x0) / 2
-                        except Exception:
-                            x_mid = x0
-                        y_note = base_y_note - interval.get("level", 0) * 0.08 * y_span
-                        try:
-                            ax.annotate(
-                                "",
-                                xy=(x1, y_note),
-                                xytext=(x0, y_note),
-                                arrowprops=dict(arrowstyle="<->", color="#92400e", lw=1.8),
-                            )
-                        except Exception:
-                            pass
-                        ax.text(
-                            x_mid,
-                            y_note,
-                            interval["label"],
-                            fontsize=11,
-                            fontweight="bold",
-                            ha="center",
-                            va="center",
-                            color="#111827",
-                            bbox=dict(boxstyle="round,pad=0.22", fc="white", ec="#92400e", alpha=0.95),
-                        )
-
-                if plot_events:
-                    for event in plot_events:
-                        ax.axvline(event["plot_x"], color="#111827", linestyle="--", linewidth=1.6, alpha=0.75)
-                        ax.text(
-                            event["plot_x"],
-                            0.98,
-                            event["label"],
-                            transform=ax.get_xaxis_transform(),
-                            rotation=90,
-                            va="top",
-                            ha="right",
-                            fontsize=10,
-                            color="#111827",
-                            bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="#111827", alpha=0.75),
-                        )
+                try:
+                    x_for_notes = ax.lines[0].get_xdata() if ax.lines else None
+                except Exception:
+                    x_for_notes = None
+                _apply_matplotlib_notes(ax, x_values=x_for_notes)
                 ax.grid(True, which="major", alpha=0.28)
                 ax.tick_params(axis="both", labelsize=12)
 
@@ -2249,7 +2385,7 @@ if selected_features and not filtered.empty:
                     ymin_i, ymax_i = ax.get_ylim()
                     y_span = ymax_i - ymin_i if ymax_i != ymin_i else 1.0
                     y_note = ymax_i - 0.04 * y_span
-                    for interval in interval_levels(plot_intervals):
+                    for interval in visible_intervals_for_notes():
                         x0 = interval["x0"]
                         x1 = interval["x1"]
                         ax.axvline(x0, color="#92400e", linestyle="--", linewidth=1.8, alpha=0.90)
@@ -2357,7 +2493,9 @@ if selected_features and not filtered.empty:
     def _apply_matplotlib_x_axis(ax, df_for_ticks):
         import matplotlib.dates as mdates
         if x_axis_mode == "Real calendar time" and "datetime" in df_for_ticks.columns and df_for_ticks["datetime"].notna().any():
-            ax.xaxis.set_major_formatter(mdates.DateFormatter("%d-%b\n%H:%M"))
+            dt_all = pd.to_datetime(df_for_ticks["datetime"], errors="coerce").dropna()
+            fmt = "%d-%b-%Y\n%H:%M" if (not dt_all.empty and (dt_all.dt.year.nunique() > 1 or (dt_all.max() - dt_all.min()).days >= 330)) else "%d-%b\n%H:%M"
+            ax.xaxis.set_major_formatter(mdates.DateFormatter(fmt))
             ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=6, maxticks=12))
         elif is_aligned_elapsed_mode(x_axis_mode):
             tick_settings = elapsed_axis_tick_kwargs(df_for_ticks, max_ticks=8 if chart_view_mode == "Mobile-friendly" else 12)
@@ -2381,48 +2519,73 @@ if selected_features and not filtered.empty:
             for x_sep in compressed_separator_positions(df_for_ticks):
                 ax.axvline(x_sep, color="#64748b", linestyle=":", linewidth=1.4, alpha=0.70)
 
-    def _apply_matplotlib_notes(ax):
-        # Interval notes: start/end lines + a centered label inside each chart.
+    def _matplotlib_event_levels(events, x_values=None, max_levels=4):
+        return note_event_levels(events, x_values=x_values, max_levels=max_levels)
+
+    def _apply_matplotlib_notes(ax, x_values=None):
+        """Apply interval and point notes with staggered rows to avoid overlap in exports."""
+        # Interval notes: parent/long intervals on top row, child intervals below.
+        note_count = total_note_count()
+        interval_font_size, event_font_size = adaptive_note_font_sizes(note_count, mobile=(chart_view_mode == "Mobile-friendly"))
         if plot_intervals:
-            ymin_i, ymax_i = ax.get_ylim()
-            y_span = ymax_i - ymin_i if ymax_i != ymin_i else 1.0
-            y_note = ymax_i - 0.06 * y_span
-            for interval in plot_intervals:
+            for idx, interval in enumerate(visible_intervals_for_notes()):
                 x0 = interval["x0"]
                 x1 = interval["x1"]
-                ax.axvline(x0, color="#92400e", linestyle="--", linewidth=1.8, alpha=0.90)
-                ax.axvline(x1, color="#92400e", linestyle="--", linewidth=1.8, alpha=0.90)
+                level = int(interval.get("level", 0))
+                note_col = note_color(idx)
+                ax.axvline(x0, color=note_col, linestyle="--", linewidth=1.8, alpha=0.90)
+                ax.axvline(x1, color=note_col, linestyle="--", linewidth=1.8, alpha=0.90)
                 try:
                     x_mid = x0 + (x1 - x0) / 2
                 except Exception:
                     x_mid = x0
+                y_frac = max(0.68, 0.96 - 0.10 * min(level, 3))
+                try:
+                    ax.annotate(
+                        "",
+                        xy=(x1, y_frac),
+                        xytext=(x0, y_frac),
+                        xycoords=("data", "axes fraction"),
+                        textcoords=("data", "axes fraction"),
+                        arrowprops=dict(arrowstyle="<->", color=note_col, lw=1.7),
+                    )
+                except Exception:
+                    pass
                 ax.text(
                     x_mid,
-                    y_note,
-                    f"← {interval['label']} →",
-                    fontsize=10.5,
+                    min(0.985, y_frac + 0.016),
+                    interval["label"],
+                    transform=ax.get_xaxis_transform(),
+                    fontsize=interval_font_size,
                     fontweight="bold",
                     ha="center",
-                    va="center",
-                    color="#111827",
-                    bbox=dict(boxstyle="round,pad=0.22", fc="white", ec="#92400e", alpha=0.95),
+                    va="bottom",
+                    color=note_col,
+                    bbox=dict(boxstyle="round,pad=0.22", fc="white", ec=note_col, alpha=0.96),
+                    clip_on=False,
                 )
 
-        # Point notes: vertical line and small vertical label in every chart.
+        # Point notes: stagger close labels on multiple rows.
         if plot_events:
-            for event in plot_events:
-                ax.axvline(event["plot_x"], color="#111827", linestyle="--", linewidth=1.5, alpha=0.75)
+            event_rows = visible_events_for_notes(x_values=x_values)
+            base_frac = 0.80 if plot_intervals else 0.98
+            for idx, event in enumerate(event_rows):
+                level = int(event.get("level", 0))
+                note_col = note_color(idx + len(plot_intervals or []))
+                y_frac = max(0.56, base_frac - 0.08 * min(level, 4))
+                ax.axvline(event["plot_x"], color=note_col, linestyle="--", linewidth=1.5, alpha=0.78)
                 ax.text(
                     event["plot_x"],
-                    0.98,
+                    y_frac,
                     event["label"],
                     transform=ax.get_xaxis_transform(),
                     rotation=90,
                     va="top",
                     ha="right",
-                    fontsize=9.5,
-                    color="#111827",
-                    bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="#111827", alpha=0.75),
+                    fontsize=event_font_size,
+                    color=note_col,
+                    bbox=dict(boxstyle="round,pad=0.15", fc="white", ec=note_col, alpha=0.82),
+                    clip_on=False,
                 )
 
     def matplotlib_overview_export_bytes(df, features, fmt="png"):
@@ -2505,7 +2668,11 @@ if selected_features and not filtered.empty:
                     pad = max((ymax - ymin) * 0.22, max(abs(ymax), 1) * 0.03, 0.5)
                     ax.set_ylim(ymin - pad, ymax + pad)
 
-            _apply_matplotlib_notes(ax)
+            try:
+                x_for_notes = ax.lines[0].get_xdata() if ax.lines else None
+            except Exception:
+                x_for_notes = None
+            _apply_matplotlib_notes(ax, x_values=x_for_notes)
             ax.set_ylabel(column_label(feature), fontsize=14, fontweight="bold")
             ax.grid(True, which="major", alpha=0.28)
             ax.tick_params(axis="both", labelsize=11)
@@ -2526,32 +2693,44 @@ if selected_features and not filtered.empty:
         return output.getvalue()
 
     def human_readable_multi_png_bytes(df, features):
-        """One phone-friendly high-resolution PNG with larger per-feature panels than the overview export."""
+        """Create one PNG byte stream per selected feature for phone-friendly separate downloads."""
         import matplotlib.pyplot as plt
         if df.empty or not features:
             raise ValueError("No filtered data/features available for export.")
+
         series_values = sorted(df["series_label"].dropna().astype(str).unique()) if "series_label" in df.columns else (
             sorted(df["well"].dropna().astype(str).unique()) if "well" in df.columns else ["All"]
         )
-        n_features = max(1, len(features))
-        width_in = 18.0 if chart_view_mode == "Mobile-friendly" else 20.0
-        height_in = max(8.5, 7.0 * n_features)
-        fig_m, axes = plt.subplots(n_features, 1, figsize=(width_in, height_in), dpi=220, squeeze=False)
-        axes = axes.flatten()
-        fig_m.suptitle(chart_title_from_data(df, custom_chart_title), fontsize=22, fontweight="bold", y=0.995)
-        for ax, feature in zip(axes, features):
+        outputs = {}
+
+        for feature in features:
+            width_in = 18.0 if chart_view_mode == "Mobile-friendly" else 20.0
+            height_in = 9.5 if chart_view_mode == "Mobile-friendly" else 10.5
+            fig_m, ax = plt.subplots(figsize=(width_in, height_in), dpi=220)
+            ax.set_title(f"{chart_title_from_data(df, custom_chart_title)}\n{column_label(feature)}", fontsize=22, fontweight="bold", pad=18)
+
             for wi, series_label in enumerate(series_values):
-                g_all = df[df[("series_label")].astype(str) == series_label].copy()
+                g_all = df[df["series_label"].astype(str) == series_label].copy() if "series_label" in df.columns else df.copy()
                 if g_all.empty or feature not in g_all.columns:
                     continue
                 color = well_color(wi) if len(series_values) > 1 else feature_color(feature, wi)
                 first_segment = True
+
                 for g in iter_plot_segments(g_all):
                     x = _matplotlib_x_values(g)
                     y = pd.to_numeric(g[feature], errors="coerce")
-                    ax.plot(x, y, marker="o" if show_points else None, markersize=4.0, linewidth=2.2, color=color, label=series_label if (len(series_values) > 1 and first_segment) else None)
+                    ax.plot(
+                        x,
+                        y,
+                        marker="o" if show_points else None,
+                        markersize=4.4,
+                        linewidth=2.4,
+                        color=color,
+                        label=series_label if (len(series_values) > 1 and first_segment) else None,
+                    )
+
                     idxs = chart_label_indices_for_export(g, feature)
-                    max_lbl = 12 if chart_view_mode == "Mobile-friendly" else 18
+                    max_lbl = 14 if chart_view_mode == "Mobile-friendly" else 22
                     if len(idxs) > max_lbl:
                         keep = sorted(idxs)
                         step = max(1, len(keep) // max_lbl)
@@ -2560,21 +2739,49 @@ if selected_features and not filtered.empty:
                     for i in sorted(idxs):
                         if i >= len(g) or pd.isna(y.iloc[i]):
                             continue
-                        ax.annotate(format_plot_value(feature, y.iloc[i]), (x.iloc[i], y.iloc[i]), textcoords="offset points", xytext=(0, 9 if i % 2 == 0 else -14), ha="center", fontsize=9.0, color=color, fontweight="bold", bbox=dict(boxstyle="round,pad=0.10", fc="white", ec="none", alpha=0.70))
+                        ax.annotate(
+                            format_plot_value(feature, y.iloc[i]),
+                            (x.iloc[i], y.iloc[i]),
+                            textcoords="offset points",
+                            xytext=(0, 10 if i % 2 == 0 else -14),
+                            ha="center",
+                            fontsize=9.5,
+                            color=color,
+                            fontweight="bold",
+                            bbox=dict(boxstyle="round,pad=0.10", fc="white", ec="none", alpha=0.70),
+                        )
                     first_segment = False
+
             vals = pd.to_numeric(df[feature], errors="coerce").dropna()
             if not vals.empty:
-                ymin = float(vals.min()); ymax = float(vals.max()); pad = max((ymax-ymin)*0.22, max(abs(ymax),1)*0.03, 0.5); ax.set_ylim(ymin-pad, ymax+pad)
-            ax.set_ylabel(column_label(feature), fontsize=13, fontweight="bold")
-            _apply_matplotlib_notes(ax)
+                ymin = float(vals.min())
+                ymax = float(vals.max())
+                pad = max((ymax - ymin) * 0.22, max(abs(ymax), 1) * 0.03, 0.5)
+                ax.set_ylim(ymin - pad, ymax + pad)
+
+            ax.set_ylabel(column_label(feature), fontsize=15, fontweight="bold")
+            ax.set_xlabel(x_axis_title_from_mode(x_axis_mode), fontsize=14, fontweight="bold")
+            try:
+                x_for_notes = ax.lines[0].get_xdata() if ax.lines else None
+            except Exception:
+                x_for_notes = None
+            _apply_matplotlib_notes(ax, x_values=x_for_notes)
             ax.grid(True, which="major", alpha=0.28)
-            ax.tick_params(axis="both", labelsize=10)
+            ax.tick_params(axis="both", labelsize=11)
             _apply_matplotlib_x_axis(ax, df)
             if len(series_values) > 1:
-                ax.legend(fontsize=10, loc="best")
-        axes[-1].set_xlabel(x_axis_title_from_mode(x_axis_mode), fontsize=13, fontweight="bold")
-        fig_m.tight_layout(rect=[0.02, 0.02, 0.98, 0.975])
-        output = io.BytesIO(); fig_m.savefig(output, format="png", dpi=260, bbox_inches="tight"); plt.close(fig_m); output.seek(0); return output.getvalue()
+                ax.legend(fontsize=11, loc="best")
+
+            fig_m.tight_layout(rect=[0.02, 0.02, 0.98, 0.94])
+            output = io.BytesIO()
+            fig_m.savefig(output, format="png", dpi=260, bbox_inches="tight")
+            plt.close(fig_m)
+            output.seek(0)
+
+            safe_feature = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in column_label(feature))[:80]
+            outputs[f"tmu_{safe_feature}.png"] = output.getvalue()
+
+        return outputs
 
 
     def _prepare_export(export_key, fmt_label, make_bytes_func, file_name, mime):
@@ -2596,14 +2803,26 @@ if selected_features and not filtered.empty:
             st.error(f"{fmt_label} export failed.")
             st.caption(st.session_state[ekey])
 
-        if st.session_state.get(bkey):
-            st.download_button(
-                f"Download {fmt_label}",
-                data=st.session_state[bkey],
-                file_name=file_name,
-                mime=mime,
-                key=f"download_{export_key}",
-            )
+        prepared = st.session_state.get(bkey)
+        if prepared:
+            if isinstance(prepared, dict):
+                st.caption("Download each selected chart as a separate PNG. This works on phones without ZIP files.")
+                for i, (fname, data_bytes) in enumerate(prepared.items(), start=1):
+                    st.download_button(
+                        f"Download {fname}",
+                        data=data_bytes,
+                        file_name=fname,
+                        mime="image/png",
+                        key=f"download_{export_key}_{i}",
+                    )
+            else:
+                st.download_button(
+                    f"Download {fmt_label}",
+                    data=prepared,
+                    file_name=file_name,
+                    mime=mime,
+                    key=f"download_{export_key}",
+                )
 
     dl1, dl2 = st.columns(2)
     dl3, dl4 = st.columns(2)
