@@ -525,6 +525,17 @@ def canonical_candidate_score(canon: str, column_name: str) -> int:
         score += 30
     if canon == "pump_freq_hz" and ("freq" in c or "hz" in c):
         score += 30
+    if canon == "salinity_kppm":
+        if "salinity" in c:
+            score += 35
+        if "nacl" in c:
+            score += 35
+        if re.search(r"\bppm\b", c):
+            score += 10
+        if "water" in c:
+            score += 5
+        if any(term in c for term in ["api", "kf", "factor", "psig", "psi", "bbl/d", "bpd", "stb/d", "mmscf", "scf/stb", "h2o", "rate"]):
+            score -= 40
 
     if canon in {"oil_rate_stbd", "water_rate_bpd", "gross_rate_bpd", "gas_rate_mmscfd"}:
         if "cum" in c or "volume" in c:
@@ -601,6 +612,20 @@ def best_canonical_name(column_name: str) -> Optional[str]:
     if "twc" in c:
         return "twc_pct"
     if ("salinity" in c or "nacl" in c or "salt" in c) and "gross rate" not in c:
+        # Avoid false salinity mapping caused by merged-header forward-fill.
+        # Example bad headers from wide TMU sheets: "api Salinity BBL/D",
+        # "[psig] Salinity BBL/D", "Factor Salinity BBL/D". Those are
+        # helper/pressure/rate columns that inherited the word Salinity from a
+        # neighboring column; they must not be plotted as salinity.
+        salinity_conflicts = [
+            "api", "kf", "factor", "psig", "psi", "psia", "bbl/d", "bpd",
+            "stb/d", "mmscf", "scf/stb", "h2o", "gross rate", "oil t",
+            "air =1", "chart", "orifice", "gor", "rate",
+        ]
+        has_conflict = any(term in c for term in salinity_conflicts)
+        has_strong_salinity_unit = ("nacl" in c) or re.search(r"\bsalinity\b.*\bppm\b", c)
+        if has_conflict and not has_strong_salinity_unit:
+            return None
         return "salinity_kppm"
     if ("oil" in c and "sg" in c):
         return "oil_sg"
@@ -1170,7 +1195,20 @@ def standardize_dataframe(
     if df is None or df.empty:
         return pd.DataFrame()
 
-    df = df.copy().dropna(how="all").dropna(axis=1, how="all")
+    # Drop fully empty rows, but do NOT blindly drop fully empty columns here.
+    # Some templates have a real field column whose values are all N/A, such as
+    # Salinity = N/A. If we drop that exact Salinity column first, a later
+    # helper/calculation column with a polluted merged header like
+    # "api Salinity BBL/D" can be selected by mistake and plotted as salinity.
+    df = df.copy().dropna(how="all")
+    if df.empty:
+        return pd.DataFrame()
+
+    keep_cols = []
+    for col in df.columns:
+        if not df[col].isna().all() or best_canonical_name(str(col)) is not None:
+            keep_cols.append(col)
+    df = df.loc[:, keep_cols]
     if df.empty:
         return pd.DataFrame()
 
