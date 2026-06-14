@@ -3598,3 +3598,422 @@ def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: 
             t = assign_test_ids(t, gap_hours=12.0)
             out_tables.append(t)
     return filter_usable_tables(out_tables)
+
+# -----------------------------------------------------------------------------
+# v46 final overrides: stricter WhatsApp TMU row acceptance + safer CTU OCR.
+# -----------------------------------------------------------------------------
+PRODUCTION_NUMERIC_FIELDS_V46 = [
+    "gross_rate_bpd", "oil_rate_stbd", "water_rate_bpd", "gas_rate_mmscfd",
+    "gas_formation_mmscfd", "whp_psi", "sep_p_psi", "flp_psi", "bsw_pct",
+    "salinity_kppm", "h2s_ppm", "co2_mole_pct", "pumping_pressure_psi",
+    "n2_rate_scfm", "choke_pct", "choke_size_64",
+]
+CORE_RATE_OR_PRESSURE_FIELDS_V46 = [
+    "gross_rate_bpd", "oil_rate_stbd", "water_rate_bpd", "gas_rate_mmscfd",
+    "whp_psi", "sep_p_psi", "pumping_pressure_psi", "bsw_pct",
+]
+
+CTU_PLAUSIBLE_RANGES_V46 = {
+    "ctu_weight_lbf": (-200000.0, 200000.0),
+    "ctu_lt_weight_lbf": (-200000.0, 200000.0),
+    "ctu_wellhead_pressure_psi": (-50.0, 2500.0),
+    "ctu_circulation_pressure_psi": (-50.0, 5000.0),
+    "ctu_reel_depth_ft": (-1000.0, 40000.0),
+    "ctu_reel_speed_ftmin": (-1000.0, 1000.0),
+    "ctu_fluid_rate_bpm": (-10.0, 50.0),
+    "ctu_n2_rate_scfm": (-100.0, 20000.0),
+    "ctu_fluid_total_bbl": (-100.0, 100000.0),
+    "ctu_n2_total_scf": (-100.0, 100000000.0),
+}
+
+CTU_REQUIRED_FIELDS_V46 = {
+    "ctu_weight_lbf", "ctu_wellhead_pressure_psi", "ctu_circulation_pressure_psi",
+    "ctu_reel_depth_ft", "ctu_reel_speed_ftmin", "ctu_fluid_rate_bpm", "ctu_n2_rate_scfm",
+}
+
+
+def _row_has_valid_numeric_v46(row: Dict[str, object], fields: List[str]) -> bool:
+    for k in fields:
+        if k in row:
+            try:
+                if pd.notna(pd.to_numeric(pd.Series([row.get(k)]), errors="coerce").iloc[0]):
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+def _clean_whatsapp_message_body_v46(body: object) -> str:
+    text = str(body or "")
+    text = text.replace("\u200e", "").replace("\u200f", "").replace("\ufeff", "")
+    text = text.replace("\xa0", " ")
+    # WhatsApp formatting only, not data.
+    text = re.sub(r"[*_`~]+", "", text)
+    # Remove attachment-only tails that can pollute value extraction.
+    text = re.sub(r"<attached:[^>]+>", "", text, flags=re.I)
+    text = re.sub(r"\bimage omitted\b|\bvideo omitted\b|\baudio omitted\b", "", text, flags=re.I)
+    return text.strip()
+
+
+def _is_probably_full_tmu_reading_v46(body: str) -> bool:
+    b = normalize_text(body)
+    if is_system_or_noise_message(b):
+        return False
+    # Accept normal PICO/TMU production reports, not comments like "return oil & water".
+    has_identity = bool(re.search(r"\b(pico\s*t?mu|tmu[-\s]*\d+|well\s*name|well\s*:)", b, flags=re.I))
+    numeric_line_hits = 0
+    for pat in [
+        r"\bchoke\b\s*[:=@]", r"\bw\.?\s*h\.?\s*p\.?\b\s*[:=@]", r"\bsep\.?\s*p\.?\b\s*[:=@]",
+        r"\bgross\s*rate\b\s*[:=@]", r"\boil\s*rate\b\s*[:=@]", r"\bwater\s*rate\b\s*[:=@]",
+        r"\bgas\s*rate\b\s*[:=@]", r"\bbs\s*&\s*w\b\s*[:=@]", r"\bpumping\s*p\b\s*[:=@]",
+    ]:
+        if re.search(pat, body, flags=re.I):
+            numeric_line_hits += 1
+    return has_identity and numeric_line_hits >= 2
+
+
+def parse_whatsapp_export_text(text: str, source_name="WhatsApp_Export") -> pd.DataFrame:
+    """v46: parse only real TMU numeric readings from WhatsApp export.
+
+    This intentionally drops chat comments/rubbish and operation notes that do not
+    contain actual numeric test readings. Notes can be added manually in the app.
+    """
+    messages = parse_whatsapp_export_messages(text)
+    if not messages:
+        return pd.DataFrame()
+
+    rows = []
+    for m in messages:
+        body_raw = str(m.get("body", ""))
+        body = _clean_whatsapp_message_body_v46(body_raw)
+        if not _is_probably_full_tmu_reading_v46(body):
+            continue
+        row = parse_tmu_message(body, source_name=source_name)
+        # Must contain at least one real numeric production/pressure value.
+        if not _row_has_valid_numeric_v46(row, CORE_RATE_OR_PRESSURE_FIELDS_V46):
+            continue
+        # Avoid rows that have only choke or metadata but no plotted test reading.
+        valid_numeric_count = sum(
+            1 for k in PRODUCTION_NUMERIC_FIELDS_V46
+            if k in row and pd.notna(pd.to_numeric(pd.Series([row.get(k)]), errors="coerce").iloc[0])
+        )
+        if valid_numeric_count < 2:
+            continue
+
+        msg_dt = m.get("datetime", pd.NaT)
+        if ("datetime" not in row or pd.isna(row.get("datetime", pd.NaT))) and pd.notna(msg_dt):
+            row["datetime"] = msg_dt
+            row["date"] = pd.Timestamp(msg_dt).floor("D")
+            row["time_text"] = pd.Timestamp(msg_dt).strftime("%H:%M")
+
+        row["source_type"] = "whatsapp_export_text"
+        row["chat_sender"] = m.get("sender", "")
+        row["chat_datetime"] = msg_dt
+        row["message_index"] = m.get("message_index", np.nan)
+        row["attachment_name"] = m.get("attachment_name", "")
+        row["whatsapp_message_body"] = body[:500]
+        row["link_status"] = "text_confirmed_by_well" if clean_well_name_value(row.get("well")) != "Unknown" else "text_needs_well_review"
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    # Remove exact duplicates created by repeated quoted/attached messages.
+    subset = [c for c in ["well", "datetime", "gross_rate_bpd", "oil_rate_stbd", "water_rate_bpd", "whp_psi", "sep_p_psi"] if c in df.columns]
+    if subset:
+        df = df.drop_duplicates(subset=subset, keep="first")
+    return df.reset_index(drop=True)
+
+
+def parse_whatsapp_plain_or_export_text(text: str, source_name="WhatsApp_Text") -> pd.DataFrame:
+    export_df = parse_whatsapp_export_text(text, source_name=source_name)
+    if export_df is not None and not export_df.empty:
+        return export_df
+    df = parse_many_tmu_messages(_clean_whatsapp_message_body_v46(text), source_name=source_name)
+    if df is not None and not df.empty:
+        df["source_type"] = "pasted_whatsapp_text"
+        df["link_status"] = "text_confirmed_by_well"
+    return df
+
+
+def _normalize_ctu_ocr_value_v46(field: str, value: object) -> float:
+    try:
+        v = float(value)
+    except Exception:
+        return np.nan
+    if not np.isfinite(v):
+        return np.nan
+
+    lo, hi = CTU_PLAUSIBLE_RANGES_V46.get(field, (-np.inf, np.inf))
+    # Tesseract often loses decimal points on HMI screens: 12096 -> 120.96.
+    # Try decimal restoration before rejecting.
+    candidates = [v]
+    for div in [10.0, 100.0, 1000.0]:
+        candidates.append(v / div)
+    # Preserve negative sign for speed if needed.
+    for c in candidates:
+        if lo <= c <= hi:
+            # For pressure fields, prefer decimal-restored value when raw is impossible.
+            if lo <= v <= hi:
+                return float(v)
+            return float(c)
+    return np.nan
+
+
+_parse_ctu_all_data_screen_image_base_v46 = parse_ctu_all_data_screen_image
+
+def parse_ctu_all_data_screen_image(uploaded_file, source_name="Image_OCR") -> pd.DataFrame:
+    """v46: stricter CTU/PICO screen OCR.
+
+    Only returns a row when enough plausible CTU fields are detected. Random chat
+    photos are ignored instead of becoming rubbish OCR rows.
+    """
+    df = _parse_ctu_all_data_screen_image_base_v46(uploaded_file, source_name=source_name)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    found = 0
+    confidences = []
+    for field in list(CTU_PLAUSIBLE_RANGES_V46.keys()):
+        if field in out.columns:
+            v = _normalize_ctu_ocr_value_v46(field, out.at[out.index[0], field])
+            if pd.notna(v):
+                out.at[out.index[0], field] = v
+                found += 1
+            else:
+                out = out.drop(columns=[field], errors="ignore")
+    try:
+        conf = float(out.get("ocr_confidence", pd.Series([0.0])).iloc[0])
+        confidences.append(conf)
+    except Exception:
+        pass
+    key_found = sum(1 for f in CTU_REQUIRED_FIELDS_V46 if f in out.columns and pd.notna(pd.to_numeric(out[f], errors="coerce").iloc[0]))
+    # Stricter gate: enough plausible fields, or at least multiple key fields.
+    if found < 4 or key_found < 3:
+        return pd.DataFrame()
+    out["ocr_fields_found"] = found
+    out["ocr_status"] = "parsed_review_required"
+    out["link_status"] = "ocr_manual_link_required"
+    out["review_required"] = True
+    return out
+
+
+# v46 final usable filters: a table with only empty rows/comments is not usable.
+def is_usable_single_message_table(df: pd.DataFrame) -> bool:
+    if df is None or df.empty:
+        return False
+    # OCR handled separately.
+    if "source_type" in df.columns and df["source_type"].astype(str).str.contains("ocr", case=False, na=False).any():
+        return is_usable_ocr_table(df)
+    has_dt = "datetime" in df.columns and pd.to_datetime(df["datetime"], errors="coerce").notna().any()
+    if not has_dt:
+        return False
+    return any(c in df.columns and pd.to_numeric(df[c], errors="coerce").notna().any() for c in CORE_RATE_OR_PRESSURE_FIELDS_V46)
+
+
+def filter_usable_tables(tables: List[pd.DataFrame]) -> List[pd.DataFrame]:
+    out = []
+    for t in tables or []:
+        if t is None or t.empty:
+            continue
+        # Drop rows with no useful numeric values, except valid OCR rows.
+        tt = t.copy()
+        if "source_type" in tt.columns:
+            ocr_mask = tt["source_type"].astype(str).str.contains("ocr", case=False, na=False)
+        else:
+            ocr_mask = pd.Series([False] * len(tt), index=tt.index)
+        non_ocr = ~ocr_mask
+        useful = pd.Series([False] * len(tt), index=tt.index)
+        for c in CORE_RATE_OR_PRESSURE_FIELDS_V46:
+            if c in tt.columns:
+                useful |= pd.to_numeric(tt[c], errors="coerce").notna()
+        ocr_useful = pd.Series([False] * len(tt), index=tt.index)
+        for c in CTU_PLAUSIBLE_RANGES_V46.keys():
+            if c in tt.columns:
+                ocr_useful |= pd.to_numeric(tt[c], errors="coerce").notna()
+        keep = (non_ocr & useful) | (ocr_mask & ocr_useful)
+        tt = tt.loc[keep].copy()
+        if not tt.empty and (is_valid_timeseries(tt) or is_usable_single_message_table(tt) or is_usable_ocr_table(tt)):
+            out.append(tt)
+    return out
+
+# v46.1 OCR decimal preference override.
+def _normalize_ctu_ocr_value_v46(field: str, value: object) -> float:
+    try:
+        v = float(value)
+    except Exception:
+        return np.nan
+    if not np.isfinite(v):
+        return np.nan
+    lo, hi = CTU_PLAUSIBLE_RANGES_V46.get(field, (-np.inf, np.inf))
+    abs_v = abs(v)
+    # When decimals disappear, pressures like 120.96 often become 12096.
+    if field in {"ctu_wellhead_pressure_psi", "ctu_circulation_pressure_psi"}:
+        if abs_v >= 10000 and lo <= v / 100.0 <= hi:
+            return float(v / 100.0)
+        if abs_v >= 2500:
+            for div in [100.0, 10.0, 1000.0]:
+                c = v / div
+                if lo <= c <= hi:
+                    return float(c)
+    if field in {"ctu_reel_speed_ftmin", "ctu_fluid_rate_bpm"}:
+        if abs_v > hi:
+            for div in [100.0, 10.0, 1000.0]:
+                c = v / div
+                if lo <= c <= hi:
+                    return float(c)
+    if field in {"ctu_weight_lbf", "ctu_lt_weight_lbf", "ctu_reel_depth_ft"}:
+        if not (lo <= v <= hi):
+            for div in [100.0, 10.0, 1000.0]:
+                c = v / div
+                if lo <= c <= hi:
+                    return float(c)
+    return float(v) if lo <= v <= hi else np.nan
+
+# v46.2 final router: exact same-message CTU linking from WhatsApp caption only.
+def _apply_exact_caption_context_to_ocr_v46(t: pd.DataFrame, ctx: Dict[str, object], ext: str) -> pd.DataFrame:
+    if t is None or t.empty:
+        return t
+    out = safe_object_columns(t)
+    if ext not in IMAGE_SUFFIXES:
+        return out
+    caption = _clean_whatsapp_message_body_v46(ctx.get("body", "")) if ctx else ""
+    if caption:
+        out["caption_text"] = caption[:1000]
+    is_ocr = out.get("source_type", pd.Series([""] * len(out), index=out.index)).astype(str).str.contains("ocr", case=False, na=False)
+    if not is_ocr.any():
+        return out
+    if not caption:
+        return out
+    try:
+        cap_row = parse_tmu_message(caption, source_name="WhatsApp_caption_context")
+    except Exception:
+        cap_row = {}
+    cap_well = clean_well_name_value(cap_row.get("well", "Unknown"))
+    cap_dt = pd.to_datetime(cap_row.get("datetime", pd.NaT), errors="coerce")
+    if cap_well != "Unknown":
+        out.loc[is_ocr, "well"] = cap_well
+        out.loc[is_ocr, "link_status"] = "ocr_linked_by_same_whatsapp_message_caption"
+        out.loc[is_ocr, "review_required"] = True  # still allow review, but not Unknown
+    if pd.notna(cap_dt):
+        out.loc[is_ocr, "datetime"] = cap_dt
+        out.loc[is_ocr, "date"] = pd.Timestamp(cap_dt).floor("D")
+        out.loc[is_ocr, "time_text"] = pd.Timestamp(cap_dt).strftime("%H:%M")
+    elif ctx and pd.notna(ctx.get("datetime", pd.NaT)):
+        msg_dt = ctx.get("datetime")
+        out.loc[is_ocr, "datetime"] = msg_dt
+        out.loc[is_ocr, "date"] = pd.Timestamp(msg_dt).floor("D")
+        out.loc[is_ocr, "time_text"] = pd.Timestamp(msg_dt).strftime("%H:%M")
+    if cap_row.get("test_unit"):
+        out.loc[is_ocr, "test_unit"] = cap_row.get("test_unit")
+    return out
+
+
+def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: int = 1000) -> List[pd.DataFrame]:
+    name = getattr(uploaded_file, "name", "uploaded")
+    suffix = Path(str(name)).suffix.lower().lstrip(".")
+
+    if suffix in IMAGE_SUFFIXES:
+        if not parse_images:
+            return []
+        df = parse_ctu_all_data_screen_image(uploaded_file, source_name=name)
+        if df is not None and not df.empty:
+            df = safe_object_columns(df)
+            df = assign_test_ids(df, gap_hours=12.0)
+        return filter_usable_tables([df])
+
+    if suffix == "zip":
+        try:
+            raw = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
+            tables: List[pd.DataFrame] = []
+            ocr_count = 0
+            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                members = [m for m in zf.namelist() if not m.endswith("/") and not Path(m).name.startswith("._")]
+                all_messages: List[Dict[str, object]] = []
+                for member in members:
+                    member_name = Path(member).name
+                    ext = Path(member_name).suffix.lower().lstrip(".")
+                    if ext == "txt" and ("chat" in member_name.lower() or "_chat" in member_name.lower()):
+                        text = zf.read(member).decode("utf-8", errors="ignore")
+                        msgs = parse_whatsapp_export_messages(text)
+                        all_messages.extend(msgs)
+                        df = parse_whatsapp_export_text(text, source_name=f"{name}:{member_name}")
+                        if df is not None and not df.empty:
+                            df = safe_object_columns(df)
+                            df["source_member"] = member
+                            tables.append(df)
+
+                attachment_context: Dict[str, Dict[str, object]] = {}
+                for m in all_messages:
+                    att = str(m.get("attachment_name", "") or "").strip()
+                    if att:
+                        attachment_context[Path(att).name] = m
+
+                for member in members:
+                    member_name = Path(member).name
+                    ext = Path(member_name).suffix.lower().lstrip(".")
+                    if not member_name or ext not in (DATA_SUFFIXES | IMAGE_SUFFIXES):
+                        continue
+                    if ext == "txt" and ("chat" in member_name.lower() or "_chat" in member_name.lower()):
+                        continue
+                    if ext in IMAGE_SUFFIXES:
+                        if not parse_images:
+                            continue
+                        if int(max_ocr_images or 0) > 0 and ocr_count >= int(max_ocr_images):
+                            continue
+                        ocr_count += 1
+
+                    sub_file = UploadedBytes(zf.read(member), member_name)
+                    sub_tables = load_tabular_file(sub_file, parse_images=parse_images, max_ocr_images=max_ocr_images)
+                    ctx = attachment_context.get(member_name, {})
+                    for t in sub_tables or []:
+                        if t is None or t.empty:
+                            continue
+                        t = safe_object_columns(t)
+                        t["attachment_name"] = member_name
+                        t["source_member"] = member
+                        if ctx:
+                            t["chat_sender"] = ctx.get("sender", "")
+                            t["chat_datetime"] = ctx.get("datetime", pd.NaT)
+                            t["message_index"] = ctx.get("message_index", np.nan)
+                            if ext in IMAGE_SUFFIXES:
+                                t = _apply_exact_caption_context_to_ocr_v46(t, ctx, ext)
+                            else:
+                                if "datetime" not in t.columns or pd.to_datetime(t["datetime"], errors="coerce").isna().all():
+                                    if pd.notna(ctx.get("datetime", pd.NaT)):
+                                        t["datetime"] = ctx.get("datetime")
+                                        t["date"] = pd.Timestamp(ctx.get("datetime")).floor("D")
+                                        t["time_text"] = pd.Timestamp(ctx.get("datetime")).strftime("%H:%M")
+                        tables.append(t)
+            if not tables:
+                return []
+            merged = pd.concat(tables, ignore_index=True, sort=False)
+            merged = safe_object_columns(merged)
+            merged = assign_test_ids(merged, gap_hours=12.0)
+            merged = suggest_links_for_ocr_rows(merged, max_gap_hours=0.0)
+            return filter_usable_tables([merged])
+        except Exception as e:
+            raise RuntimeError(f"Could not read WhatsApp ZIP {name}: {e}")
+
+    if suffix == "txt":
+        try:
+            text = uploaded_file.getvalue().decode("utf-8", errors="ignore")
+        except Exception:
+            if hasattr(uploaded_file, "seek"):
+                uploaded_file.seek(0)
+            text = uploaded_file.read().decode("utf-8", errors="ignore")
+        df = parse_whatsapp_plain_or_export_text(text, source_name=name)
+        if df is not None and not df.empty:
+            df = safe_object_columns(df)
+            df = assign_test_ids(df, gap_hours=12.0)
+            return filter_usable_tables([df])
+        return []
+
+    tables = load_tabular_file_base(uploaded_file)
+    out_tables = []
+    for t in tables or []:
+        if t is not None and not t.empty:
+            t = safe_object_columns(t)
+            t = assign_test_ids(t, gap_hours=12.0)
+            out_tables.append(t)
+    return filter_usable_tables(out_tables)

@@ -561,7 +561,6 @@ with st.sidebar:
         accept_multiple_files=True,
         help="Upload normal test files or a WhatsApp exported ZIP. ZIP can contain _chat.txt, Excel/PDF/DOCX/CSV attachments, and CTU screen images.",
     )
-    st.caption("For WhatsApp: export chat with media, then upload the ZIP. CTU/HMI images are parsed as auxiliary OCR rows and must be manually linked to the correct test.")
 
     st.header("2) Test split and CTU image OCR")
     test_gap_hours = st.number_input(
@@ -575,18 +574,15 @@ with st.sidebar:
     enable_ctu_ocr = st.checkbox(
         "Process CTU/HMI images with OCR",
         value=True,
-        help="Turn OFF when a WhatsApp ZIP contains many irrelevant photos. OCR rows stay unlinked until you manually select the correct Well/Test.",
+        help="Turn OFF when a WhatsApp ZIP contains many irrelevant photos.",
     )
     max_ocr_images = st.number_input(
         "CTU/HMI image OCR limit per ZIP (0 = no limit)",
         min_value=0,
         max_value=5000,
-        value=300,
-        step=25,
+        value=1000,
+        step=50,
         help="Use the OCR checkbox above to skip images completely. Set this to 0 only when you want to OCR every image in the ZIP. Excel/text/PDF attachments are always parsed normally.",
-    )
-    st.caption(
-        "Safety rule: CTU/OCR image rows use only their exact WhatsApp/photo timestamp. No nearest-time suggestion or automatic well fill is used; link them manually only when you are sure."
     )
 
     st.header("3) Paste WhatsApp report")
@@ -648,11 +644,6 @@ data = pd.concat(frames, ignore_index=True, sort=False)
 # a different well is always a separate test stream.
 data = assign_test_ids(data, gap_hours=float(test_gap_hours))
 
-# CTU/OCR rows are intentionally safe by default:
-# no nearest-time auto-linking, no silent well/test fill.
-# They keep their own WhatsApp/photo timestamp and remain unlinked until the user
-# manually selects the correct Well/Test in the OCR review table.
-
 if "datetime" in data.columns:
     data["datetime"] = pd.to_datetime(data["datetime"], errors="coerce")
 if "date" in data.columns:
@@ -661,14 +652,9 @@ if "date" in data.columns:
 # Learn/apply user mappings before feature lists and plots are built.
 data, active_column_aliases = editable_column_mapping_panel(data)
 
-# Safety review for CTU/HMI OCR image rows.
 ocr_mask = data.get("source_type", pd.Series([], dtype=str)).astype(str).str.contains("ocr", case=False, na=False) if "source_type" in data.columns else pd.Series([False] * len(data), index=data.index)
 if ocr_mask.any():
-    with st.expander("CTU / HMI image OCR review — manually link to the correct test", expanded=True):
-        st.warning(
-            "CTU image OCR rows are auxiliary data. They are NOT linked by nearest time. "
-            "Check the OCR numbers and manually choose the correct Well/Test only when you are sure the image belongs to that test."
-        )
+    with st.expander("CTU / HMI image OCR review", expanded=True):
         ocr_cols = [
             "image_file", "datetime", "well", "test_id", "link_status",
             "ocr_fields_found", "ocr_confidence",
@@ -694,7 +680,6 @@ if ocr_mask.any():
                 if str(w).strip() and str(w).lower() != "unknown"
             ])
 
-        st.caption("You can manually edit Well/Test ID here. Any OCR row with a confirmed Well and Test ID will be marked as manually reviewed.")
         column_config = {
             "row_id": st.column_config.NumberColumn("Row", disabled=True),
         }
@@ -723,7 +708,6 @@ if ocr_mask.any():
                     data.at[rid, "link_status"] = "ocr_manual_reviewed"
                     data.at[rid, "review_required"] = False
 
-        st.info("OCR rows are included only after you manually assign the correct Well/Test ID in this table. No nearest-time suggestion is used.")
 
 
 def parse_manual_events(text, reference_start=None):
@@ -1190,18 +1174,48 @@ with st.sidebar:
 
     st.header("5) Filter and plot")
 
-    all_wells = sorted([w for w in data["well"].dropna().astype(str).unique() if str(w).strip() and str(w).lower() != "unknown"]) if "well" in data.columns else []
-    selected_wells = st.multiselect("Choose wells", all_wells, default=all_wells[:5] if all_wells else [])
+    # Prefer recent wells/tests with actual numeric readings, not alphabetical chat history.
+    def _has_any_plot_numeric(_df):
+        mask = pd.Series([False] * len(_df), index=_df.index)
+        preferred = [
+            "gross_rate_bpd", "oil_rate_stbd", "water_rate_bpd", "gas_rate_mmscfd",
+            "whp_psi", "sep_p_psi", "pumping_pressure_psi", "bsw_pct",
+            "ctu_wellhead_pressure_psi", "ctu_circulation_pressure_psi", "ctu_reel_depth_ft",
+        ]
+        for _c in preferred:
+            if _c in _df.columns:
+                mask |= pd.to_numeric(_df[_c], errors="coerce").notna()
+        return mask
+
+    if "well" in data.columns:
+        well_df = data.copy()
+        useful_mask_for_wells = _has_any_plot_numeric(well_df)
+        well_df = well_df[useful_mask_for_wells] if useful_mask_for_wells.any() else well_df
+        well_df = well_df[well_df["well"].astype(str).str.strip().ne("") & well_df["well"].astype(str).str.lower().ne("unknown")]
+        if "datetime" in well_df.columns and well_df["datetime"].notna().any():
+            all_wells = well_df.groupby(well_df["well"].astype(str))["datetime"].max().sort_values(ascending=False).index.tolist()
+        else:
+            all_wells = sorted(well_df["well"].dropna().astype(str).unique())
+    else:
+        all_wells = []
+    selected_wells = st.multiselect("Choose wells", all_wells, default=all_wells[:1] if all_wells else [])
 
     if "test_id" in data.columns:
         test_filter_df = data.copy()
         if selected_wells:
             test_filter_df = test_filter_df[test_filter_df["well"].astype(str).isin(selected_wells)]
-        all_tests = sorted([t for t in test_filter_df["test_id"].dropna().astype(str).unique() if not str(t).startswith("Unlinked")])
+        useful_mask_for_tests = _has_any_plot_numeric(test_filter_df)
+        if useful_mask_for_tests.any():
+            test_filter_df = test_filter_df[useful_mask_for_tests]
+        test_filter_df = test_filter_df[test_filter_df["test_id"].notna() & ~test_filter_df["test_id"].astype(str).str.startswith("Unlinked")]
+        if not test_filter_df.empty and "datetime" in test_filter_df.columns and test_filter_df["datetime"].notna().any():
+            all_tests = test_filter_df.groupby(test_filter_df["test_id"].astype(str))["datetime"].max().sort_values(ascending=False).index.tolist()
+        else:
+            all_tests = sorted([t for t in test_filter_df["test_id"].dropna().astype(str).unique() if not str(t).startswith("Unlinked")])
         selected_tests = st.multiselect(
             "Choose tests / periods",
             all_tests,
-            default=all_tests[:10] if all_tests else [],
+            default=all_tests[:1] if all_tests else [],
             help="Tests are detected by well name and time gap. Select one test period or compare several.",
         )
     else:
@@ -1244,11 +1258,12 @@ with st.sidebar:
     else:
         auto_chart_header = "Well Production Test"
 
+    data_title_signature = "_".join([str(x) for x in sorted(data.get("source", pd.Series(dtype=str)).dropna().astype(str).unique())[:3]])[:80]
     custom_chart_title = st.text_input(
         "Chart header / title",
         value=auto_chart_header,
-        help="Edit this header if you want a different title. The default uses well name(s) only, without date.",
-        key="chart_header_title_input",
+        help="Edit this header if you want a different title. The default uses selected well/test only.",
+        key=f"chart_header_{abs(hash(data_title_signature))}_{len(data)}",
     )
 
     custom_y_ranges = {}
