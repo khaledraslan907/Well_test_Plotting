@@ -51,6 +51,9 @@ available_numeric_columns = _tmu_parser.available_numeric_columns
 column_label = _tmu_parser.column_label
 load_tabular_file = _tmu_parser.load_tabular_file
 parse_many_tmu_messages = _tmu_parser.parse_many_tmu_messages
+assign_test_ids = getattr(_tmu_parser, "assign_test_ids", lambda df, gap_hours=12.0: df)
+approve_suggested_ocr_links = getattr(_tmu_parser, "approve_suggested_ocr_links", lambda df: df)
+suggest_links_for_ocr_rows = getattr(_tmu_parser, "suggest_links_for_ocr_rows", lambda df, max_gap_hours=3.0: df)
 
 
 def canonical_key(s: object) -> str:
@@ -548,19 +551,57 @@ st.markdown(
 
 st.title("TMU Production Test Dashboard")
 st.caption(
-    "Upload Excel / CSV / Word / PDF files, paste WhatsApp reports, clean the data, compare wells, "
-    "and export clear production-test plots."
+    "Upload Excel / CSV / Word / PDF files, WhatsApp exported ZIPs, CTU images, or paste WhatsApp reports. "
+    "Clean data, split tests by well/time gap, compare wells/tests, and export clear production-test plots."
 )
 
 with st.sidebar:
     st.header("1) Upload data")
     uploaded_files = st.file_uploader(
         "Upload one or many files",
-        type=["xlsx", "xls", "csv", "txt", "docx", "pdf"],
+        type=["xlsx", "xls", "csv", "txt", "docx", "pdf", "zip", "jpg", "jpeg", "png"],
         accept_multiple_files=True,
+        help="Upload normal test files or a WhatsApp exported ZIP. ZIP can contain _chat.txt, Excel/PDF/DOCX/CSV attachments, and CTU screen images.",
+    )
+    st.caption("For WhatsApp: export chat with media, then upload the ZIP. CTU/HMI images are parsed as auxiliary OCR rows and require review before linking to a test.")
+
+    st.header("2) Test split and OCR safety")
+    test_gap_hours = st.number_input(
+        "Start a new test for the same well if gap exceeds (hours)",
+        min_value=1.0,
+        max_value=72.0,
+        value=12.0,
+        step=1.0,
+        help="Same well continues the same test until this inactive gap is exceeded. A different well is always treated as another test stream.",
+    )
+    ocr_link_window_hours = st.number_input(
+        "Suggest CTU image link only if nearest confirmed row is within (hours)",
+        min_value=0.25,
+        max_value=24.0,
+        value=3.0,
+        step=0.25,
+        help="This only creates a suggestion. CTU/OCR rows are not assigned to a well/test until you approve or manually edit them.",
+    )
+    enable_ctu_ocr = st.checkbox(
+        "Process CTU/HMI images with OCR",
+        value=True,
+        help="Turn OFF when a WhatsApp ZIP contains many irrelevant photos. OCR rows still require review before linking.",
+    )
+    max_ocr_images = st.number_input(
+        "Maximum images to OCR per ZIP",
+        min_value=0,
+        max_value=100,
+        value=3,
+        step=1,
+        help="Keeps free Streamlit runs fast. Increase only when you need OCR for many CTU photos. Excel/text/PDF attachments are still parsed normally.",
+    )
+    approve_ocr_suggestions = st.checkbox(
+        "Approve suggested CTU/OCR links",
+        value=False,
+        help="Leave OFF for safety. Turn ON only after reviewing the OCR rows table and confirming the suggested well/test is correct.",
     )
 
-    st.header("2) Paste WhatsApp report")
+    st.header("3) Paste WhatsApp report")
     whatsapp_text = st.text_area(
         "Paste one or many TMU WhatsApp messages",
         height=260,
@@ -586,7 +627,7 @@ errors = []
 if uploaded_files:
     for f in uploaded_files:
         try:
-            parsed_tables = load_tabular_file(f)
+            parsed_tables = load_tabular_file(f, parse_images=bool(enable_ctu_ocr), max_ocr_images=int(max_ocr_images))
             if parsed_tables:
                 frames.extend(parsed_tables)
             else:
@@ -615,6 +656,17 @@ if not frames:
 
 data = pd.concat(frames, ignore_index=True, sort=False)
 
+# Test segmentation: same well continues until the selected gap is exceeded;
+# a different well is always a separate test stream.
+data = assign_test_ids(data, gap_hours=float(test_gap_hours))
+data = suggest_links_for_ocr_rows(data, max_gap_hours=float(ocr_link_window_hours))
+
+# CTU/OCR rows are intentionally safe by default: the parser suggests links but
+# does not silently assign image data to a well/test. The user can approve the
+# suggestions after reviewing the table below.
+if approve_ocr_suggestions:
+    data = approve_suggested_ocr_links(data)
+
 if "datetime" in data.columns:
     data["datetime"] = pd.to_datetime(data["datetime"], errors="coerce")
 if "date" in data.columns:
@@ -622,6 +674,72 @@ if "date" in data.columns:
 
 # Learn/apply user mappings before feature lists and plots are built.
 data, active_column_aliases = editable_column_mapping_panel(data)
+
+# Safety review for CTU/HMI OCR image rows.
+ocr_mask = data.get("source_type", pd.Series([], dtype=str)).astype(str).str.contains("ocr", case=False, na=False) if "source_type" in data.columns else pd.Series([False] * len(data), index=data.index)
+if ocr_mask.any():
+    with st.expander("CTU / HMI image OCR review — confirm before using in plots", expanded=not bool(approve_ocr_suggestions)):
+        st.warning(
+            "CTU image OCR rows are auxiliary data. They are not assigned to a well/test automatically unless you approve the suggested links. "
+            "Use this table to check OCR numbers, suggested well/test, and link status."
+        )
+        ocr_cols = [
+            "image_file", "datetime", "well", "test_id", "link_status",
+            "suggested_well", "suggested_test_id", "suggested_link_gap_hours",
+            "ocr_fields_found", "ocr_confidence",
+            "ctu_weight_lbf", "ctu_lt_weight_lbf", "ctu_wellhead_pressure_psi",
+            "ctu_circulation_pressure_psi", "ctu_reel_depth_ft", "ctu_reel_speed_ftmin",
+            "ctu_fluid_rate_bpm", "ctu_n2_rate_scfm", "ctu_fluid_total_bbl", "ctu_n2_total_scf",
+            "caption_text", "suggested_link_reason",
+        ]
+        ocr_cols = [c for c in ocr_cols if c in data.columns]
+        review_df = data.loc[ocr_mask, ocr_cols].copy()
+        review_df.insert(0, "row_id", review_df.index.astype(int))
+
+        confirmed_test_options = []
+        if "test_id" in data.columns:
+            confirmed_test_options = sorted([
+                str(t) for t in data.loc[~ocr_mask, "test_id"].dropna().astype(str).unique()
+                if not str(t).startswith("Unlinked")
+            ])
+        well_options = ["Unknown"]
+        if "well" in data.columns:
+            well_options += sorted([
+                str(w) for w in data.loc[~ocr_mask, "well"].dropna().astype(str).unique()
+                if str(w).strip() and str(w).lower() != "unknown"
+            ])
+
+        st.caption("You can manually edit Well/Test ID here. Any OCR row with a confirmed Well and Test ID will be marked as manually reviewed.")
+        column_config = {
+            "row_id": st.column_config.NumberColumn("Row", disabled=True),
+        }
+        if well_options:
+            column_config["well"] = st.column_config.SelectboxColumn("Well", options=well_options)
+        if confirmed_test_options:
+            column_config["test_id"] = st.column_config.SelectboxColumn("Test ID", options=["Unlinked_OCR_or_Unknown_Well"] + confirmed_test_options)
+
+        edited_review = st.data_editor(
+            review_df,
+            use_container_width=True,
+            height=260,
+            key="ctu_ocr_review_editor",
+            column_config=column_config,
+            disabled=[c for c in review_df.columns if c not in {"well", "test_id"}],
+        )
+        for _, erow in edited_review.iterrows():
+            rid = int(erow.get("row_id"))
+            if rid in data.index:
+                for col in ["well", "test_id"]:
+                    if col in edited_review.columns and col in data.columns:
+                        data.at[rid, col] = erow.get(col)
+                well_ok = str(data.at[rid, "well"]).strip().lower() not in ["", "unknown", "nan"] if "well" in data.columns else False
+                tid_ok = str(data.at[rid, "test_id"]).strip() and not str(data.at[rid, "test_id"]).startswith("Unlinked") if "test_id" in data.columns else False
+                if well_ok and tid_ok:
+                    data.at[rid, "link_status"] = "ocr_manual_reviewed"
+                    data.at[rid, "review_required"] = False
+
+        if not approve_ocr_suggestions:
+            st.info("Suggested links are not applied automatically. Either turn ON approval after checking them, or manually choose Well/Test ID in the table above.")
 
 
 def parse_manual_events(text, reference_start=None):
@@ -1010,7 +1128,7 @@ with st.expander("Detected columns from uploaded files", expanded=False):
 
 # Sidebar filters
 with st.sidebar:
-    st.header("3) Time scale")
+    st.header("4) Time scale")
     time_filter_mode = st.selectbox(
         "Time range control",
         ["Slider", "Manual calendar/time"],
@@ -1086,10 +1204,24 @@ with st.sidebar:
     trace_grouping = "Auto"
 
 
-    st.header("4) Filter and plot")
+    st.header("5) Filter and plot")
 
-    all_wells = sorted([w for w in data["well"].dropna().astype(str).unique()]) if "well" in data.columns else []
+    all_wells = sorted([w for w in data["well"].dropna().astype(str).unique() if str(w).strip() and str(w).lower() != "unknown"]) if "well" in data.columns else []
     selected_wells = st.multiselect("Choose wells", all_wells, default=all_wells[:5] if all_wells else [])
+
+    if "test_id" in data.columns:
+        test_filter_df = data.copy()
+        if selected_wells:
+            test_filter_df = test_filter_df[test_filter_df["well"].astype(str).isin(selected_wells)]
+        all_tests = sorted([t for t in test_filter_df["test_id"].dropna().astype(str).unique() if not str(t).startswith("Unlinked")])
+        selected_tests = st.multiselect(
+            "Choose tests / periods",
+            all_tests,
+            default=all_tests[:10] if all_tests else [],
+            help="Tests are detected by well name and time gap. Select one test period or compare several.",
+        )
+    else:
+        selected_tests = []
 
     select_all_features = st.checkbox(
         "Select all numeric columns",
@@ -1101,7 +1233,9 @@ with st.sidebar:
         c for c in [
             "gross_rate_bpd", "qgross_s_bpd", "oil_rate_stbd", "qoil_s_stbd",
             "water_rate_bpd", "qwat_s_bpd", "gas_rate_mmscfd", "gas_formation_mmscfd",
-            "pumping_pressure_psi", "bsw_pct", "wlr_s_pct", "whp_psi",
+            "pumping_pressure_psi", "ctu_circulation_pressure_psi", "ctu_wellhead_pressure_psi",
+            "ctu_reel_depth_ft", "ctu_reel_speed_ftmin", "ctu_n2_rate_scfm",
+            "bsw_pct", "wlr_s_pct", "whp_psi",
             "flow_press_psi", "sep_p_psi", "salinity_kppm",
         ] if c in numeric_cols
     ] or numeric_cols[: min(6, len(numeric_cols))]
@@ -1113,7 +1247,12 @@ with st.sidebar:
         format_func=column_label,
     )
 
-    if selected_wells:
+    if selected_tests:
+        if len(selected_tests) == 1:
+            auto_chart_header = selected_tests[0]
+        else:
+            auto_chart_header = " vs ".join(selected_tests[:3]) + (f" +{len(selected_tests) - 3} more" if len(selected_tests) > 3 else "")
+    elif selected_wells:
         if len(selected_wells) == 1:
             auto_chart_header = f"Well {selected_wells[0]}"
         else:
@@ -1219,7 +1358,7 @@ with st.sidebar:
 
     show_internal_names = False
 
-    st.header("5) Graph events")
+    st.header("6) Graph events")
 
     auto_hide_crowded_notes = st.checkbox(
         "Auto hide some notes when too crowded",
@@ -1412,6 +1551,8 @@ with st.sidebar:
 filtered = data.copy()
 if selected_wells:
     filtered = filtered[filtered["well"].astype(str).isin(selected_wells)]
+if "test_id" in filtered.columns and selected_tests:
+    filtered = filtered[filtered["test_id"].astype(str).isin(selected_tests)]
 
 if hide_zero_flow_rows:
     # Prefer gross-rate columns when available, because some bypass periods still
@@ -1500,15 +1641,16 @@ for i in st.session_state.get("operation_intervals_table", []):
 plot_intervals = convert_intervals_for_plot(operation_intervals, filtered, x_axis_mode)
 
 # Header KPIs
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Detected rows", f"{len(data):,}")
 c2.metric("Filtered rows", f"{len(filtered):,}")
 c3.metric("Wells", f"{data['well'].nunique() if 'well' in data.columns else 0:,}")
-c4.metric("Numeric features", f"{len(numeric_cols):,}")
+c4.metric("Tests", f"{data['test_id'].nunique() if 'test_id' in data.columns else 0:,}")
+c5.metric("Numeric features", f"{len(numeric_cols):,}")
 
 with st.expander("Detected data preview", expanded=False):
     st.caption("Detected data = cleaned rows pulled from uploads before your well/time/feature filters.")
-    preview_cols = ["source", "sheet", "well", "datetime", "time_text"] + numeric_cols
+    preview_cols = ["source", "sheet", "source_type", "well", "test_id", "link_status", "datetime", "time_text"] + numeric_cols
     preview_cols = [c for c in preview_cols if c in data.columns]
     display_detected = data[preview_cols].copy()
     if not show_internal_names:

@@ -1,7 +1,10 @@
 
 import re
 import warnings
-from typing import Dict, Iterable, List, Optional
+import io
+import zipfile
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -1777,7 +1780,7 @@ def filter_preferred_tables(tables: List[pd.DataFrame]) -> List[pd.DataFrame]:
 
     return detailed if detailed else tables
 
-def load_tabular_file(uploaded_file) -> List[pd.DataFrame]:
+def load_tabular_file_base(uploaded_file) -> List[pd.DataFrame]:
     name = uploaded_file.name
     suffix = name.split(".")[-1].lower()
     tables: List[pd.DataFrame] = []
@@ -2119,3 +2122,887 @@ def column_label(column_name: str) -> str:
         label = str(column_name)[5:].replace("_", " ").strip()
         return f"Raw: {label.title()}"
     return COLUMN_LABELS.get(column_name, column_name)
+
+# -----------------------------------------------------------------------------
+# v43 additions: WhatsApp export ZIP + CTU image OCR + safe test segmentation
+# -----------------------------------------------------------------------------
+
+# Keep CTU / OCR metadata out of normal numeric detection and plotting unless the
+# value columns themselves are selected.
+BASE_NON_PLOT_COLS.update({
+    "source_type", "ocr_template", "ocr_fields_found", "ocr_status", "ocr_confidence",
+    "image_file", "attachment_name", "chat_sender", "chat_datetime", "message_index",
+    "test_id", "test_start", "test_end", "test_sequence", "link_status",
+    "suggested_well", "suggested_test_id", "suggested_link_reason", "suggested_link_gap_hours",
+    "review_required", "caption_text", "whatsapp_message_body", "source_member",
+})
+
+COLUMN_LABELS.update({
+    "ctu_weight_lbf": "CTU Weight (LBF)",
+    "ctu_lt_weight_lbf": "CTU Lt Weight (LBF)",
+    "ctu_wellhead_pressure_psi": "CTU Wellhead Pressure (psi)",
+    "ctu_circulation_pressure_psi": "CTU Circulation Pressure (psi)",
+    "ctu_reel_depth_ft": "CTU Reel Depth (ft)",
+    "ctu_reel_speed_ftmin": "CTU Reel Speed (ft/min)",
+    "ctu_fluid_rate_bpm": "CTU Fluid Rate (bpm)",
+    "ctu_n2_rate_scfm": "CTU N2 Flow (scf/min)",
+    "ctu_fluid_total_bbl": "CTU Fluid Total (bbl)",
+    "ctu_n2_total_scf": "CTU N2 Total (scf)",
+})
+
+for _kw in [
+    "circulation", "reel", "lt weight", "fluid total", "n2 total", "flare test",
+    "wellhead pressure", "all data", "ctu", "coil tubing", "coiled tubing",
+]:
+    if _kw not in KEYWORDS:
+        KEYWORDS.append(_kw)
+
+IMAGE_SUFFIXES = {"jpg", "jpeg", "png"}
+DATA_SUFFIXES = {"xlsx", "xls", "csv", "docx", "pdf", "txt"}
+
+
+class UploadedBytes(io.BytesIO):
+    """BytesIO object that behaves like a Streamlit UploadedFile for recursive parsers."""
+
+    def __init__(self, data: bytes, name: str):
+        super().__init__(data)
+        self.name = name
+
+
+def append_note(old_note, new_note):
+    old = "" if old_note is None or pd.isna(old_note) else str(old_note).strip()
+    new = str(new_note or "").strip()
+    if not new:
+        return old
+    if not old:
+        return new
+    if new.lower() in old.lower():
+        return old
+    return f"{old}; {new}"
+
+
+def parse_datetime_from_filename(name: str):
+    """Parse WhatsApp media filenames such as PHOTO-2026-06-12-20-35-05.jpg."""
+    name = str(name or "")
+    patterns = [
+        r"(20\d{2})[-_](\d{2})[-_](\d{2})[-_](\d{2})[-_](\d{2})[-_](\d{2})",
+        r"(20\d{2})[-_](\d{2})[-_](\d{2})[-_](\d{2})[-_](\d{2})",
+        r"(\d{2})[-_](\d{2})[-_](20\d{2})[-_](\d{2})[-_](\d{2})[-_](\d{2})",
+    ]
+    for p in patterns:
+        m = re.search(p, name)
+        if not m:
+            continue
+        nums = list(map(int, m.groups()))
+        try:
+            if len(nums) == 6 and str(nums[0]).startswith("20"):
+                y, mo, d, hh, mm, ss = nums
+            elif len(nums) == 5:
+                y, mo, d, hh, mm = nums
+                ss = 0
+            else:
+                d, mo, y, hh, mm, ss = nums
+            return pd.Timestamp(year=y, month=mo, day=d, hour=hh, minute=mm, second=ss)
+        except Exception:
+            pass
+    return pd.NaT
+
+
+def parse_attachment_reference(body: str) -> str:
+    """Return attached filename mentioned in exported WhatsApp text, if any."""
+    text = str(body or "")
+    patterns = [
+        r"<attached:\s*([^>]+)>",
+        r"([^\s<>]+\.(?:jpg|jpeg|png|xlsx|xls|csv|pdf|docx))",
+    ]
+    for p in patterns:
+        m = re.search(p, text, flags=re.I)
+        if m:
+            return Path(m.group(1).strip()).name
+    return ""
+
+
+def _try_import_ocr_libs():
+    try:
+        from PIL import Image, ImageOps, ImageEnhance
+        import pytesseract
+        return Image, ImageOps, ImageEnhance, pytesseract
+    except Exception:
+        return None, None, None, None
+
+
+def _numbers_from_ocr_text(txt: str) -> List[str]:
+    return re.findall(r"-?\d+(?:\.\d+)?", str(txt or "").replace(" ", ""))
+
+
+def _best_number_from_ocr_text(txt: str):
+    nums = _numbers_from_ocr_text(txt)
+    if not nums:
+        return np.nan
+    # Prefer the longest candidate; this avoids choosing a stray unit digit.
+    nums = sorted(nums, key=lambda x: len(x.replace(".", "").replace("-", "")), reverse=True)
+    return extract_number(nums[0])
+
+
+def _ocr_numeric_region_pil(crop_img):
+    """OCR a numeric value from a CTU/PICO HMI ROI using multiple simple preprocesses."""
+    Image, ImageOps, ImageEnhance, pytesseract = _try_import_ocr_libs()
+    if Image is None:
+        return np.nan, 0.0, "ocr_dependency_missing"
+
+    best_val = np.nan
+    best_score = -1
+    best_text = ""
+
+    try:
+        gray = crop_img.convert("L")
+        gray = ImageOps.autocontrast(gray)
+    except Exception:
+        return np.nan, 0.0, "ocr_image_error"
+
+    variants = []
+    for invert in [False, True]:
+        g0 = ImageOps.invert(gray) if invert else gray
+        for contrast in [2.0, 3.0, 5.0]:
+            g = ImageEnhance.Contrast(g0).enhance(contrast)
+            g = ImageEnhance.Sharpness(g).enhance(2.0)
+            g = g.resize((max(90, g.width * 4), max(40, g.height * 4)))
+            variants.append(g)
+            for thr in [110, 140, 170, 200]:
+                variants.append(g.point(lambda p, t=thr: 255 if p > t else 0))
+
+    for img_try in variants:
+        try:
+            txt = pytesseract.image_to_string(
+                img_try,
+                config="--oem 3 --psm 7 -c tessedit_char_whitelist=-0123456789.",
+            )
+        except Exception:
+            continue
+
+        nums = _numbers_from_ocr_text(txt)
+        if not nums:
+            continue
+        val = _best_number_from_ocr_text(txt)
+        digit_count = max(len(n.replace(".", "").replace("-", "")) for n in nums)
+        score = digit_count + (2 if any("." in n for n in nums) else 0)
+        if pd.notna(val) and score > best_score:
+            best_score = score
+            best_val = val
+            best_text = str(txt).strip()
+
+    confidence = min(1.0, max(0.0, best_score / 8.0)) if best_score >= 0 else 0.0
+    return best_val, confidence, best_text
+
+
+# ROIs are value boxes only, relative to the full image. They fit the CTU "ALL DATA"
+# screen style in the user's sample; all rows remain review_required unless safely linked.
+
+
+def _ocr_numeric_region_cv2(crop_img):
+    """Optional OpenCV OCR path that improves low-contrast colored HMI digits."""
+    try:
+        import cv2
+        import numpy as _np
+        import pytesseract
+    except Exception:
+        return np.nan, 0.0, "cv2_or_tesseract_missing"
+
+    try:
+        arr = _np.array(crop_img.convert("RGB"))
+        bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+        bgr = cv2.resize(bgr, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+        lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        gray = clahe.apply(l)
+        variants = [gray, 255 - gray]
+        for block in [31, 51, 71]:
+            variants.append(cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, block, 3))
+            variants.append(cv2.adaptiveThreshold(255 - gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, block, 3))
+
+        best_val = np.nan
+        best_score = -1
+        best_text = ""
+        for v in variants:
+            try:
+                txt = pytesseract.image_to_string(
+                    v,
+                    config="--oem 3 --psm 7 -c tessedit_char_whitelist=-0123456789.",
+                )
+            except Exception:
+                continue
+            nums = _numbers_from_ocr_text(txt)
+            if not nums:
+                continue
+            val = _best_number_from_ocr_text(txt)
+            digit_count = max(len(n.replace(".", "").replace("-", "")) for n in nums)
+            score = digit_count + (2 if any("." in n for n in nums) else 0)
+            if pd.notna(val) and score > best_score:
+                best_score = score
+                best_val = val
+                best_text = str(txt).strip()
+        confidence = min(1.0, max(0.0, best_score / 8.0)) if best_score >= 0 else 0.0
+        return best_val, confidence, best_text
+    except Exception:
+        return np.nan, 0.0, "cv2_ocr_error"
+
+
+def _ocr_numeric_region(crop_img):
+    """Use PIL and OpenCV OCR paths, then choose the higher-confidence numeric value."""
+    pil_val, pil_conf, pil_text = _ocr_numeric_region_pil(crop_img)
+    cv_val, cv_conf, cv_text = _ocr_numeric_region_cv2(crop_img)
+    if pd.notna(cv_val) and (pd.isna(pil_val) or cv_conf >= pil_conf):
+        return cv_val, cv_conf, cv_text
+    return pil_val, pil_conf, pil_text
+
+CTU_ALL_DATA_ROIS = {
+    "ctu_weight_lbf": (0.26, 0.13, 0.55, 0.30),
+    "ctu_lt_weight_lbf": (0.66, 0.13, 0.92, 0.30),
+    "ctu_wellhead_pressure_psi": (0.31, 0.31, 0.55, 0.47),
+    "ctu_circulation_pressure_psi": (0.64, 0.31, 0.92, 0.47),
+    "ctu_reel_depth_ft": (0.31, 0.49, 0.55, 0.66),
+    "ctu_reel_speed_ftmin": (0.62, 0.49, 0.92, 0.66),
+    "ctu_fluid_rate_bpm": (0.31, 0.66, 0.55, 0.80),
+    "ctu_n2_rate_scfm": (0.64, 0.66, 0.92, 0.80),
+    "ctu_fluid_total_bbl": (0.31, 0.81, 0.55, 0.95),
+    "ctu_n2_total_scf": (0.64, 0.81, 0.92, 0.95),
+}
+
+
+def parse_ctu_all_data_screen_image(uploaded_file, source_name="Image_OCR") -> pd.DataFrame:
+    """Parse CTU/PICO ALL DATA screen photos as auxiliary OCR rows.
+
+    Safety rule: OCR rows are never treated as confirmed well-test readings by
+    themselves. If the image does not explicitly carry a well/date, the row is
+    marked review_required and remains Well=Unknown until the app/user approves
+    linking. This avoids silently assigning CTU data to the wrong test.
+    """
+    Image, _, _, _ = _try_import_ocr_libs()
+    if Image is None:
+        return pd.DataFrame()
+
+    try:
+        if hasattr(uploaded_file, "seek"):
+            uploaded_file.seek(0)
+        img = Image.open(uploaded_file).convert("RGB")
+        w, h = img.size
+        file_name = getattr(uploaded_file, "name", source_name)
+        dt_from_name = parse_datetime_from_filename(file_name)
+
+        row = {
+            "source": source_name,
+            "sheet": "CTU_Image_OCR",
+            "source_type": "ctu_image_ocr",
+            "ocr_template": "ctu_all_data",
+            "image_file": file_name,
+            "well": "Unknown",
+            "link_status": "unlinked_needs_review",
+            "review_required": True,
+        }
+        if pd.notna(dt_from_name):
+            row["datetime"] = dt_from_name
+            row["date"] = pd.Timestamp(dt_from_name.date())
+            row["time_text"] = pd.Timestamp(dt_from_name).strftime("%H:%M")
+
+        fields_found = 0
+        confidences = []
+        for field, (x1, y1, x2, y2) in CTU_ALL_DATA_ROIS.items():
+            crop = img.crop((int(x1 * w), int(y1 * h), int(x2 * w), int(y2 * h)))
+            val, conf, _raw = _ocr_numeric_region(crop)
+            if pd.notna(val):
+                row[field] = float(val)
+                fields_found += 1
+                confidences.append(float(conf))
+
+        row["ocr_fields_found"] = fields_found
+        row["ocr_confidence"] = float(np.mean(confidences)) if confidences else 0.0
+        row["ocr_status"] = "parsed_review_required" if fields_found >= 2 else "low_confidence_or_not_ctu_screen"
+
+        if fields_found < 1:
+            return pd.DataFrame()
+        return pd.DataFrame([row])
+    except Exception:
+        return pd.DataFrame()
+
+
+WHATSAPP_SYSTEM_PATTERNS = [
+    r"messages and calls are end-to-end encrypted",
+    r"joined using this group",
+    r"changed the subject",
+    r"changed the group description",
+    r"changed this group's icon",
+    r"this message was deleted",
+    r"missed voice call",
+    r"missed video call",
+    r"created group",
+]
+
+
+def is_system_or_noise_message(body: str) -> bool:
+    b = normalize_text(body)
+    if not b:
+        return True
+    for p in WHATSAPP_SYSTEM_PATTERNS:
+        if re.search(p, b, flags=re.I):
+            return True
+    # Very short acknowledgement messages are not useful data.
+    if b in {"ok", "okay", "thanks", "thank you", "done", "تمام", "اوكي"}:
+        return True
+    return False
+
+
+def score_tmu_body(body: str) -> int:
+    b = normalize_text(body)
+    if is_system_or_noise_message(b):
+        return 0
+    score = 0
+    for kw in [
+        "tmu", "well", "date", "time", "choke", "w.h.p", "whp", "sep",
+        "gas rate", "gross rate", "oil rate", "water rate", "bsw", "bs&w",
+        "salinity", "h2s", "co2", "pumping", "n2", "flare test", "all data",
+        "circulation pressure", "reel depth", "wellhead pressure",
+    ]:
+        if kw in b:
+            score += 1
+    score += min(5, len(re.findall(r"[-+]?\d+(?:\.\d+)?", body)))
+    return score
+
+
+def parse_whatsapp_export_messages(text: str) -> List[Dict[str, object]]:
+    """Parse WhatsApp exported _chat.txt into message dicts.
+
+    Handles common Android/iOS formats:
+      12/06/2026, 00:30 - Sender: body
+      [12/06/2026, 00:30:05] Sender: body
+    Multi-line messages are preserved.
+    """
+    lines = str(text or "").replace("\ufeff", "").splitlines()
+    messages = []
+    current = None
+
+    patterns = [
+        r"^(?P<date>\d{1,2}[/-]\d{1,2}[/-]\d{2,4}),\s*(?P<time>\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM|am|pm)?)\s*-\s*(?P<sender>[^:]+):\s*(?P<body>.*)$",
+        r"^\[(?P<date>\d{1,2}[/-]\d{1,2}[/-]\d{2,4}),\s*(?P<time>\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM|am|pm)?)\]\s*(?P<sender>[^:]+):\s*(?P<body>.*)$",
+        r"^(?P<date>\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s+(?P<time>\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM|am|pm)?)\s*-\s*(?P<sender>[^:]+):\s*(?P<body>.*)$",
+    ]
+
+    for line in lines:
+        line = line.rstrip()
+        if not line.strip():
+            continue
+
+        matched = False
+        for p in patterns:
+            m = re.match(p, line)
+            if m:
+                if current:
+                    messages.append(current)
+                current = m.groupdict()
+                current["sender"] = str(current.get("sender", "")).strip()
+                current["body"] = str(current.get("body", "")).strip()
+                matched = True
+                break
+
+        if not matched and current:
+            current["body"] = str(current.get("body", "")) + "\n" + line.strip()
+
+    if current:
+        messages.append(current)
+
+    for i, m in enumerate(messages):
+        m["message_index"] = i
+        m["datetime"] = pd.to_datetime(
+            f"{m.get('date', '')} {m.get('time', '')}",
+            errors="coerce",
+            dayfirst=True,
+        )
+        m["attachment_name"] = parse_attachment_reference(m.get("body", ""))
+
+    return messages
+
+
+def parse_whatsapp_export_text(text: str, source_name="WhatsApp_Export") -> pd.DataFrame:
+    """Parse exported WhatsApp chat text into TMU production rows.
+
+    Important: this parser uses well name and explicit TMU keywords. It does not
+    assume one chat equals one test.
+    """
+    messages = parse_whatsapp_export_messages(text)
+    if not messages:
+        return pd.DataFrame()
+
+    rows = []
+    for m in messages:
+        body = str(m.get("body", ""))
+        if score_tmu_body(body) < 4:
+            continue
+
+        row = parse_tmu_message(body, source_name=source_name)
+        # If a message is only a continuation line, parse_tmu_message may not get
+        # its own date/time. Use WhatsApp timestamp as fallback only.
+        msg_dt = m.get("datetime", pd.NaT)
+        if ("datetime" not in row or pd.isna(row.get("datetime", pd.NaT))) and pd.notna(msg_dt):
+            row["datetime"] = msg_dt
+            row["date"] = pd.Timestamp(msg_dt).floor("D")
+            row["time_text"] = pd.Timestamp(msg_dt).strftime("%H:%M")
+
+        row["source_type"] = "whatsapp_export_text"
+        row["chat_sender"] = m.get("sender", "")
+        row["chat_datetime"] = msg_dt
+        row["message_index"] = m.get("message_index", np.nan)
+        row["attachment_name"] = m.get("attachment_name", "")
+        row["whatsapp_message_body"] = body[:500]
+        row["link_status"] = "text_confirmed_by_well" if row.get("well") and str(row.get("well")).lower() != "unknown" else "text_needs_well_review"
+
+        has_useful = any(
+            k in row for k in [
+                "gross_rate_bpd", "oil_rate_stbd", "water_rate_bpd", "whp_psi",
+                "sep_p_psi", "pumping_pressure_psi", "gas_rate_mmscfd", "bsw_pct",
+            ]
+        )
+        if has_useful:
+            rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
+def parse_whatsapp_plain_or_export_text(text: str, source_name="WhatsApp_Text") -> pd.DataFrame:
+    """Try exported-chat parsing first; fallback to pasted/block TMU parser."""
+    export_df = parse_whatsapp_export_text(text, source_name=source_name)
+    if not export_df.empty:
+        return export_df
+    df = parse_many_tmu_messages(text, source_name=source_name)
+    if not df.empty:
+        df["source_type"] = "pasted_whatsapp_text"
+        df["link_status"] = "text_confirmed_by_well"
+    return df
+
+
+def assign_test_ids(df: pd.DataFrame, gap_hours: float = 12.0) -> pd.DataFrame:
+    """Assign stable test_id by well name + time gap.
+
+    Rule requested by user:
+      - Same well continues the same test until the time gap exceeds gap_hours.
+      - A different well is always a different test stream.
+      - Unknown/unlinked OCR rows are NOT silently assigned to a well/test.
+    """
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+    if "well" not in out.columns:
+        out["well"] = "Unknown"
+    if "datetime" not in out.columns:
+        out["datetime"] = pd.NaT
+
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+    out["well"] = out["well"].fillna("Unknown").astype(str).str.strip().replace("", "Unknown")
+    out["test_id"] = out.get("test_id", pd.Series([np.nan] * len(out), index=out.index))
+    out["test_sequence"] = out.get("test_sequence", pd.Series([np.nan] * len(out), index=out.index))
+
+    sortable = out.sort_values(["well", "datetime", "source"], na_position="last").copy()
+    assigned = {}
+
+    for well, g in sortable.groupby("well", dropna=False):
+        well_txt = str(well or "Unknown").strip() or "Unknown"
+        if well_txt.lower() == "unknown":
+            # Keep unknown rows separate/unlinked. They may be reviewed in the app.
+            for i in g.index:
+                assigned[i] = ("Unlinked_OCR_or_Unknown_Well", np.nan)
+            continue
+
+        seq = 0
+        last_dt = pd.NaT
+        current_id = None
+        current_start = pd.NaT
+        for i, row in g.iterrows():
+            dt = row.get("datetime", pd.NaT)
+            if pd.isna(dt):
+                # Same well but no time: keep as separate manual-review row.
+                seq += 1
+                current_id = f"{well_txt}_T{seq:02d}_NoTime"
+                assigned[i] = (current_id, seq)
+                continue
+
+            new_test = (
+                current_id is None
+                or pd.isna(last_dt)
+                or (pd.Timestamp(dt) - pd.Timestamp(last_dt) > pd.Timedelta(hours=float(gap_hours)))
+            )
+            if new_test:
+                seq += 1
+                current_start = pd.Timestamp(dt)
+                current_id = f"{well_txt}_{current_start.strftime('%Y%m%d_%H%M')}"
+
+            assigned[i] = (current_id, seq)
+            last_dt = pd.Timestamp(dt)
+
+    for i, (tid, seq) in assigned.items():
+        out.at[i, "test_id"] = tid
+        out.at[i, "test_sequence"] = seq
+
+    # Add test start/end for confirmed test rows.
+    if "test_id" in out.columns and "datetime" in out.columns:
+        valid = out[~out["test_id"].astype(str).str.startswith("Unlinked") & out["datetime"].notna()].copy()
+        if not valid.empty:
+            starts = valid.groupby("test_id")["datetime"].min()
+            ends = valid.groupby("test_id")["datetime"].max()
+            out["test_start"] = out["test_id"].map(starts)
+            out["test_end"] = out["test_id"].map(ends)
+
+    return out
+
+
+def suggest_links_for_ocr_rows(df: pd.DataFrame, max_gap_hours: float = 3.0) -> pd.DataFrame:
+    """Suggest, but do not apply, well/test links for CTU image rows.
+
+    A suggestion is created only when there is one nearest confirmed non-OCR row
+    within max_gap_hours. The row remains review_required; app/user must approve
+    before it becomes part of the test plot.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    for c in ["source_type", "well", "datetime", "test_id", "suggested_well", "suggested_test_id", "suggested_link_reason", "suggested_link_gap_hours"]:
+        if c not in out.columns:
+            out[c] = np.nan
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+
+    anchor_mask = (
+        out["datetime"].notna()
+        & out["well"].notna()
+        & (out["well"].astype(str).str.strip().str.lower() != "unknown")
+        & (~out["source_type"].astype(str).str.contains("ocr", case=False, na=False))
+    )
+    anchors = out[anchor_mask].copy()
+    if anchors.empty:
+        return out
+
+    ocr_mask = out["source_type"].astype(str).str.contains("ocr", case=False, na=False)
+    for i, row in out[ocr_mask].iterrows():
+        dt = row.get("datetime", pd.NaT)
+        if pd.isna(dt):
+            continue
+        deltas = (anchors["datetime"] - pd.Timestamp(dt)).abs()
+        if deltas.empty:
+            continue
+        nearest_idx = deltas.idxmin()
+        gap_h = float(deltas.loc[nearest_idx].total_seconds() / 3600.0)
+        if gap_h <= float(max_gap_hours):
+            out.at[i, "suggested_well"] = anchors.at[nearest_idx, "well"]
+            out.at[i, "suggested_test_id"] = anchors.at[nearest_idx, "test_id"]
+            out.at[i, "suggested_link_gap_hours"] = round(gap_h, 3)
+            out.at[i, "suggested_link_reason"] = f"Nearest confirmed text/Excel row within {gap_h:.2f} hr; review before approving."
+            out.at[i, "link_status"] = "suggested_needs_user_approval"
+            out.at[i, "review_required"] = True
+    return out
+
+
+def approve_suggested_ocr_links(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply suggested OCR links after explicit user approval in Streamlit."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    required = {"suggested_well", "suggested_test_id", "source_type"}
+    if not required.issubset(set(out.columns)):
+        return out
+    mask = (
+        out["source_type"].astype(str).str.contains("ocr", case=False, na=False)
+        & out["suggested_well"].notna()
+        & out["suggested_test_id"].notna()
+    )
+    out.loc[mask, "well"] = out.loc[mask, "suggested_well"]
+    out.loc[mask, "test_id"] = out.loc[mask, "suggested_test_id"]
+    out.loc[mask, "link_status"] = "ocr_link_approved"
+    out.loc[mask, "review_required"] = False
+    return out
+
+
+def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: int = 10) -> List[pd.DataFrame]:
+    """v43 upload router.
+
+    Supports existing Excel/CSV/DOCX/PDF/TXT parsing plus:
+      - WhatsApp exported ZIP bundles (_chat.txt + attachments + images)
+      - Direct CTU screen image OCR (JPG/JPEG/PNG)
+
+    OCR safety: CTU image rows are parsed as auxiliary rows and left unlinked until
+    reviewed/approved in the app. No nearest-well fill is applied automatically.
+    """
+    name = getattr(uploaded_file, "name", "uploaded")
+    suffix = Path(str(name)).suffix.lower().lstrip(".")
+
+    if suffix in IMAGE_SUFFIXES:
+        if not parse_images:
+            return []
+        return filter_usable_tables([parse_ctu_all_data_screen_image(uploaded_file, source_name=name)])
+
+    if suffix == "zip":
+        try:
+            raw = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
+            tables: List[pd.DataFrame] = []
+            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                members = [m for m in zf.namelist() if not m.endswith("/") and not Path(m).name.startswith("._")]
+
+                # Build chat-message index first so OCR/image rows can get timestamps and suggestions.
+                all_messages: List[Dict[str, object]] = []
+                chat_names = []
+                for member in members:
+                    member_name = Path(member).name
+                    if Path(member_name).suffix.lower().lstrip(".") == "txt" and ("chat" in member_name.lower() or "_chat" in member_name.lower()):
+                        text = zf.read(member).decode("utf-8", errors="ignore")
+                        chat_names.append(member_name)
+                        all_messages.extend(parse_whatsapp_export_messages(text))
+                        df = parse_whatsapp_export_text(text, source_name=f"{name}:{member_name}")
+                        if not df.empty:
+                            df["source_member"] = member
+                            tables.append(df)
+
+                attachment_context = {}
+                for m in all_messages:
+                    att = str(m.get("attachment_name", "") or "").strip()
+                    if not att:
+                        continue
+                    attachment_context[Path(att).name] = m
+
+                # Parse non-chat attachments and OCR images.
+                for member in members:
+                    member_name = Path(member).name
+                    ext = Path(member_name).suffix.lower().lstrip(".")
+                    if not member_name or ext not in (DATA_SUFFIXES | IMAGE_SUFFIXES):
+                        continue
+                    if ext == "txt" and ("chat" in member_name.lower() or "_chat" in member_name.lower()):
+                        continue
+
+                    sub_file = UploadedBytes(zf.read(member), member_name)
+                    if ext in IMAGE_SUFFIXES:
+                        if not parse_images or max_ocr_images <= 0:
+                            continue
+                        max_ocr_images -= 1
+                    sub_tables = load_tabular_file(sub_file, parse_images=parse_images, max_ocr_images=max_ocr_images)
+                    ctx = attachment_context.get(member_name, {})
+                    for t in sub_tables or []:
+                        if t is None or t.empty:
+                            continue
+                        t = t.copy()
+                        t["attachment_name"] = member_name
+                        t["source_member"] = member
+                        if ctx:
+                            t["chat_sender"] = ctx.get("sender", "")
+                            t["chat_datetime"] = ctx.get("datetime", pd.NaT)
+                            t["message_index"] = ctx.get("message_index", np.nan)
+                            if "datetime" not in t.columns or pd.to_datetime(t["datetime"], errors="coerce").isna().all():
+                                if pd.notna(ctx.get("datetime", pd.NaT)):
+                                    t["datetime"] = ctx.get("datetime")
+                                    t["date"] = pd.Timestamp(ctx.get("datetime")).floor("D")
+                                    t["time_text"] = pd.Timestamp(ctx.get("datetime")).strftime("%H:%M")
+                            if ext in IMAGE_SUFFIXES:
+                                t["caption_text"] = str(ctx.get("body", ""))[:500]
+                        tables.append(t)
+
+            if not tables:
+                return []
+            merged = pd.concat(tables, ignore_index=True, sort=False)
+            merged = assign_test_ids(merged, gap_hours=12.0)
+            merged = suggest_links_for_ocr_rows(merged, max_gap_hours=3.0)
+            return filter_usable_tables([merged])
+        except Exception as e:
+            raise RuntimeError(f"Could not read WhatsApp ZIP {name}: {e}")
+
+    if suffix == "txt":
+        try:
+            text = uploaded_file.getvalue().decode("utf-8", errors="ignore")
+        except Exception:
+            if hasattr(uploaded_file, "seek"):
+                uploaded_file.seek(0)
+            text = uploaded_file.read().decode("utf-8", errors="ignore")
+        df = parse_whatsapp_plain_or_export_text(text, source_name=name)
+        if not df.empty:
+            df = assign_test_ids(df, gap_hours=12.0)
+            return filter_usable_tables([df])
+        return []
+
+    tables = load_tabular_file_base(uploaded_file)
+    out_tables = []
+    for t in tables or []:
+        if t is not None and not t.empty:
+            t = assign_test_ids(t, gap_hours=12.0)
+            out_tables.append(t)
+    return filter_usable_tables(out_tables)
+
+# v43.1 safety refinements: allow direct OCR rows even if no timestamp; keep them unlinked.
+def parse_datetime_from_filename(name: str):
+    """Parse common WhatsApp media filenames, including 'WhatsApp Image 2026-06-13 at 15.29.01.jpeg'."""
+    name = str(name or "")
+    patterns = [
+        r"(20\d{2})[-_](\d{2})[-_](\d{2})\s+at\s+(\d{1,2})[.:\-_](\d{2})[.:\-_](\d{2})",
+        r"(20\d{2})[-_](\d{2})[-_](\d{2})[-_](\d{2})[-_](\d{2})[-_](\d{2})",
+        r"(20\d{2})[-_](\d{2})[-_](\d{2})[-_](\d{2})[-_](\d{2})",
+        r"(\d{2})[-_](\d{2})[-_](20\d{2})[-_](\d{2})[-_](\d{2})[-_](\d{2})",
+    ]
+    for p in patterns:
+        m = re.search(p, name, flags=re.I)
+        if not m:
+            continue
+        nums = list(map(int, m.groups()))
+        try:
+            if len(nums) == 6 and str(nums[0]).startswith("20"):
+                y, mo, d, hh, mm, ss = nums
+            elif len(nums) == 5:
+                y, mo, d, hh, mm = nums
+                ss = 0
+            else:
+                d, mo, y, hh, mm, ss = nums
+            return pd.Timestamp(year=y, month=mo, day=d, hour=hh, minute=mm, second=ss)
+        except Exception:
+            pass
+    return pd.NaT
+
+
+def is_usable_ocr_table(df: pd.DataFrame) -> bool:
+    if df is None or df.empty:
+        return False
+    if "source_type" not in df.columns:
+        return False
+    if not df["source_type"].astype(str).str.contains("ocr", case=False, na=False).any():
+        return False
+    return any(c in df.columns and pd.to_numeric(df[c], errors="coerce").notna().any() for c in COLUMN_LABELS if str(c).startswith("ctu_"))
+
+
+def filter_usable_tables(tables: List[pd.DataFrame]) -> List[pd.DataFrame]:
+    """Final safety filter for all upload types, including direct CTU OCR rows."""
+    return [t for t in tables if is_valid_timeseries(t) or is_usable_single_message_table(t) or is_usable_ocr_table(t)]
+
+# v43.2 optimized OCR overrides: fewer OCR passes for Streamlit performance.
+def _ocr_numeric_region_pil(crop_img):
+    Image, ImageOps, ImageEnhance, pytesseract = _try_import_ocr_libs()
+    if Image is None:
+        return np.nan, 0.0, "ocr_dependency_missing"
+    try:
+        gray = ImageOps.autocontrast(crop_img.convert("L"))
+        g = ImageEnhance.Contrast(gray).enhance(3.0)
+        g = ImageEnhance.Sharpness(g).enhance(2.0)
+        g = g.resize((max(90, g.width * 4), max(40, g.height * 4)))
+        variants = [g, ImageOps.invert(g), g.point(lambda p: 255 if p > 150 else 0)]
+        best = (-1, np.nan, "")
+        for im in variants:
+            try:
+                txt = pytesseract.image_to_string(im, config="--oem 3 --psm 7 -c tessedit_char_whitelist=-0123456789.")
+            except Exception:
+                continue
+            nums = _numbers_from_ocr_text(txt)
+            if not nums:
+                continue
+            val = _best_number_from_ocr_text(txt)
+            score = max(len(n.replace(".", "").replace("-", "")) for n in nums) + (2 if any("." in n for n in nums) else 0)
+            if pd.notna(val) and score > best[0]:
+                best = (score, val, str(txt).strip())
+        conf = min(1.0, max(0.0, best[0] / 8.0)) if best[0] >= 0 else 0.0
+        return best[1], conf, best[2]
+    except Exception:
+        return np.nan, 0.0, "ocr_image_error"
+
+
+def _ocr_numeric_region_cv2(crop_img):
+    try:
+        import cv2
+        import numpy as _np
+        import pytesseract
+    except Exception:
+        return np.nan, 0.0, "cv2_or_tesseract_missing"
+    try:
+        arr = _np.array(crop_img.convert("RGB"))
+        bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+        bgr = cv2.resize(bgr, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+        lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+        l, _, _ = cv2.split(lab)
+        gray = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(l)
+        variants = [gray, 255 - gray, cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 51, 3)]
+        best = (-1, np.nan, "")
+        for im in variants:
+            try:
+                txt = pytesseract.image_to_string(im, config="--oem 3 --psm 7 -c tessedit_char_whitelist=-0123456789.")
+            except Exception:
+                continue
+            nums = _numbers_from_ocr_text(txt)
+            if not nums:
+                continue
+            val = _best_number_from_ocr_text(txt)
+            score = max(len(n.replace(".", "").replace("-", "")) for n in nums) + (2 if any("." in n for n in nums) else 0)
+            if pd.notna(val) and score > best[0]:
+                best = (score, val, str(txt).strip())
+        conf = min(1.0, max(0.0, best[0] / 8.0)) if best[0] >= 0 else 0.0
+        return best[1], conf, best[2]
+    except Exception:
+        return np.nan, 0.0, "cv2_ocr_error"
+
+
+def _ocr_numeric_region(crop_img):
+    pil_val, pil_conf, pil_text = _ocr_numeric_region_pil(crop_img)
+    cv_val, cv_conf, cv_text = _ocr_numeric_region_cv2(crop_img)
+    if pd.notna(cv_val) and (pd.isna(pil_val) or cv_conf >= pil_conf):
+        return cv_val, cv_conf, cv_text
+    return pil_val, pil_conf, pil_text
+
+# v43.3 dtype-safe test ID assignment override.
+def assign_test_ids(df: pd.DataFrame, gap_hours: float = 12.0) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if "well" not in out.columns:
+        out["well"] = "Unknown"
+    if "datetime" not in out.columns:
+        out["datetime"] = pd.NaT
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+    out["well"] = out["well"].fillna("Unknown").astype(str).str.strip().replace("", "Unknown")
+    out["test_id"] = out["test_id"].astype("object") if "test_id" in out.columns else pd.Series([None] * len(out), index=out.index, dtype="object")
+    out["test_sequence"] = pd.to_numeric(out["test_sequence"], errors="coerce") if "test_sequence" in out.columns else pd.Series([np.nan] * len(out), index=out.index, dtype="float")
+    sortable = out.sort_values(["well", "datetime", "source"], na_position="last").copy()
+    assigned = {}
+    for well, g in sortable.groupby("well", dropna=False):
+        well_txt = str(well or "Unknown").strip() or "Unknown"
+        if well_txt.lower() == "unknown":
+            for i in g.index:
+                assigned[i] = ("Unlinked_OCR_or_Unknown_Well", np.nan)
+            continue
+        seq = 0
+        last_dt = pd.NaT
+        current_id = None
+        for i, row in g.iterrows():
+            dt = row.get("datetime", pd.NaT)
+            if pd.isna(dt):
+                seq += 1
+                current_id = f"{well_txt}_T{seq:02d}_NoTime"
+                assigned[i] = (current_id, float(seq))
+                continue
+            new_test = current_id is None or pd.isna(last_dt) or (pd.Timestamp(dt) - pd.Timestamp(last_dt) > pd.Timedelta(hours=float(gap_hours)))
+            if new_test:
+                seq += 1
+                current_id = f"{well_txt}_{pd.Timestamp(dt).strftime('%Y%m%d_%H%M')}"
+            assigned[i] = (current_id, float(seq))
+            last_dt = pd.Timestamp(dt)
+    for i, (tid, seq) in assigned.items():
+        out.at[i, "test_id"] = tid
+        out.at[i, "test_sequence"] = seq
+    if "test_id" in out.columns and "datetime" in out.columns:
+        valid = out[~out["test_id"].astype(str).str.startswith("Unlinked") & out["datetime"].notna()].copy()
+        if not valid.empty:
+            starts = valid.groupby("test_id")["datetime"].min()
+            ends = valid.groupby("test_id")["datetime"].max()
+            out["test_start"] = out["test_id"].map(starts)
+            out["test_end"] = out["test_id"].map(ends)
+    return out
+
+# v43.4 preserve old TMU parser but add operation-note detection such as Flare test.
+_parse_tmu_message_base_v43 = parse_tmu_message
+
+def parse_tmu_message(message: str, source_name: str = "WhatsApp_Text") -> Dict[str, object]:
+    row = _parse_tmu_message_base_v43(message, source_name=source_name)
+    text = str(message or "")
+    if re.search(r"\bflare\s+test\b", text, flags=re.I):
+        row["note"] = append_note(row.get("note"), "Flare test")
+    if re.search(r"\bctu\b|coiled\s+tubing|coil\s+tubing", text, flags=re.I):
+        row["note"] = append_note(row.get("note"), "CTU operation")
+    return row
