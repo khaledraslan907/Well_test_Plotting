@@ -563,7 +563,7 @@ with st.sidebar:
     )
     st.caption("For WhatsApp: export chat with media, then upload the ZIP. CTU/HMI images are parsed as auxiliary OCR rows and must be manually linked to the correct test.")
 
-    st.header("2) Test split and OCR safety")
+    st.header("2) Test split and CTU image OCR")
     test_gap_hours = st.number_input(
         "Start a new test for the same well if gap exceeds (hours)",
         min_value=1.0,
@@ -578,15 +578,15 @@ with st.sidebar:
         help="Turn OFF when a WhatsApp ZIP contains many irrelevant photos. OCR rows stay unlinked until you manually select the correct Well/Test.",
     )
     max_ocr_images = st.number_input(
-        "Maximum CTU/HMI images to OCR per ZIP",
+        "CTU/HMI image OCR limit per ZIP (0 = no limit)",
         min_value=0,
-        max_value=1000,
-        value=100,
-        step=10,
-        help="Use 0 to skip image OCR. Increase if the WhatsApp chat contains many CTU screen images. Excel/text/PDF attachments are still parsed normally.",
+        max_value=5000,
+        value=300,
+        step=25,
+        help="Use the OCR checkbox above to skip images completely. Set this to 0 only when you want to OCR every image in the ZIP. Excel/text/PDF attachments are always parsed normally.",
     )
     st.caption(
-        "Safety rule: CTU/OCR image rows are NOT linked by nearest time. They keep their exact WhatsApp/photo time and are linked only when the user manually selects the correct Well/Test."
+        "Safety rule: CTU/OCR image rows use only their exact WhatsApp/photo timestamp. No nearest-time suggestion or automatic well fill is used; link them manually only when you are sure."
     )
 
     st.header("3) Paste WhatsApp report")

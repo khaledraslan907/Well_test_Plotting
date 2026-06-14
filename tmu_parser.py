@@ -3296,3 +3296,305 @@ def assign_test_ids(df: pd.DataFrame, gap_hours: float = 12.0) -> pd.DataFrame:
         out["test_start"] = out["test_id"].map(starts)
         out["test_end"] = out["test_id"].map(ends)
     return out
+
+
+# -----------------------------------------------------------------------------
+# v45 FINAL SAFETY OVERRIDES
+# -----------------------------------------------------------------------------
+# Purpose:
+# 1) Completely disable nearest-time CTU/OCR suggestions and any automatic OCR link.
+# 2) Prevent pandas dtype errors when text well names such as '*S8-58*' are assigned.
+# 3) Interpret max_ocr_images=0 as no limit; image OCR is skipped only when parse_images=False.
+
+PARSER_BUILD = "v45_whatsapp_zip_ctu_ocr_safe_no_nearest_link"
+
+
+def _v45_series_object(default=None, n=0, index=None):
+    return pd.Series([default] * int(n), index=index, dtype="object")
+
+
+def safe_object_columns(df: pd.DataFrame, columns=None) -> pd.DataFrame:
+    """Force mixed text/status columns to object dtype before assignment."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if columns is None:
+        columns = [
+            "well", "test_id", "source", "sheet", "source_type", "link_status",
+            "review_required", "suggested_well", "suggested_test_id",
+            "suggested_link_reason", "image_file", "attachment_name", "source_member",
+            "chat_sender", "caption_text", "ocr_template", "ocr_status",
+        ]
+    for c in columns:
+        if c not in out.columns:
+            out[c] = _v45_series_object(None, len(out), out.index)
+        else:
+            out[c] = out[c].astype("object")
+    return out
+
+
+def suggest_links_for_ocr_rows(df: pd.DataFrame, max_gap_hours: float = 0.0) -> pd.DataFrame:
+    """v45 disabled: no nearest-time suggestion, no automatic CTU/OCR well/test fill."""
+    if df is None or df.empty:
+        return df
+    out = safe_object_columns(df)
+    ocr_mask = out.get("source_type", pd.Series([""] * len(out), index=out.index)).astype(str).str.contains("ocr", case=False, na=False)
+    out.loc[ocr_mask, "link_status"] = out.loc[ocr_mask, "link_status"].where(
+        out.loc[ocr_mask, "link_status"].notna(), "ocr_manual_link_required"
+    )
+    out.loc[ocr_mask, "review_required"] = True
+    # Keep old columns empty if older app versions look for them.
+    out.loc[ocr_mask, "suggested_well"] = None
+    out.loc[ocr_mask, "suggested_test_id"] = None
+    out.loc[ocr_mask, "suggested_link_reason"] = "disabled_no_nearest_time_linking"
+    return out
+
+
+def approve_suggested_ocr_links(df: pd.DataFrame) -> pd.DataFrame:
+    """v45 no-op; user must manually select well/test in Streamlit review table."""
+    return df
+
+
+def clean_well_name_value(value: object) -> str:
+    """Final robust well-name cleanup for WhatsApp bold/hidden characters."""
+    s = safe_text(value)
+    s = s.replace("\u200e", "").replace("\u200f", "").replace("\ufeff", "")
+    s = re.sub(r"[*_`~]+", "", s)  # WhatsApp markdown bold/italic
+    s = re.sub(r"(?i)\bwell\s*name\b|\bwell\b", "", s)
+    s = re.sub(r"^[\s:=@\-]+", "", s).strip()
+    s = re.split(r"[\n\r,;]|\s{2,}", s)[0].strip()
+    s = s.strip(" .:;=()[]{}<>|'\"")
+    if not s or s.lower() in {"nan", "nat", "none", "unknown", "null", "-", "to", "*"}:
+        return "Unknown"
+    # Avoid dates becoming wells.
+    if re.fullmatch(r"\d{1,2}[-/]\d{1,2}[-/]\d{2,4}", s):
+        return "Unknown"
+    # Pure numeric values are usually BS&W/salinity/rates from partial WhatsApp messages, not well names.
+    if re.fullmatch(r"\d+(?:\.\d+)?", s):
+        return "Unknown"
+    # Examples: S8-58, OB-69, B3C18-7, A-C83-1, BED15-33.
+    pat = r"\b(?:[A-Za-z]{1,12}[-/ ]*)?[A-Za-z0-9]*\d[A-Za-z0-9]*(?:[-/][A-Za-z0-9]+)*\b"
+    candidates = []
+    for m in re.finditer(pat, s):
+        cand = re.sub(r"\s+", "", m.group(0).strip("-_/ ."))
+        if not cand or not re.search(r"\d", cand):
+            continue
+        if re.fullmatch(r"\d{1,2}[-/]\d{1,2}[-/]\d{2,4}", cand):
+            continue
+        candidates.append(cand)
+    if candidates:
+        return candidates[-1].upper()
+    return "Unknown"
+
+
+def guess_well_from_name(name: str) -> Optional[str]:
+    """Final well guess used after WhatsApp markdown cleanup."""
+    s = re.sub(r"[*_`~]+", "", str(name or ""))
+    # Prefer explicit Obaiyed/OB style when present.
+    patterns = [
+        r"\b(OB\s*[-_ ]\s*\d+[A-Z]?)\b",
+        r"\b(S\d+\s*[-_ ]\s*\d+[A-Z]?)\b",
+        r"\b([A-Z]{1,4}\d+[A-Z]*\s*[-_ ]\s*\d+[A-Z]?)\b",
+        r"\b([A-Z]{1,4}\s*[-_ ]\s*[A-Z]?\d+[A-Z]*\s*[-_ ]\s*\d+[A-Z]?)\b",
+    ]
+    for pat in patterns:
+        m = re.search(pat, s, flags=re.I)
+        if m:
+            well = clean_well_name_value(m.group(1))
+            if well != "Unknown":
+                return well
+    return None
+
+
+_parse_tmu_message_before_v45 = parse_tmu_message
+
+def parse_tmu_message(message: str, source_name: str = "WhatsApp_Text") -> Dict[str, object]:
+    row = _parse_tmu_message_before_v45(message, source_name=source_name)
+    text = str(message or "")
+    cleaned = clean_well_name_value(row.get("well", "Unknown"))
+    if cleaned == "Unknown":
+        cleaned = clean_well_name_value(guess_well_from_name(text))
+    row["well"] = cleaned
+    if re.search(r"\bflare\s+test\b", text, flags=re.I):
+        row["note"] = append_note(row.get("note"), "Flare test")
+    if re.search(r"\bctu\b|coiled\s+tubing|coil\s+tubing", text, flags=re.I):
+        row["note"] = append_note(row.get("note"), "CTU operation")
+    return row
+
+
+def assign_test_ids(df: pd.DataFrame, gap_hours: float = 12.0) -> pd.DataFrame:
+    """Assign test IDs by well name and same-well time gap only.
+
+    CTU/OCR rows with Unknown well remain unlinked. Nothing is filled by nearest time.
+    """
+    if df is None or df.empty:
+        return df
+    out = safe_object_columns(df)
+    out["well"] = out["well"].apply(clean_well_name_value).astype("object")
+    out["datetime"] = pd.to_datetime(out.get("datetime"), errors="coerce")
+    if "test_sequence" not in out.columns:
+        out["test_sequence"] = np.nan
+    out["test_sequence"] = pd.to_numeric(out["test_sequence"], errors="coerce")
+
+    sortable_cols = [c for c in ["well", "datetime", "source"] if c in out.columns]
+    sortable = out.sort_values(sortable_cols, na_position="last").copy() if sortable_cols else out.copy()
+    assigned = {}
+
+    for well, g in sortable.groupby("well", dropna=False):
+        well_txt = clean_well_name_value(well)
+        if well_txt == "Unknown":
+            for i, row in g.iterrows():
+                is_ocr = "ocr" in str(row.get("source_type", "")).lower()
+                assigned[i] = ("Unlinked_OCR_or_Unknown_Well" if is_ocr else "Unknown_Well_Unlinked", np.nan)
+            continue
+
+        seq = 0
+        last_dt = pd.NaT
+        current_id = None
+        for i, row in g.iterrows():
+            dt = row.get("datetime", pd.NaT)
+            if pd.isna(dt):
+                seq += 1
+                current_id = f"{well_txt}_T{seq:02d}_NoTime"
+                assigned[i] = (current_id, float(seq))
+                continue
+            dt = pd.Timestamp(dt)
+            new_test = current_id is None or pd.isna(last_dt) or (dt - pd.Timestamp(last_dt) > pd.Timedelta(hours=float(gap_hours)))
+            if new_test:
+                seq += 1
+                current_id = f"{well_txt}_{dt.strftime('%Y%m%d_%H%M')}"
+            assigned[i] = (current_id, float(seq))
+            last_dt = dt
+
+    for i, (tid, seq) in assigned.items():
+        out.at[i, "test_id"] = str(tid)
+        out.at[i, "test_sequence"] = seq
+
+    ocr_mask = out["source_type"].astype(str).str.contains("ocr", case=False, na=False)
+    unknown_ocr = ocr_mask & ((out["well"].astype(str).str.lower() == "unknown") | out["test_id"].astype(str).str.startswith("Unlinked"))
+    out.loc[unknown_ocr, "link_status"] = "ocr_manual_link_required"
+    out.loc[unknown_ocr, "review_required"] = True
+
+    valid = out[~out["test_id"].astype(str).str.startswith("Unlinked") & out["datetime"].notna()].copy()
+    if not valid.empty:
+        starts = valid.groupby("test_id")["datetime"].min()
+        ends = valid.groupby("test_id")["datetime"].max()
+        out["test_start"] = out["test_id"].map(starts)
+        out["test_end"] = out["test_id"].map(ends)
+    return out
+
+
+# Keep a final explicit router so older code paths cannot call the old nearest-time suggester.
+def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: int = 300) -> List[pd.DataFrame]:
+    name = getattr(uploaded_file, "name", "uploaded")
+    suffix = Path(str(name)).suffix.lower().lstrip(".")
+
+    if suffix in IMAGE_SUFFIXES:
+        if not parse_images:
+            return []
+        df = parse_ctu_all_data_screen_image(uploaded_file, source_name=name)
+        if df is not None and not df.empty:
+            df = safe_object_columns(df)
+            df = assign_test_ids(df, gap_hours=12.0)
+        return filter_usable_tables([df])
+
+    if suffix == "zip":
+        try:
+            raw = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
+            tables: List[pd.DataFrame] = []
+            ocr_count = 0
+            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                members = [m for m in zf.namelist() if not m.endswith("/") and not Path(m).name.startswith("._")]
+
+                all_messages: List[Dict[str, object]] = []
+                for member in members:
+                    member_name = Path(member).name
+                    ext = Path(member_name).suffix.lower().lstrip(".")
+                    if ext == "txt" and ("chat" in member_name.lower() or "_chat" in member_name.lower()):
+                        text = zf.read(member).decode("utf-8", errors="ignore")
+                        msgs = parse_whatsapp_export_messages(text)
+                        all_messages.extend(msgs)
+                        df = parse_whatsapp_export_text(text, source_name=f"{name}:{member_name}")
+                        if df is not None and not df.empty:
+                            df = safe_object_columns(df)
+                            df["source_member"] = member
+                            tables.append(df)
+
+                attachment_context = {}
+                for m in all_messages:
+                    att = str(m.get("attachment_name", "") or "").strip()
+                    if att:
+                        attachment_context[Path(att).name] = m
+
+                for member in members:
+                    member_name = Path(member).name
+                    ext = Path(member_name).suffix.lower().lstrip(".")
+                    if not member_name or ext not in (DATA_SUFFIXES | IMAGE_SUFFIXES):
+                        continue
+                    if ext == "txt" and ("chat" in member_name.lower() or "_chat" in member_name.lower()):
+                        continue
+
+                    if ext in IMAGE_SUFFIXES:
+                        if not parse_images:
+                            continue
+                        # max_ocr_images=0 means no limit in v45.
+                        if int(max_ocr_images or 0) > 0 and ocr_count >= int(max_ocr_images):
+                            continue
+                        ocr_count += 1
+
+                    sub_file = UploadedBytes(zf.read(member), member_name)
+                    sub_tables = load_tabular_file(sub_file, parse_images=parse_images, max_ocr_images=max_ocr_images)
+                    ctx = attachment_context.get(member_name, {})
+                    for t in sub_tables or []:
+                        if t is None or t.empty:
+                            continue
+                        t = safe_object_columns(t)
+                        t["attachment_name"] = member_name
+                        t["source_member"] = member
+                        if ctx:
+                            t["chat_sender"] = ctx.get("sender", "")
+                            t["chat_datetime"] = ctx.get("datetime", pd.NaT)
+                            t["message_index"] = ctx.get("message_index", np.nan)
+                            # Use exact WhatsApp attachment timestamp only when the attachment parser did not provide time.
+                            if "datetime" not in t.columns or pd.to_datetime(t["datetime"], errors="coerce").isna().all():
+                                if pd.notna(ctx.get("datetime", pd.NaT)):
+                                    t["datetime"] = ctx.get("datetime")
+                                    t["date"] = pd.Timestamp(ctx.get("datetime")).floor("D")
+                                    t["time_text"] = pd.Timestamp(ctx.get("datetime")).strftime("%H:%M")
+                            if ext in IMAGE_SUFFIXES:
+                                t["caption_text"] = str(ctx.get("body", ""))[:500]
+                        tables.append(t)
+
+            if not tables:
+                return []
+            merged = pd.concat(tables, ignore_index=True, sort=False)
+            merged = safe_object_columns(merged)
+            merged = assign_test_ids(merged, gap_hours=12.0)
+            # Explicitly keep OCR rows unlinked. No nearest-time suggestions.
+            merged = suggest_links_for_ocr_rows(merged, max_gap_hours=0.0)
+            return filter_usable_tables([merged])
+        except Exception as e:
+            raise RuntimeError(f"Could not read WhatsApp ZIP {name}: {e}")
+
+    if suffix == "txt":
+        try:
+            text = uploaded_file.getvalue().decode("utf-8", errors="ignore")
+        except Exception:
+            if hasattr(uploaded_file, "seek"):
+                uploaded_file.seek(0)
+            text = uploaded_file.read().decode("utf-8", errors="ignore")
+        df = parse_whatsapp_plain_or_export_text(text, source_name=name)
+        if df is not None and not df.empty:
+            df = safe_object_columns(df)
+            df = assign_test_ids(df, gap_hours=12.0)
+            return filter_usable_tables([df])
+        return []
+
+    tables = load_tabular_file_base(uploaded_file)
+    out_tables = []
+    for t in tables or []:
+        if t is not None and not t.empty:
+            t = safe_object_columns(t)
+            t = assign_test_ids(t, gap_hours=12.0)
+            out_tables.append(t)
+    return filter_usable_tables(out_tables)
