@@ -2721,7 +2721,7 @@ def approve_suggested_ocr_links(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: int = 10) -> List[pd.DataFrame]:
+def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: int = 100) -> List[pd.DataFrame]:
     """v43 upload router.
 
     Supports existing Excel/CSV/DOCX/PDF/TXT parsing plus:
@@ -2806,7 +2806,8 @@ def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: 
                 return []
             merged = pd.concat(tables, ignore_index=True, sort=False)
             merged = assign_test_ids(merged, gap_hours=12.0)
-            merged = suggest_links_for_ocr_rows(merged, max_gap_hours=3.0)
+            # No nearest-time OCR linking here. CTU/OCR image rows remain unlinked
+            # unless the user manually selects the correct Well/Test in Streamlit.
             return filter_usable_tables([merged])
         except Exception as e:
             raise RuntimeError(f"Could not read WhatsApp ZIP {name}: {e}")
@@ -3006,3 +3007,292 @@ def parse_tmu_message(message: str, source_name: str = "WhatsApp_Text") -> Dict[
     if re.search(r"\bctu\b|coiled\s+tubing|coil\s+tubing", text, flags=re.I):
         row["note"] = append_note(row.get("note"), "CTU operation")
     return row
+
+
+# -----------------------------------------------------------------------------
+# v44 safety patch: no nearest-time CTU linking + robust WhatsApp bold well names
+# -----------------------------------------------------------------------------
+def clean_well_name_value(value: object) -> str:
+    """Clean WhatsApp/Excel well names without inventing a well.
+
+    Examples:
+      '*S8-58*' -> 'S8-58'
+      '*'       -> 'Unknown'
+    """
+    s = safe_text(value)
+    s = s.replace("\u200e", "").replace("\u200f", "")
+    s = re.sub(r"[*_`~]+", "", s)
+    s = re.sub(r"(?i)\bwell\s*name\b|\bwell\b", "", s)
+    s = re.sub(r"^[\s:=@\-]+", "", s).strip()
+    s = re.split(r"[\n\r,;]|\s{2,}", s)[0].strip()
+    s = s.strip(" .:;=()[]{}<>|'\"")
+    if not s or s.lower() in {"nan", "nat", "none", "unknown", "null", "-"}:
+        return "Unknown"
+    # Prefer the first token/candidate containing at least one digit, which is how
+    # almost all field well names appear: S8-58, B3C18-7, A-C83-1, BED15-33.
+    token_match = re.search(r"[A-Za-z0-9]+(?:[-/][A-Za-z0-9]+)*", s)
+    if token_match:
+        candidate = token_match.group(0).strip("-_/ .")
+        if candidate and re.search(r"[A-Za-z0-9]", candidate):
+            return candidate
+    return "Unknown"
+
+
+def suggest_links_for_ocr_rows(df: pd.DataFrame, max_gap_hours: float = 0.0) -> pd.DataFrame:
+    """Disabled in v44 by design.
+
+    CTU/OCR rows are not linked or suggested by nearest time because that can
+    attach image data to the wrong test. The app asks the user to manually choose
+    the Well/Test ID after reviewing the image OCR numbers.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if "source_type" in out.columns:
+        ocr_mask = out["source_type"].astype(str).str.contains("ocr", case=False, na=False)
+        for c in ["link_status", "review_required"]:
+            if c not in out.columns:
+                out[c] = pd.Series([None] * len(out), index=out.index, dtype="object")
+        out.loc[ocr_mask, "link_status"] = out.loc[ocr_mask, "link_status"].fillna("ocr_manual_link_required")
+        out.loc[ocr_mask, "review_required"] = True
+    return out
+
+
+def approve_suggested_ocr_links(df: pd.DataFrame) -> pd.DataFrame:
+    """No-op kept for backward compatibility with older app.py builds."""
+    return df
+
+
+_parse_tmu_message_base_v44 = parse_tmu_message
+
+def parse_tmu_message(message: str, source_name: str = "WhatsApp_Text") -> Dict[str, object]:
+    row = _parse_tmu_message_base_v44(message, source_name=source_name)
+    row["well"] = clean_well_name_value(row.get("well", "Unknown"))
+    text = str(message or "")
+    if row.get("well", "Unknown") == "Unknown":
+        guessed = guess_well_from_name(re.sub(r"[*_`~]+", "", text))
+        row["well"] = clean_well_name_value(guessed)
+    if re.search(r"\bflare\s+test\b", text, flags=re.I):
+        row["note"] = append_note(row.get("note"), "Flare test")
+    if re.search(r"\bctu\b|coiled\s+tubing|coil\s+tubing", text, flags=re.I):
+        row["note"] = append_note(row.get("note"), "CTU operation")
+    return row
+
+
+def assign_test_ids(df: pd.DataFrame, gap_hours: float = 12.0) -> pd.DataFrame:
+    """Assign test IDs by well name and time gap only.
+
+    - Different well names are always separate streams.
+    - Same well continues until the inactive gap exceeds gap_hours.
+    - OCR rows with Unknown well stay Unlinked until manual review.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    for c in ["source", "sheet", "source_type", "well", "datetime", "test_id", "test_sequence", "link_status", "review_required"]:
+        if c not in out.columns:
+            default = None if c in {"well", "test_id", "link_status", "source_type", "source", "sheet"} else np.nan
+            out[c] = pd.Series([default] * len(out), index=out.index, dtype="object")
+    out["well"] = out["well"].apply(clean_well_name_value).astype("object")
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+    out["test_id"] = out["test_id"].astype("object")
+    out["link_status"] = out["link_status"].astype("object")
+    out["review_required"] = out["review_required"].astype("object")
+
+    sortable = out.sort_values(["well", "datetime", "source"], na_position="last").copy()
+    assigned = {}
+    for well, g in sortable.groupby("well", dropna=False):
+        well_txt = clean_well_name_value(well)
+        if well_txt == "Unknown":
+            for i, row in g.iterrows():
+                is_ocr = str(row.get("source_type", "")).lower().find("ocr") >= 0
+                assigned[i] = ("Unlinked_OCR_or_Unknown_Well" if is_ocr else "Unknown_Well_Unlinked", np.nan)
+            continue
+        seq = 0
+        last_dt = pd.NaT
+        current_id = None
+        for i, row in g.iterrows():
+            dt = row.get("datetime", pd.NaT)
+            if pd.isna(dt):
+                seq += 1
+                current_id = f"{well_txt}_T{seq:02d}_NoTime"
+                assigned[i] = (current_id, float(seq))
+                continue
+            dt = pd.Timestamp(dt)
+            new_test = current_id is None or pd.isna(last_dt) or (dt - pd.Timestamp(last_dt) > pd.Timedelta(hours=float(gap_hours)))
+            if new_test:
+                seq += 1
+                current_id = f"{well_txt}_{dt.strftime('%Y%m%d_%H%M')}"
+            assigned[i] = (current_id, float(seq))
+            last_dt = dt
+
+    for i, (tid, seq) in assigned.items():
+        out.at[i, "test_id"] = str(tid)
+        out.at[i, "test_sequence"] = seq
+
+    ocr_mask = out["source_type"].astype(str).str.contains("ocr", case=False, na=False)
+    unknown_ocr = ocr_mask & ((out["well"].astype(str).str.lower() == "unknown") | out["test_id"].astype(str).str.startswith("Unlinked"))
+    out.loc[unknown_ocr, "link_status"] = out.loc[unknown_ocr, "link_status"].fillna("ocr_manual_link_required")
+    out.loc[unknown_ocr, "review_required"] = True
+
+    valid = out[~out["test_id"].astype(str).str.startswith("Unlinked") & out["datetime"].notna()].copy()
+    if not valid.empty:
+        starts = valid.groupby("test_id")["datetime"].min()
+        ends = valid.groupby("test_id")["datetime"].max()
+        out["test_start"] = out["test_id"].map(starts)
+        out["test_end"] = out["test_id"].map(ends)
+    return out
+
+
+# v44.1 extra well-name cleanup for WhatsApp bold/plain first-line well names.
+_guess_well_from_name_base_v441 = guess_well_from_name
+
+def guess_well_from_name(name: str) -> Optional[str]:
+    base = _guess_well_from_name_base_v441(name)
+    if base:
+        return clean_well_name_value(base) if 'clean_well_name_value' in globals() else base
+    s = re.sub(r"[*_`~]+", "", str(name or ""))
+    extra_patterns = [
+        r"\b(OB\s*[-_ ]\s*\d+[A-Z]?)\b",          # Obaiyed OB-69
+        r"\b(S\d+\s*[-_ ]\s*\d+[A-Z]?)\b",        # S8-58
+        r"\b([A-Z]{1,4}\d+[A-Z]*\s*[-_ ]\s*\d+[A-Z]?)\b",
+    ]
+    for pat in extra_patterns:
+        m = re.search(pat, s, flags=re.I)
+        if m:
+            return clean_well_name_value(m.group(1)) if 'clean_well_name_value' in globals() else normalize_well_name(m.group(1))
+    return None
+
+# Override clean_well_name_value to reject non-well words such as 'to' and '*'.
+def clean_well_name_value(value: object) -> str:
+    s = safe_text(value)
+    s = s.replace("\u200e", "").replace("\u200f", "")
+    s = re.sub(r"[*_`~]+", "", s)
+    s = re.sub(r"(?i)\bwell\s*name\b|\bwell\b", "", s)
+    s = re.sub(r"^[\s:=@\-]+", "", s).strip()
+    s = re.split(r"[\n\r,;]|\s{2,}", s)[0].strip()
+    s = s.strip(" .:;=()[]{}<>|'\"")
+    if not s or s.lower() in {"nan", "nat", "none", "unknown", "null", "-", "to"}:
+        return "Unknown"
+    # Candidate must contain at least one digit to avoid false wells from normal words.
+    m = re.search(r"[A-Za-z0-9]*\d[A-Za-z0-9]*(?:[-/][A-Za-z0-9]+)*", s)
+    if m:
+        candidate = m.group(0).strip("-_/ .")
+        if candidate and re.search(r"\d", candidate):
+            return candidate.upper() if re.match(r"^[A-Za-z]{1,6}[-/ ]?\d", candidate) else candidate
+    return "Unknown"
+
+# Re-override parser and test-id assignment so the final clean_well_name_value is used.
+_parse_tmu_message_base_v441 = _parse_tmu_message_base_v44
+
+def parse_tmu_message(message: str, source_name: str = "WhatsApp_Text") -> Dict[str, object]:
+    row = _parse_tmu_message_base_v441(message, source_name=source_name)
+    text = str(message or "")
+    cleaned_guess = clean_well_name_value(row.get("well", "Unknown"))
+    if cleaned_guess == "Unknown":
+        guessed = guess_well_from_name(text)
+        cleaned_guess = clean_well_name_value(guessed)
+    row["well"] = cleaned_guess
+    if re.search(r"\bflare\s+test\b", text, flags=re.I):
+        row["note"] = append_note(row.get("note"), "Flare test")
+    if re.search(r"\bctu\b|coiled\s+tubing|coil\s+tubing", text, flags=re.I):
+        row["note"] = append_note(row.get("note"), "CTU operation")
+    return row
+
+# v44.2 final well cleaning: keep prefixes like OB-69, S8-58, B3C18-7, A-C83-1.
+def clean_well_name_value(value: object) -> str:
+    s = safe_text(value)
+    s = s.replace("\u200e", "").replace("\u200f", "")
+    s = re.sub(r"[*_`~]+", "", s)
+    s = re.sub(r"(?i)\bwell\s*name\b|\bwell\b", "", s)
+    s = re.sub(r"^[\s:=@\-]+", "", s).strip()
+    s = re.split(r"[\n\r,;]|\s{2,}", s)[0].strip()
+    s = s.strip(" .:;=()[]{}<>|'\"")
+    if not s or s.lower() in {"nan", "nat", "none", "unknown", "null", "-", "to"}:
+        return "Unknown"
+    # Find all candidate well-looking tokens that contain digits and optional letter prefixes.
+    pat = r"\b(?:[A-Za-z]{1,12}[-/ ]*)?[A-Za-z0-9]*\d[A-Za-z0-9]*(?:[-/][A-Za-z0-9]+)*\b"
+    candidates = []
+    for m in re.finditer(pat, s):
+        cand = re.sub(r"\s+", "", m.group(0).strip("-_/ ."))
+        if not cand or not re.search(r"\d", cand):
+            continue
+        if re.fullmatch(r"\d{1,2}[-/]\d{1,2}[-/]\d{2,4}", cand):
+            continue
+        candidates.append(cand)
+    if candidates:
+        # Prefer the last candidate because strings like 'Obaiyed OB-69' contain
+        # a field name first and the actual well token at the end.
+        return candidates[-1].upper()
+    return "Unknown"
+
+_parse_tmu_message_base_v442 = _parse_tmu_message_base_v441
+
+def parse_tmu_message(message: str, source_name: str = "WhatsApp_Text") -> Dict[str, object]:
+    row = _parse_tmu_message_base_v442(message, source_name=source_name)
+    text = str(message or "")
+    cleaned_guess = clean_well_name_value(row.get("well", "Unknown"))
+    if cleaned_guess == "Unknown":
+        guessed = guess_well_from_name(text)
+        cleaned_guess = clean_well_name_value(guessed)
+    row["well"] = cleaned_guess
+    if re.search(r"\bflare\s+test\b", text, flags=re.I):
+        row["note"] = append_note(row.get("note"), "Flare test")
+    if re.search(r"\bctu\b|coiled\s+tubing|coil\s+tubing", text, flags=re.I):
+        row["note"] = append_note(row.get("note"), "CTU operation")
+    return row
+
+# Re-override assign_test_ids to use v44.2 clean_well_name_value.
+def assign_test_ids(df: pd.DataFrame, gap_hours: float = 12.0) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    for c in ["source", "sheet", "source_type", "well", "datetime", "test_id", "test_sequence", "link_status", "review_required"]:
+        if c not in out.columns:
+            default = None if c in {"well", "test_id", "link_status", "source_type", "source", "sheet"} else np.nan
+            out[c] = pd.Series([default] * len(out), index=out.index, dtype="object")
+    out["well"] = out["well"].apply(clean_well_name_value).astype("object")
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+    out["test_id"] = out["test_id"].astype("object")
+    out["link_status"] = out["link_status"].astype("object")
+    out["review_required"] = out["review_required"].astype("object")
+    sortable = out.sort_values(["well", "datetime", "source"], na_position="last").copy()
+    assigned = {}
+    for well, g in sortable.groupby("well", dropna=False):
+        well_txt = clean_well_name_value(well)
+        if well_txt == "Unknown":
+            for i, row in g.iterrows():
+                is_ocr = str(row.get("source_type", "")).lower().find("ocr") >= 0
+                assigned[i] = ("Unlinked_OCR_or_Unknown_Well" if is_ocr else "Unknown_Well_Unlinked", np.nan)
+            continue
+        seq = 0
+        last_dt = pd.NaT
+        current_id = None
+        for i, row in g.iterrows():
+            dt = row.get("datetime", pd.NaT)
+            if pd.isna(dt):
+                seq += 1
+                current_id = f"{well_txt}_T{seq:02d}_NoTime"
+                assigned[i] = (current_id, float(seq))
+                continue
+            dt = pd.Timestamp(dt)
+            new_test = current_id is None or pd.isna(last_dt) or (dt - pd.Timestamp(last_dt) > pd.Timedelta(hours=float(gap_hours)))
+            if new_test:
+                seq += 1
+                current_id = f"{well_txt}_{dt.strftime('%Y%m%d_%H%M')}"
+            assigned[i] = (current_id, float(seq))
+            last_dt = dt
+    for i, (tid, seq) in assigned.items():
+        out.at[i, "test_id"] = str(tid)
+        out.at[i, "test_sequence"] = seq
+    ocr_mask = out["source_type"].astype(str).str.contains("ocr", case=False, na=False)
+    unknown_ocr = ocr_mask & ((out["well"].astype(str).str.lower() == "unknown") | out["test_id"].astype(str).str.startswith("Unlinked"))
+    out.loc[unknown_ocr, "link_status"] = out.loc[unknown_ocr, "link_status"].fillna("ocr_manual_link_required")
+    out.loc[unknown_ocr, "review_required"] = True
+    valid = out[~out["test_id"].astype(str).str.startswith("Unlinked") & out["datetime"].notna()].copy()
+    if not valid.empty:
+        starts = valid.groupby("test_id")["datetime"].min()
+        ends = valid.groupby("test_id")["datetime"].max()
+        out["test_start"] = out["test_id"].map(starts)
+        out["test_end"] = out["test_id"].map(ends)
+    return out

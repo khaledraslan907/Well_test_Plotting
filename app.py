@@ -52,8 +52,6 @@ column_label = _tmu_parser.column_label
 load_tabular_file = _tmu_parser.load_tabular_file
 parse_many_tmu_messages = _tmu_parser.parse_many_tmu_messages
 assign_test_ids = getattr(_tmu_parser, "assign_test_ids", lambda df, gap_hours=12.0: df)
-approve_suggested_ocr_links = getattr(_tmu_parser, "approve_suggested_ocr_links", lambda df: df)
-suggest_links_for_ocr_rows = getattr(_tmu_parser, "suggest_links_for_ocr_rows", lambda df, max_gap_hours=3.0: df)
 
 
 def canonical_key(s: object) -> str:
@@ -563,7 +561,7 @@ with st.sidebar:
         accept_multiple_files=True,
         help="Upload normal test files or a WhatsApp exported ZIP. ZIP can contain _chat.txt, Excel/PDF/DOCX/CSV attachments, and CTU screen images.",
     )
-    st.caption("For WhatsApp: export chat with media, then upload the ZIP. CTU/HMI images are parsed as auxiliary OCR rows and require review before linking to a test.")
+    st.caption("For WhatsApp: export chat with media, then upload the ZIP. CTU/HMI images are parsed as auxiliary OCR rows and must be manually linked to the correct test.")
 
     st.header("2) Test split and OCR safety")
     test_gap_hours = st.number_input(
@@ -574,31 +572,21 @@ with st.sidebar:
         step=1.0,
         help="Same well continues the same test until this inactive gap is exceeded. A different well is always treated as another test stream.",
     )
-    ocr_link_window_hours = st.number_input(
-        "Suggest CTU image link only if nearest confirmed row is within (hours)",
-        min_value=0.25,
-        max_value=24.0,
-        value=3.0,
-        step=0.25,
-        help="This only creates a suggestion. CTU/OCR rows are not assigned to a well/test until you approve or manually edit them.",
-    )
     enable_ctu_ocr = st.checkbox(
         "Process CTU/HMI images with OCR",
         value=True,
-        help="Turn OFF when a WhatsApp ZIP contains many irrelevant photos. OCR rows still require review before linking.",
+        help="Turn OFF when a WhatsApp ZIP contains many irrelevant photos. OCR rows stay unlinked until you manually select the correct Well/Test.",
     )
     max_ocr_images = st.number_input(
-        "Maximum images to OCR per ZIP",
+        "Maximum CTU/HMI images to OCR per ZIP",
         min_value=0,
-        max_value=100,
-        value=3,
-        step=1,
-        help="Keeps free Streamlit runs fast. Increase only when you need OCR for many CTU photos. Excel/text/PDF attachments are still parsed normally.",
+        max_value=1000,
+        value=100,
+        step=10,
+        help="Use 0 to skip image OCR. Increase if the WhatsApp chat contains many CTU screen images. Excel/text/PDF attachments are still parsed normally.",
     )
-    approve_ocr_suggestions = st.checkbox(
-        "Approve suggested CTU/OCR links",
-        value=False,
-        help="Leave OFF for safety. Turn ON only after reviewing the OCR rows table and confirming the suggested well/test is correct.",
+    st.caption(
+        "Safety rule: CTU/OCR image rows are NOT linked by nearest time. They keep their exact WhatsApp/photo time and are linked only when the user manually selects the correct Well/Test."
     )
 
     st.header("3) Paste WhatsApp report")
@@ -659,13 +647,11 @@ data = pd.concat(frames, ignore_index=True, sort=False)
 # Test segmentation: same well continues until the selected gap is exceeded;
 # a different well is always a separate test stream.
 data = assign_test_ids(data, gap_hours=float(test_gap_hours))
-data = suggest_links_for_ocr_rows(data, max_gap_hours=float(ocr_link_window_hours))
 
-# CTU/OCR rows are intentionally safe by default: the parser suggests links but
-# does not silently assign image data to a well/test. The user can approve the
-# suggestions after reviewing the table below.
-if approve_ocr_suggestions:
-    data = approve_suggested_ocr_links(data)
+# CTU/OCR rows are intentionally safe by default:
+# no nearest-time auto-linking, no silent well/test fill.
+# They keep their own WhatsApp/photo timestamp and remain unlinked until the user
+# manually selects the correct Well/Test in the OCR review table.
 
 if "datetime" in data.columns:
     data["datetime"] = pd.to_datetime(data["datetime"], errors="coerce")
@@ -678,19 +664,18 @@ data, active_column_aliases = editable_column_mapping_panel(data)
 # Safety review for CTU/HMI OCR image rows.
 ocr_mask = data.get("source_type", pd.Series([], dtype=str)).astype(str).str.contains("ocr", case=False, na=False) if "source_type" in data.columns else pd.Series([False] * len(data), index=data.index)
 if ocr_mask.any():
-    with st.expander("CTU / HMI image OCR review — confirm before using in plots", expanded=not bool(approve_ocr_suggestions)):
+    with st.expander("CTU / HMI image OCR review — manually link to the correct test", expanded=True):
         st.warning(
-            "CTU image OCR rows are auxiliary data. They are not assigned to a well/test automatically unless you approve the suggested links. "
-            "Use this table to check OCR numbers, suggested well/test, and link status."
+            "CTU image OCR rows are auxiliary data. They are NOT linked by nearest time. "
+            "Check the OCR numbers and manually choose the correct Well/Test only when you are sure the image belongs to that test."
         )
         ocr_cols = [
             "image_file", "datetime", "well", "test_id", "link_status",
-            "suggested_well", "suggested_test_id", "suggested_link_gap_hours",
             "ocr_fields_found", "ocr_confidence",
             "ctu_weight_lbf", "ctu_lt_weight_lbf", "ctu_wellhead_pressure_psi",
             "ctu_circulation_pressure_psi", "ctu_reel_depth_ft", "ctu_reel_speed_ftmin",
             "ctu_fluid_rate_bpm", "ctu_n2_rate_scfm", "ctu_fluid_total_bbl", "ctu_n2_total_scf",
-            "caption_text", "suggested_link_reason",
+            "caption_text",
         ]
         ocr_cols = [c for c in ocr_cols if c in data.columns]
         review_df = data.loc[ocr_mask, ocr_cols].copy()
@@ -738,8 +723,7 @@ if ocr_mask.any():
                     data.at[rid, "link_status"] = "ocr_manual_reviewed"
                     data.at[rid, "review_required"] = False
 
-        if not approve_ocr_suggestions:
-            st.info("Suggested links are not applied automatically. Either turn ON approval after checking them, or manually choose Well/Test ID in the table above.")
+        st.info("OCR rows are included only after you manually assign the correct Well/Test ID in this table. No nearest-time suggestion is used.")
 
 
 def parse_manual_events(text, reference_start=None):
