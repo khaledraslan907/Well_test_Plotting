@@ -4017,3 +4017,59 @@ def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: 
             t = assign_test_ids(t, gap_hours=12.0)
             out_tables.append(t)
     return filter_usable_tables(out_tables)
+
+# -----------------------------------------------------------------------------
+# v48 final safety override: never miss Pumping Pressure columns from Excel.
+# -----------------------------------------------------------------------------
+def _looks_like_pumping_pressure_column_v48(col: object) -> bool:
+    c = clean_header(col)
+    c2 = canonical_key(col)
+    txt = f" {c} {c2} "
+    if any(bad in txt for bad in ["frequency", "freq", "hz", "speed", "rate", "n2", "nitrogen", "depth", "temp", "temperature", "total"]):
+        # Do not confuse pump frequency/rate/temp with pressure.
+        if not re.search(r"\b(pump|pumping)[_\s.\-/]*p\b|pumping[.\s_\-/]*pressure|pump[.\s_\-/]*pressure", txt):
+            return False
+    return bool(re.search(
+        r"\b(pump|pumping)[_\s.\-/]*p\b|pumping[.\s_\-/]*pressure|pump[.\s_\-/]*pressure|circulation[.\s_\-/]*pressure",
+        txt,
+        flags=re.I,
+    ))
+
+
+def ensure_pumping_pressure_column_v48(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    current = pd.to_numeric(out.get("pumping_pressure_psi", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+    if current.notna().sum() > 0:
+        out["pumping_pressure_psi"] = current
+        return out
+    candidates = []
+    for col in list(out.columns):
+        if str(col) == "pumping_pressure_psi":
+            continue
+        if _looks_like_pumping_pressure_column_v48(col):
+            vals = pd.to_numeric(
+                out[col].astype(str)
+                .str.replace(",", "", regex=False)
+                .str.replace("%", "", regex=False)
+                .str.extract(r"([-+]?\d+(?:\.\d+)?)", expand=False),
+                errors="coerce",
+            )
+            if vals.notna().sum() >= max(1, min(3, len(out) // 20)):
+                candidates.append((int(vals.notna().sum()), str(col), vals))
+    if candidates:
+        candidates.sort(reverse=True, key=lambda x: x[0])
+        out["pumping_pressure_psi"] = candidates[0][2]
+    return out
+
+
+_load_tabular_file_v47_final = load_tabular_file
+
+def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: int = 1000) -> List[pd.DataFrame]:
+    tables = _load_tabular_file_v47_final(uploaded_file, parse_images=parse_images, max_ocr_images=max_ocr_images)
+    fixed = []
+    for t in tables or []:
+        if t is not None and not t.empty:
+            fixed.append(ensure_pumping_pressure_column_v48(t))
+    return fixed

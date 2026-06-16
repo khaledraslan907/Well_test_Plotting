@@ -1042,15 +1042,23 @@ def convert_events_for_plot(manual_events, df, x_axis_mode):
     if not manual_events or df.empty or "series_label" not in df.columns:
         return []
     converted = []
+
+    def _event_common(e):
+        return {
+            "x_shift_px": float(e.get("x_shift_px", 0) or 0),
+            "y_level": str(e.get("y_level", "Auto") or "Auto"),
+        }
+
     if x_axis_mode == "Real calendar time":
         for e in manual_events:
             target = e.get("target", "All selected wells")
             label = e["label"]
-            converted.append({"plot_x": e["datetime"], "label": label, "target": target})
+            item = {"plot_x": e["datetime"], "label": label, "target": target}
+            item.update(_event_common(e))
+            converted.append(item)
         return converted
     if "datetime" not in df.columns:
         return []
-    multiple_series = df["series_label"].nunique() > 1
     for event in manual_events:
         event_dt = pd.Timestamp(event["datetime"])
         target = event.get("target", "All selected wells")
@@ -1063,9 +1071,10 @@ def convert_events_for_plot(manual_events, df, x_axis_mode):
             nearest_i = int((g["datetime"] - event_dt).abs().idxmin())
             px = g.loc[nearest_i, "plot_x"] if "plot_x" in g.columns else nearest_i + 1
             label = event["label"]
-            converted.append({"plot_x": px, "label": label, "target": target})
+            item = {"plot_x": px, "label": label, "target": target}
+            item.update(_event_common(event))
+            converted.append(item)
     return converted
-
 
 def convert_intervals_for_plot(operation_intervals, df, x_axis_mode):
     if not operation_intervals or df.empty or "series_label" not in df.columns:
@@ -1345,53 +1354,62 @@ with st.sidebar:
 
     plot_mode = st.selectbox(
         "Plot style",
-        ["Separate panels like report", "Overlay actual values", "Overlay two features with secondary Y-axis"],
+        ["Separate panels like report", "Overlay actual values"],
         index=0,
+        help="Use separate panels for normal reports. Use overlay to compare actual values on one axis.",
     )
 
+    add_dual_axis_chart = False
     dual_axis_left_feature = None
     dual_axis_right_feature = None
-    if plot_mode == "Overlay two features with secondary Y-axis" and numeric_cols:
-        dual_defaults = selected_features if len(selected_features) >= 2 else (default_features if len(default_features) >= 2 else numeric_cols[:2])
-        dual_axis_left_feature = st.selectbox(
-            "Left Y-axis feature",
-            numeric_cols,
-            index=numeric_cols.index(dual_defaults[0]) if dual_defaults and dual_defaults[0] in numeric_cols else 0,
-            format_func=column_label,
+    if len(numeric_cols) >= 2 and selected_features:
+        add_dual_axis_chart = st.checkbox(
+            "Add one combined chart with secondary Y-axis",
+            value=False,
+            help="Adds one extra chart above the normal charts. The remaining selected features still stay in the multi-chart report.",
         )
-        right_default = dual_defaults[1] if len(dual_defaults) > 1 else numeric_cols[min(1, len(numeric_cols) - 1)]
-        dual_axis_right_feature = st.selectbox(
-            "Right Y-axis feature",
-            numeric_cols,
-            index=numeric_cols.index(right_default) if right_default in numeric_cols else min(1, len(numeric_cols) - 1),
-            format_func=column_label,
-        )
-        selected_features = [c for c in [dual_axis_left_feature, dual_axis_right_feature] if c]
+        if add_dual_axis_chart:
+            dual_defaults = selected_features if len(selected_features) >= 2 else (default_features if len(default_features) >= 2 else numeric_cols[:2])
+            dual_axis_left_feature = st.selectbox(
+                "Left Y-axis feature",
+                numeric_cols,
+                index=numeric_cols.index(dual_defaults[0]) if dual_defaults and dual_defaults[0] in numeric_cols else 0,
+                format_func=column_label,
+            )
+            right_default = dual_defaults[1] if len(dual_defaults) > 1 else numeric_cols[min(1, len(numeric_cols) - 1)]
+            dual_axis_right_feature = st.selectbox(
+                "Right Y-axis feature",
+                numeric_cols,
+                index=numeric_cols.index(right_default) if right_default in numeric_cols else min(1, len(numeric_cols) - 1),
+                format_func=column_label,
+            )
 
-    show_points = st.checkbox("Show markers", value=True)
+    # Keep markers off automatically on large datasets for speed/readability, but allow the user to turn them on.
+    estimated_points_for_speed = int(len(data)) if "data" in globals() else 0
+    default_markers = estimated_points_for_speed <= 350
+    show_points = st.checkbox("Show markers", value=default_markers)
 
     value_label_mode = st.selectbox(
         "Value labels on chart",
         [
-            "Hourly + min/max - best for reports",
-            "Auto sparse - recommended",
-            "All values - use wide export",
-            "Every 8 readings",
+            "Clean readable - recommended",
             "Every 20 readings",
+            "Every 8 readings",
+            "Hourly + min/max",
+            "All values - use wide export",
             "First and last only",
             "Off",
         ],
         index=0,
         help=(
-            "Dense plots cannot show every number clearly. "
-            "Hourly + min/max gives a human-readable report view. "
-            "Use All values only with single-feature PNG/PDF export."
+            "Clean readable keeps labels to important/non-crowded points. "
+            "Every 20 readings is usually best for long field-test reports. "
+            "Use All values only with a wide export."
         ),
     )
 
     st.caption(
-        "Label modes: Hourly + min/max labels operationally important points; "
-        "Auto sparse labels evenly spaced points to reduce overlap."
+        "For dense charts, avoid All values. Clean readable and Every 20 readings are designed to keep values legible."
     )
 
     label_decimals_default = st.selectbox(
@@ -1573,7 +1591,13 @@ with st.sidebar:
                 st.success(f"Added interval: {start_dt_note:%Y-%m-%d %H:%M} to {end_dt_note:%Y-%m-%d %H:%M} | {note_label_input.strip()}")
         else:
             st.session_state.manual_events_table.append(
-                {"datetime": start_dt_note, "label": note_label_input.strip(), "target": note_target}
+                {
+                    "datetime": start_dt_note,
+                    "label": note_label_input.strip(),
+                    "target": note_target,
+                    "x_shift_px": 0,
+                    "y_level": "Auto",
+                }
             )
             st.success(f"Added event: {start_dt_note:%Y-%m-%d %H:%M} | {note_label_input.strip()}")
 
@@ -1582,10 +1606,35 @@ with st.sidebar:
         events_df_sidebar = pd.DataFrame(st.session_state.manual_events_table)
         events_df_sidebar["datetime"] = pd.to_datetime(events_df_sidebar["datetime"])
         events_df_sidebar = events_df_sidebar.sort_values("datetime").reset_index(drop=True)
+        if "x_shift_px" not in events_df_sidebar.columns:
+            events_df_sidebar["x_shift_px"] = 0
+        if "y_level" not in events_df_sidebar.columns:
+            events_df_sidebar["y_level"] = "Auto"
         display_events = events_df_sidebar.copy()
         display_events["datetime"] = display_events["datetime"].dt.strftime("%Y-%m-%d %H:%M")
         display_events.insert(0, "No.", range(1, len(display_events) + 1))
-        st.dataframe(display_events, use_container_width=True, height=150)
+        edited_events = st.data_editor(
+            display_events,
+            use_container_width=True,
+            height=185,
+            key="point_notes_editor_v48",
+            column_config={
+                "No.": st.column_config.NumberColumn("No.", disabled=True),
+                "datetime": st.column_config.TextColumn("Date/time", disabled=True),
+                "target": st.column_config.TextColumn("Target", disabled=True),
+                "label": st.column_config.TextColumn("Label"),
+                "x_shift_px": st.column_config.NumberColumn("X shift px", min_value=-250, max_value=250, step=5),
+                "y_level": st.column_config.SelectboxColumn("Y level", options=["Auto", "0", "1", "2", "3", "4", "5", "6", "7"]),
+            },
+            disabled=["No.", "datetime", "target"],
+        )
+        # Save label/position edits immediately without changing the original datetime.
+        if len(edited_events) == len(events_df_sidebar):
+            for _i in range(len(events_df_sidebar)):
+                for _c in ["label", "x_shift_px", "y_level"]:
+                    if _c in edited_events.columns:
+                        events_df_sidebar.at[_i, _c] = edited_events.at[_i, _c]
+            st.session_state.manual_events_table = events_df_sidebar.to_dict("records")
 
         event_options = {
             f"{i + 1}) {row['datetime']:%Y-%m-%d %H:%M} | {row.get('target', 'All selected wells')} | {row['label']}": i
@@ -1716,7 +1765,13 @@ manual_events = []
 # Add events created from the easy date/time + note UI.
 for e in st.session_state.get("manual_events_table", []):
     try:
-        manual_events.append({"datetime": pd.Timestamp(e["datetime"]), "label": str(e["label"]), "target": str(e.get("target", "All selected wells"))})
+        manual_events.append({
+            "datetime": pd.Timestamp(e["datetime"]),
+            "label": str(e["label"]),
+            "target": str(e.get("target", "All selected wells")),
+            "x_shift_px": float(e.get("x_shift_px", 0) or 0),
+            "y_level": str(e.get("y_level", "Auto") or "Auto"),
+        })
     except Exception:
         pass
 
@@ -1818,8 +1873,11 @@ if selected_features and not filtered.empty:
     def total_note_count():
         return len(plot_intervals or []) + len(plot_events or [])
 
-    def note_event_levels(events, x_values=None, max_levels=4):
-        """Assign staggered rows for point-event labels so close labels do not overlap."""
+    def note_event_levels(events, x_values=None, max_levels=8):
+        """Assign staggered rows for point-event labels so close labels do not overlap.
+
+        Users can override the automatic row using the point-note table Y level.
+        """
         if not events:
             return []
         try:
@@ -1835,7 +1893,7 @@ if selected_features and not filtered.empty:
                 except Exception:
                     pass
             span = (max(xs) - min(xs)) if len(xs) >= 2 else 1.0
-            min_gap = max(span * 0.045, 0.5)
+            min_gap = max(span * 0.070, 0.8)
         except Exception:
             min_gap = 1.0
 
@@ -1852,11 +1910,18 @@ if selected_features and not filtered.empty:
         sortable.sort(key=lambda t: t[0])
 
         for sx, _, event in sortable:
-            level = 0
-            while level < max_levels and sx - placed_until[level] < min_gap:
-                level += 1
-            if level >= max_levels:
-                level = max_levels - 1
+            manual_level = str(event.get("y_level", "Auto") or "Auto")
+            if manual_level != "Auto":
+                try:
+                    level = max(0, min(max_levels - 1, int(float(manual_level))))
+                except Exception:
+                    level = 0
+            else:
+                level = 0
+                while level < max_levels and sx - placed_until[level] < min_gap:
+                    level += 1
+                if level >= max_levels:
+                    level = max_levels - 1
             placed_until[level] = sx
             event["level"] = level
             decorated.append(event)
@@ -1988,15 +2053,16 @@ if selected_features and not filtered.empty:
                         row=r,
                         col=1,
                     )
-                    y_note = max(0.58, 0.98 - 0.08 * min(level, 4))
+                    y_note = max(0.30, 0.98 - 0.075 * min(level, 7))
                     text_angle = 0
-                    x_anchor = "left"
-                    if event_label_style == "Vertical labels":
+                    x_anchor = "center"
+                    # In Auto mode, switch crowded/nested notes to vertical labels automatically.
+                    if event_label_style == "Vertical labels" or (event_label_style == "Auto staggered" and total_note_count() >= 3):
                         text_angle = -90
-                        y_note = max(0.25, 0.88 - 0.05 * min(level, 6))
+                        y_note = max(0.20, 0.94 - 0.055 * min(level, 7))
                         x_anchor = "right"
                     elif event_label_style == "Compact top labels":
-                        y_note = max(0.72, 0.99 - 0.05 * min(level, 6))
+                        y_note = max(0.64, 0.99 - 0.045 * min(level, 7))
                         x_anchor = "center"
                     fig.add_annotation(
                         x=x,
@@ -2008,8 +2074,9 @@ if selected_features and not filtered.empty:
                         xanchor=x_anchor,
                         yanchor="top",
                         textangle=text_angle,
+                        xshift=float(event.get("x_shift_px", 0) or 0),
                         font=dict(size=event_font_size, color=note_col),
-                        bgcolor="rgba(255,255,255,0.88)",
+                        bgcolor="rgba(255,255,255,0.92)",
                         bordercolor=note_col,
                         borderwidth=1,
                     )
@@ -2036,36 +2103,28 @@ if selected_features and not filtered.empty:
         return len(df)
 
     def label_indices(n, mode):
-        if mode == "Off":
+        if mode == "Off" or n <= 0:
             return set()
-
-        if n <= 0:
-            return set()
-
         if mode == "All values - use wide export":
             return set(range(n))
-
         if mode == "Every 8 readings":
             return set(list(range(0, n, 8)) + [n - 1])
-
         if mode == "Every 20 readings":
             return set(list(range(0, n, 20)) + [n - 1])
-
         if mode == "First and last only":
             return {0, n - 1}
 
-        # Auto sparse: evenly spaced labels with fewer collisions.
-        if n <= 14:
+        # Clean/auto sparse: use a small number of evenly spaced labels.
+        if n <= 10:
             step = 1
-        elif n <= 35:
-            step = 3
+        elif n <= 30:
+            step = 4
         elif n <= 80:
-            step = 5
-        elif n <= 160:
             step = 8
+        elif n <= 180:
+            step = 15
         else:
-            step = max(10, round(n / 22))
-
+            step = max(20, round(n / 16))
         return set(list(range(0, n, step)) + [n - 1])
 
     def format_plot_value(feature, value):
@@ -2103,63 +2162,77 @@ if selected_features and not filtered.empty:
         return txt
 
     def report_label_indices(g, feature):
-        """Meaningful labels for dense field reports.
+        """Readable labels for dense field reports.
 
-        For one well/test: first/last, hourly points, min/max, and zero values.
-        For comparison charts: much fewer labels to prevent unreadable overlap.
+        Keeps first/last, min/max, selected time points, and major local changes.
+        It intentionally does not label every zero because repeated zeros make
+        field-test charts unreadable.
         """
+        g = g.reset_index(drop=True)
         n = len(g)
         idxs = {0, n - 1} if n else set()
-
         if n == 0 or feature not in g.columns:
             return idxs
 
         y = pd.to_numeric(g[feature], errors="coerce").reset_index(drop=True)
-        multi_series = "series_label" in filtered.columns and filtered["series_label"].dropna().astype(str).nunique() > 1
+        valid = y.dropna()
+        if valid.empty:
+            return idxs
 
-        if y.notna().any():
-            idxs.add(int(y.idxmin()))
-            idxs.add(int(y.idxmax()))
+        idxs.add(int(valid.idxmin()))
+        idxs.add(int(valid.idxmax()))
 
-        if multi_series and value_label_mode != "All values - use wide export":
-            # Comparison/mobile view: prevent label collision by keeping only key markers.
-            divisions = 2 if chart_view_mode == "Mobile-friendly" else 5
-            if n > 12:
-                idxs.update(range(0, n, max(1, n // divisions)))
-            return {i for i in idxs if 0 <= i < n}
+        # Add significant local peaks/troughs only when the change is meaningful.
+        try:
+            yrange = float(valid.max() - valid.min())
+            threshold = max(abs(float(valid.mean())) * 0.08, yrange * 0.12, 1e-9)
+            for i in range(1, n - 1):
+                if pd.isna(y.iloc[i - 1]) or pd.isna(y.iloc[i]) or pd.isna(y.iloc[i + 1]):
+                    continue
+                is_peak = y.iloc[i] > y.iloc[i - 1] and y.iloc[i] > y.iloc[i + 1]
+                is_trough = y.iloc[i] < y.iloc[i - 1] and y.iloc[i] < y.iloc[i + 1]
+                if (is_peak or is_trough) and max(abs(y.iloc[i] - y.iloc[i - 1]), abs(y.iloc[i] - y.iloc[i + 1])) >= threshold:
+                    idxs.add(i)
+        except Exception:
+            pass
 
-        if y.notna().any():
-            zero_positions = list(y[y.abs() < 1e-12].index)
-            idxs.update(zero_positions[:10])
-
-        if "datetime" in g.columns and g["datetime"].notna().any():
+        if value_label_mode == "Hourly + min/max" and "datetime" in g.columns and g["datetime"].notna().any():
             dt = pd.to_datetime(g["datetime"], errors="coerce")
             hourly = list(dt.reset_index(drop=True)[(dt.dt.minute == 0) & dt.notna()].index)
             if len(hourly) < 3:
                 hourly = list(dt.reset_index(drop=True)[(dt.dt.minute.isin([0, 30])) & dt.notna()].index)
             idxs.update(hourly)
         else:
-            idxs.update(label_indices(n, "Auto sparse - recommended"))
+            idxs.update(label_indices(n, "Clean readable - recommended"))
 
-        max_labels = 20 if chart_view_mode == "Mobile-friendly" else 45
+        # Prevent too many labels on one panel. Exports use the same cap.
+        max_labels = 14 if chart_view_mode == "Mobile-friendly" else 20
+        if value_label_mode == "Hourly + min/max":
+            max_labels = 18 if chart_view_mode == "Mobile-friendly" else 26
         if len(idxs) > max_labels:
-            idxs = set(sorted(idxs)[::max(1, len(idxs) // max_labels)])
-            idxs.update({0, n - 1})
+            important = {0, n - 1, int(valid.idxmin()), int(valid.idxmax())}
+            remaining = [i for i in sorted(idxs) if i not in important]
+            keep_n = max(0, max_labels - len(important))
+            if keep_n and remaining:
+                chosen = [remaining[i] for i in sorted(set(np.linspace(0, len(remaining) - 1, keep_n).round().astype(int).tolist()))]
+            else:
+                chosen = []
+            idxs = set(chosen) | important
 
         return {i for i in idxs if 0 <= i < n}
 
     def build_text_and_positions(g, feature):
-        if value_label_mode == "Hourly + min/max - best for reports":
+        if value_label_mode in ["Clean readable - recommended", "Hourly + min/max"]:
             idxs = report_label_indices(g.reset_index(drop=True), feature)
         else:
             idxs = label_indices(len(g), value_label_mode)
 
         text = []
         pos = []
+        position_cycle = ["top center", "bottom center", "middle right", "middle left"]
         for i, v in enumerate(g[feature]):
             text.append(format_plot_value(feature, v) if i in idxs else "")
-            # Alternate labels above/below points to reduce collisions.
-            pos.append("top center" if i % 2 == 0 else "bottom center")
+            pos.append(position_cycle[i % len(position_cycle)])
         return text, pos
 
     def padded_range(df, feature):
@@ -2214,7 +2287,7 @@ if selected_features and not filtered.empty:
                                 mode=line_mode + ("+text" if value_label_mode != "Off" else ""),
                                 text=text,
                                 textposition=textposition,
-                                textfont=dict(size=12 if chart_view_mode == "Mobile-friendly" else 15, color=color, family="Arial, sans-serif"),
+                                textfont=dict(size=10 if chart_view_mode == "Mobile-friendly" else 12, color=color, family="Arial, sans-serif"),
                                 cliponaxis=False,
                                 name=trace_name,
                                 legendgroup=trace_name,
@@ -2297,7 +2370,7 @@ if selected_features and not filtered.empty:
                                 mode=line_mode + ("+text" if value_label_mode != "Off" else ""),
                                 text=text,
                                 textposition=textposition,
-                                textfont=dict(size=13 if chart_view_mode == "Mobile-friendly" else 16, color=color, family="Arial, sans-serif"),
+                                textfont=dict(size=10 if chart_view_mode == "Mobile-friendly" else 12, color=color, family="Arial, sans-serif"),
                                 cliponaxis=False,
                                 name=f"{series_label}",
                                 legendgroup=str(series_label),
@@ -2472,18 +2545,22 @@ if selected_features and not filtered.empty:
                 )
         return fig
 
+    plotly_config_common = {
+        "responsive": True,
+        "displaylogo": False,
+        "editable": bool(enable_drag_annotations),
+        "edits": {"annotationPosition": bool(enable_drag_annotations)},
+        "toImageButtonOptions": {"format": "png", "scale": 3},
+        "scrollZoom": True,
+    }
+
+    if add_dual_axis_chart and dual_axis_left_feature and dual_axis_right_feature:
+        st.markdown("### Combined secondary Y-axis chart")
+        dual_fig = build_figure(filtered, [dual_axis_left_feature, dual_axis_right_feature], "Overlay two features with secondary Y-axis")
+        st.plotly_chart(dual_fig, use_container_width=True, config=plotly_config_common)
+
     fig = build_figure(filtered, selected_features, plot_mode)
-    st.plotly_chart(
-        fig,
-        use_container_width=True,
-        config={
-            "responsive": True,
-            "displaylogo": False,
-            "editable": bool(enable_drag_annotations),
-            "edits": {"annotationPosition": bool(enable_drag_annotations)},
-            "toImageButtonOptions": {"format": "png", "scale": 3},
-        },
-    )
+    st.plotly_chart(fig, use_container_width=True, config=plotly_config_common)
 
     with st.expander("Filtered data used by current plot", expanded=False):
         st.caption("Filtered data = only the rows currently feeding the chart after your sidebar selections.")
@@ -2498,45 +2575,20 @@ if selected_features and not filtered.empty:
     st.caption("Exports are generated only when you press a prepare button. This prevents Streamlit Cloud from crashing when charts are large.")
 
     def chart_label_indices_for_export(g, feature):
-        """Label points that matter for a printed chart."""
+        """Use the same readable label logic for exports as the interactive chart."""
         g2 = g.reset_index(drop=True)
         n = len(g2)
-        if value_label_mode != "Hourly + min/max - best for reports":
-            return label_indices(n, value_label_mode)
-
-        idxs = {0, n - 1} if n else set()
-
-        y = pd.to_numeric(g2[feature], errors="coerce").reset_index(drop=True)
-        multi_series = "series_label" in filtered.columns and filtered["series_label"].dropna().astype(str).nunique() > 1
-        if y.notna().any():
-            idxs.add(int(y.idxmin()))
-            idxs.add(int(y.idxmax()))
-
-        if multi_series and value_label_mode != "All values - use wide export":
-            divisions = 4 if chart_view_mode == "Mobile-friendly" else 6
-            if n > 12:
-                idxs.update(range(0, n, max(1, n // divisions)))
-            return {i for i in idxs if 0 <= i < n}
-
-        if y.notna().any():
-            zero_positions = list(y[y.abs() < 1e-12].index)
-            idxs.update(zero_positions[:12])
-
-        if "datetime" in g2.columns and g2["datetime"].notna().any():
-            dt = pd.to_datetime(g2["datetime"], errors="coerce")
-            hourly = list(dt[(dt.dt.minute == 0) & dt.notna()].index)
-            if len(hourly) < 4:
-                hourly = list(dt[(dt.dt.minute.isin([0, 30])) & dt.notna()].index)
-            idxs.update(hourly)
-        else:
-            idxs.update(label_indices(n, "Auto sparse - recommended"))
-
-        if len(idxs) > 55:
+        if value_label_mode in ["Clean readable - recommended", "Hourly + min/max"]:
+            return report_label_indices(g2, feature)
+        idxs = label_indices(n, value_label_mode)
+        # Even when user asks every 8/20, keep exports readable on very dense curves.
+        max_labels = 26 if chart_view_mode != "Mobile-friendly" else 18
+        if value_label_mode != "All values - use wide export" and len(idxs) > max_labels:
             keep = sorted(idxs)
-            step = max(1, len(keep) // 55)
-            idxs = set(keep[::step])
-            idxs.update({0, n - 1})
-
+            chosen = [keep[i] for i in sorted(set(np.linspace(0, len(keep) - 1, max_labels).round().astype(int).tolist()))]
+            idxs = set(chosen)
+            if n:
+                idxs.update({0, n - 1})
         return {i for i in idxs if 0 <= i < n}
 
     def human_readable_pdf_bytes(df, features):
@@ -2578,7 +2630,7 @@ if selected_features and not filtered.empty:
                         )
 
                         idxs = chart_label_indices_for_export(g, feature)
-                        if value_label_mode in ["Hourly + min/max - best for reports", "Auto sparse - recommended"]:
+                        if value_label_mode in ["Hourly + min/max", "Clean readable - recommended"]:
                             max_lbl = 16 if chart_view_mode == "Mobile-friendly" else 24
                             if len(idxs) > max_lbl:
                                 keep = sorted(idxs)
@@ -2904,15 +2956,20 @@ if selected_features and not filtered.empty:
             for idx, event in enumerate(event_rows):
                 level = int(event.get("level", 0))
                 note_col = note_color(idx + len(plot_intervals or []))
-                y_frac = max(0.56, base_frac - 0.08 * min(level, 4))
+                y_frac = max(0.30, base_frac - 0.075 * min(level, 7))
                 ax.axvline(event["plot_x"], color=note_col, linestyle="--", linewidth=1.5, alpha=0.78)
-                rotation = 90 if event_label_style in ["Auto staggered", "Vertical labels"] else 0
+                rotation = 90 if (event_label_style == "Vertical labels" or (event_label_style == "Auto staggered" and total_note_count() >= 3)) else 0
                 ha = "right" if rotation else "center"
-                ax.text(
-                    event["plot_x"],
-                    y_frac,
+                try:
+                    x_shift_points = float(event.get("x_shift_px", 0) or 0) * 0.5
+                except Exception:
+                    x_shift_points = 0
+                ax.annotate(
                     event["label"],
-                    transform=ax.get_xaxis_transform(),
+                    xy=(event["plot_x"], y_frac),
+                    xycoords=("data", "axes fraction"),
+                    xytext=(x_shift_points, 0),
+                    textcoords="offset points",
                     rotation=rotation,
                     va="top",
                     ha=ha,
@@ -3064,7 +3121,7 @@ if selected_features and not filtered.empty:
                     )
 
                     idxs = chart_label_indices_for_export(g, feature)
-                    if value_label_mode in ["Hourly + min/max - best for reports", "Auto sparse - recommended"]:
+                    if value_label_mode in ["Hourly + min/max", "Clean readable - recommended"]:
                         max_lbl = 14 if chart_view_mode == "Mobile-friendly" else 22
                         if len(idxs) > max_lbl:
                             keep = sorted(idxs)
