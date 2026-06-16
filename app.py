@@ -700,6 +700,17 @@ if "date" in data.columns:
 # Learn/apply user mappings before feature lists and plots are built.
 data, active_column_aliases = editable_column_mapping_panel(data)
 
+# v52 safety: make sure any Pumping Pressure column rescued from hidden/far-right
+# Excel columns remains canonical, numeric, and available for plotting after user
+# mappings/cache reruns.
+try:
+    if hasattr(_tmu_parser, "ensure_pumping_pressure_column_v48"):
+        data = _tmu_parser.ensure_pumping_pressure_column_v48(data)
+    if "pumping_pressure_psi" in data.columns:
+        data["pumping_pressure_psi"] = pd.to_numeric(data["pumping_pressure_psi"], errors="coerce")
+except Exception:
+    pass
+
 ocr_mask = data.get("source_type", pd.Series([], dtype=str)).astype(str).str.contains("ocr", case=False, na=False) if "source_type" in data.columns else pd.Series([False] * len(data), index=data.index)
 if ocr_mask.any():
     with st.expander("CTU / HMI image OCR review", expanded=True):
@@ -2034,19 +2045,19 @@ if selected_features and not filtered.empty:
                 x_mid = x0
 
             try:
-                y_row = max(0.86, 1.03 - 0.045 * min(level, 4))
+                y_row = max(1.035, 1.155 - 0.055 * min(level, 4))
                 fig.add_annotation(
                     x=x_mid,
                     y=y_row,
                     xref="x",
                     yref="paper",
-                    text=label,
+                    text=f"<b>{label}</b>",
                     showarrow=False,
                     xanchor="center",
                     yanchor="bottom",
                     bgcolor="rgba(255,255,255,0.98)",
                     bordercolor=note_col,
-                    borderwidth=1,
+                    borderwidth=1.4,
                     font=dict(size=interval_font_size, color=note_col),
                 )
             except Exception:
@@ -2080,30 +2091,30 @@ if selected_features and not filtered.empty:
             except Exception:
                 pass
             try:
-                y_note = max(0.82, 1.04 - 0.045 * min(level, 8))
+                y_note = max(1.015, 1.115 - 0.050 * min(level, 8))
                 text_angle = 0
                 x_anchor = "center"
                 if event_label_style == "Vertical labels" or (event_label_style == "Auto staggered" and total_note_count() >= 3):
                     text_angle = -90
-                    y_note = max(0.80, 1.02 - 0.035 * min(level, 8))
+                    y_note = max(1.005, 1.105 - 0.045 * min(level, 8))
                     x_anchor = "right"
                 elif event_label_style == "Compact top labels":
-                    y_note = max(0.90, 1.04 - 0.035 * min(level, 8))
+                    y_note = max(1.015, 1.115 - 0.045 * min(level, 8))
                     x_anchor = "center"
                 fig.add_annotation(
                     x=x,
                     y=y_note,
                     xref="x",
                     yref="paper",
-                    text=label,
+                    text=f"<b>{label}</b>",
                     showarrow=False,
                     xanchor=x_anchor,
                     yanchor="bottom",
                     textangle=text_angle,
                     font=dict(size=event_font_size, color=note_col),
-                    bgcolor="rgba(255,255,255,0.92)",
+                    bgcolor="rgba(255,255,255,0.98)",
                     bordercolor=note_col,
-                    borderwidth=1,
+                    borderwidth=1.4,
                 )
             except Exception:
                 pass
@@ -2366,7 +2377,7 @@ if selected_features and not filtered.empty:
                 title=dict(text=chart_title_from_data(df, custom_chart_title), font=dict(size=28, color="#0f172a", family="Arial Black, Arial, sans-serif")),
                 xaxis_title=x_axis_title,
                 hovermode="x unified",
-                margin=dict(l=85, r=90, t=115, b=80),
+                margin=dict(l=85, r=90, t=185, b=80),
                 plot_bgcolor="white",
                 paper_bgcolor="white",
                 font=dict(color="#111827", size=15),
@@ -2461,7 +2472,7 @@ if selected_features and not filtered.empty:
                 height=max(620, panel_height * len(features)),
                 title=dict(text=chart_title_from_data(df, custom_chart_title), font=dict(size=26 if mobile_view else 30, color="#0f172a", family="Arial Black, Arial, sans-serif")),
                 hovermode="x unified",
-                margin=dict(l=85, r=50, t=115, b=80),
+                margin=dict(l=85, r=50, t=185, b=80),
                 uniformtext_minsize=8,
                 uniformtext_mode="hide",
                 plot_bgcolor="white",
@@ -2471,7 +2482,7 @@ if selected_features and not filtered.empty:
                     font=dict(size=17, color="#111827"),
                     bgcolor="rgba(255,255,255,0.90)",
                     bordercolor="#e5e7eb",
-                    borderwidth=1,
+                    borderwidth=1.4,
                 ),
                 showlegend=show_chart_legend,
                 title_x=0.5,
@@ -2489,7 +2500,7 @@ if selected_features and not filtered.empty:
                     font=dict(size=12, color="#111827"),
                     bgcolor="rgba(255,255,255,0.90)",
                     bordercolor="#e5e7eb",
-                    borderwidth=1,
+                    borderwidth=1.4,
                 )
             fig.update_layout(**layout_kwargs)
             # Show readable time ticks on EVERY subplot, not only the bottom one.
@@ -2559,7 +2570,7 @@ if selected_features and not filtered.empty:
             yaxis_title=y_title,
             xaxis_title=x_axis_title,
             hovermode="x unified",
-            margin=dict(l=85, r=50, t=115, b=80),
+            margin=dict(l=85, r=50, t=185, b=80),
             plot_bgcolor="white",
             paper_bgcolor="white",
             font=dict(color="#111827", size=15),
@@ -2567,7 +2578,7 @@ if selected_features and not filtered.empty:
                 font=dict(size=17, color="#111827"),
                 bgcolor="rgba(255,255,255,0.90)",
                 bordercolor="#e5e7eb",
-                borderwidth=1,
+                borderwidth=1.4,
             ),
             title_x=0.5,
             title_xanchor="center",
@@ -2602,7 +2613,7 @@ if selected_features and not filtered.empty:
                     font=dict(size=13, color="#111827"),
                     bgcolor="rgba(255,255,255,0.85)",
                     bordercolor="#111827",
-                    borderwidth=1,
+                    borderwidth=1.4,
                 )
         return fig
 
@@ -2658,7 +2669,7 @@ if selected_features and not filtered.empty:
             title=dict(text=chart_title_from_data(df, custom_chart_title) + suffix, font=dict(size=26, color="#0f172a", family="Arial Black, Arial, sans-serif")),
             xaxis_title=x_axis_title,
             hovermode="x unified",
-            margin=dict(l=85, r=95, t=115, b=80),
+            margin=dict(l=85, r=95, t=185, b=80),
             plot_bgcolor="white",
             paper_bgcolor="white",
             font=dict(color="#111827", size=15),

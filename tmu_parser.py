@@ -4259,3 +4259,647 @@ def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: 
         fixed_tables = merge_pumping_pressure_tables_v49(fixed_tables, pump_df)
         fixed_tables = [ensure_pumping_pressure_column_v48(t) for t in fixed_tables if t is not None and not t.empty]
     return fixed_tables
+
+
+# -----------------------------------------------------------------------------
+# v51: stronger pumping-pressure rescue and cache-busting build id
+# -----------------------------------------------------------------------------
+PARSER_BUILD_ID = "v52_xml_pump_notes_layout_20260616"
+
+_load_tabular_file_v50_final = load_tabular_file
+
+
+def _clean_merge_well_v51(x: object) -> str:
+    try:
+        y = clean_well_name_value(x)
+    except Exception:
+        y = x
+    s = str(y or "").strip().strip("*")
+    if not s or s.lower() in {"nan", "none", "unknown", "to", "*"}:
+        return "Unknown"
+    return s.upper()
+
+
+def _to_number_series_v51(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(
+        s.astype(str)
+        .str.replace(",", "", regex=False)
+        .str.replace("%", "", regex=False)
+        .str.extract(r"([-+]?\d+(?:\.\d+)?)", expand=False),
+        errors="coerce",
+    )
+
+
+def _looks_like_pumping_pressure_header_v51(value: object, unit_value: object = "") -> bool:
+    # Handles hidden Excel headers such as: pumping.p / psi, Pumping P, Pump P,
+    # Pump Pressure, Pumping Pressure, Circulation Pressure.
+    h = f" {clean_header(value)} {canonical_key(value)} "
+    u = f" {clean_header(unit_value)} {canonical_key(unit_value)} "
+    txt = h + u
+    if not re.search(r"pump|pumping|circulation", txt, flags=re.I):
+        return False
+    # Avoid pump frequency / speed / rate / temp unless the compact header clearly says P/pressure.
+    if re.search(r"freq|frequency|hz|speed|rate|n2|nitrogen|temp|temperature|depth|total", txt, flags=re.I):
+        if not re.search(r"pump[\s._/-]*p\b|pumping[\s._/-]*p\b|pump[\s._/-]*pressure|pumping[\s._/-]*pressure|circulation[\s._/-]*pressure|pumping\.p|pump\.p", txt, flags=re.I):
+            return False
+    return bool(re.search(r"pump[\s._/-]*p\b|pumping[\s._/-]*p\b|pump[\s._/-]*pressure|pumping[\s._/-]*pressure|pumping\.p|pump\.p|circulation[\s._/-]*pressure", txt, flags=re.I))
+
+
+def _date_time_from_raw_v51(raw: pd.DataFrame, idx) -> pd.Series:
+    # First try columns A/B, because the uploaded TMU sheets put Date and Time there.
+    try:
+        dt = _combine_date_time_v49(raw.iloc[idx, 0], raw.iloc[idx, 1])
+        if pd.to_datetime(dt, errors="coerce").notna().sum() >= 3:
+            return dt
+    except Exception:
+        pass
+
+    # Then scan for date/time headers in the first 35 rows.
+    date_col = None
+    time_col = None
+    scan_rows = min(35, len(raw))
+    for r in range(scan_rows):
+        for c in range(raw.shape[1]):
+            v = clean_header(raw.iat[r, c] if c < raw.shape[1] else "")
+            if date_col is None and re.search(r"\bdate\b", v):
+                date_col = c
+            if time_col is None and re.search(r"\btime\b|hh:mm", v):
+                time_col = c
+        if date_col is not None and time_col is not None:
+            break
+    if date_col is not None and time_col is not None:
+        try:
+            dt = _combine_date_time_v49(raw.iloc[idx, date_col], raw.iloc[idx, time_col])
+            if pd.to_datetime(dt, errors="coerce").notna().sum() >= 3:
+                return dt
+        except Exception:
+            pass
+    return pd.Series([pd.NaT] * len(idx), index=idx)
+
+
+def _extract_pumping_pressure_from_pandas_raw_v51(data: bytes, name: str) -> pd.DataFrame:
+    suffix = str(name).split(".")[-1].lower()
+    if suffix not in {"xlsx", "xls"}:
+        return pd.DataFrame()
+    try:
+        sheets = pd.read_excel(io.BytesIO(data), sheet_name=None, header=None, dtype=object)
+    except Exception:
+        return pd.DataFrame()
+
+    rows = []
+    for sheet_name, raw in sheets.items():
+        if raw is None or raw.empty:
+            continue
+        # Excel files may have formatting extended to XFD (16,384 columns).
+        # Prune all-empty columns before scanning headers, otherwise regex scanning
+        # becomes extremely slow.  Hidden data columns such as EG are preserved
+        # because they contain real values.
+        raw = raw.dropna(axis=1, how="all")
+        if raw.shape[1] > 400:
+            sample = raw.head(250).astype(str).replace({"nan": "", "NaT": ""})
+            keep_cols = [c for c in sample.columns if sample[c].str.strip().ne("").any()]
+            raw = raw.loc[:, keep_cols]
+        default_well = _clean_merge_well_v51(extract_well_from_raw(raw, source_name=name, sheet_name=str(sheet_name)) or "Unknown")
+        candidate_cols = []
+        scan_rows = min(50, len(raw))
+        for r in range(scan_rows):
+            for c in range(raw.shape[1]):
+                val = raw.iat[r, c]
+                unit_below = raw.iat[r + 1, c] if r + 1 < len(raw) else ""
+                unit_above = raw.iat[r - 1, c] if r - 1 >= 0 else ""
+                unit_right = raw.iat[r, c + 1] if c + 1 < raw.shape[1] else ""
+                if _looks_like_pumping_pressure_header_v51(val, f"{unit_below} {unit_above} {unit_right}"):
+                    candidate_cols.append((r, c))
+        seen = set()
+        for header_r, c in candidate_cols:
+            if (header_r, c) in seen:
+                continue
+            seen.add((header_r, c))
+            # Use data below the header, but also allow one or two unit rows directly below it.
+            for start_r in [header_r + 1, header_r + 2, header_r + 3]:
+                if start_r >= len(raw):
+                    continue
+                idx = raw.index[start_r:]
+                vals = _to_number_series_v51(pd.Series(raw.iloc[start_r:, c], index=idx))
+                if vals.notna().sum() < 3:
+                    continue
+                dt = _date_time_from_raw_v51(raw, idx)
+                valid = vals.notna() & pd.to_datetime(dt, errors="coerce").notna()
+                if valid.sum() < 3:
+                    continue
+                for row_idx in vals[valid].index:
+                    dtv = pd.Timestamp(dt.loc[row_idx])
+                    rows.append({
+                        "source": name,
+                        "sheet": str(sheet_name),
+                        "well": default_well,
+                        "well_key_v51": default_well,
+                        "datetime": dtv,
+                        "date": dtv.floor("D"),
+                        "time_text": dtv.strftime("%H:%M"),
+                        "pumping_pressure_psi": float(vals.loc[row_idx]),
+                        "source_type": "excel_raw_pumping_pressure_v51",
+                    })
+                break
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows)
+    out = out.drop_duplicates(subset=["sheet", "well_key_v51", "datetime"], keep="last")
+    return out
+
+
+def _extract_pumping_pressure_from_openpyxl_v51(data: bytes, name: str) -> pd.DataFrame:
+    # Extra fallback for hidden/far-right columns.  openpyxl sees hidden columns
+    # such as EG even when the visual sheet hides them.
+    suffix = str(name).split(".")[-1].lower()
+    if suffix not in {"xlsx"}:
+        return pd.DataFrame()
+    try:
+        from openpyxl import load_workbook
+    except Exception:
+        return pd.DataFrame()
+    try:
+        wb = load_workbook(io.BytesIO(data), read_only=False, data_only=True)
+    except Exception:
+        return pd.DataFrame()
+
+    rows = []
+    for ws in wb.worksheets:
+        max_r = min(ws.max_row or 0, 5000)
+        max_c = min(ws.max_column or 0, 300)
+        if max_r < 3 or max_c < 3:
+            continue
+        # Build a small raw dataframe for well extraction and datetime parsing.
+        raw_vals = []
+        for r in range(1, max_r + 1):
+            raw_vals.append([ws.cell(r, c).value for c in range(1, max_c + 1)])
+        raw = pd.DataFrame(raw_vals)
+        default_well = _clean_merge_well_v51(extract_well_from_raw(raw, source_name=name, sheet_name=str(ws.title)) or "Unknown")
+        candidate_cols = []
+        for r in range(1, min(50, max_r) + 1):
+            for c in range(1, max_c + 1):
+                val = ws.cell(r, c).value
+                if val is None:
+                    continue
+                unit_below = ws.cell(r + 1, c).value if r + 1 <= max_r else ""
+                unit_above = ws.cell(r - 1, c).value if r - 1 >= 1 else ""
+                unit_right = ws.cell(r, c + 1).value if c + 1 <= max_c else ""
+                if _looks_like_pumping_pressure_header_v51(val, f"{unit_below} {unit_above} {unit_right}"):
+                    candidate_cols.append((r - 1, c - 1))
+        for header_r0, c0 in candidate_cols:
+            for start_r0 in [header_r0 + 1, header_r0 + 2, header_r0 + 3]:
+                if start_r0 >= len(raw):
+                    continue
+                idx = raw.index[start_r0:]
+                vals = _to_number_series_v51(pd.Series(raw.iloc[start_r0:, c0], index=idx))
+                if vals.notna().sum() < 3:
+                    continue
+                dt = _date_time_from_raw_v51(raw, idx)
+                valid = vals.notna() & pd.to_datetime(dt, errors="coerce").notna()
+                if valid.sum() < 3:
+                    continue
+                for row_idx in vals[valid].index:
+                    dtv = pd.Timestamp(dt.loc[row_idx])
+                    rows.append({
+                        "source": name,
+                        "sheet": str(ws.title),
+                        "well": default_well,
+                        "well_key_v51": default_well,
+                        "datetime": dtv,
+                        "date": dtv.floor("D"),
+                        "time_text": dtv.strftime("%H:%M"),
+                        "pumping_pressure_psi": float(vals.loc[row_idx]),
+                        "source_type": "excel_openpyxl_pumping_pressure_v51",
+                    })
+                break
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows)
+    out = out.drop_duplicates(subset=["sheet", "well_key_v51", "datetime"], keep="last")
+    return out
+
+
+def extract_any_pumping_pressure_from_excel_v51(data: bytes, name: str) -> pd.DataFrame:
+    frames = []
+    for fn in [_extract_pumping_pressure_from_pandas_raw_v51, _extract_pumping_pressure_from_openpyxl_v51, extract_hidden_pumping_pressure_from_excel_v49]:
+        try:
+            df = fn(data, name)
+            if df is not None and not df.empty:
+                frames.append(df)
+        except Exception:
+            pass
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True, sort=False)
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+    out["well"] = out["well"].map(_clean_merge_well_v51)
+    out["well_key_v51"] = out["well"].map(_clean_merge_well_v51)
+    out["pumping_pressure_psi"] = pd.to_numeric(out["pumping_pressure_psi"], errors="coerce")
+    out = out.dropna(subset=["datetime", "pumping_pressure_psi"])
+    out = out.drop_duplicates(subset=["well_key_v51", "datetime"], keep="last")
+    return out
+
+
+def merge_pumping_pressure_tables_v51(tables, pump_df: pd.DataFrame):
+    if pump_df is None or pump_df.empty:
+        return tables
+    pump_df = pump_df.copy()
+    pump_df["datetime"] = pd.to_datetime(pump_df["datetime"], errors="coerce")
+    pump_df["well_key_v51"] = pump_df.get("well", "Unknown").map(_clean_merge_well_v51) if isinstance(pump_df.get("well", None), pd.Series) else "Unknown"
+    pump_df = pump_df.dropna(subset=["datetime", "pumping_pressure_psi"])
+    if pump_df.empty:
+        return tables
+    if not tables:
+        return [pump_df]
+
+    merged_tables = []
+    used_any = False
+    for df in tables:
+        if df is None or df.empty:
+            merged_tables.append(df)
+            continue
+        out = df.copy()
+        if "datetime" not in out.columns:
+            merged_tables.append(out)
+            continue
+        out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+        if "well" not in out.columns:
+            out["well"] = "Unknown"
+        out["well_key_v51"] = out["well"].map(_clean_merge_well_v51)
+        tmp = pump_df[["well_key_v51", "datetime", "pumping_pressure_psi"]].copy()
+
+        # First and safest: clean well + datetime.
+        out = out.merge(tmp, on=["well_key_v51", "datetime"], how="left", suffixes=("", "__pump_v51"))
+        if "pumping_pressure_psi__pump_v51" in out.columns:
+            base = pd.to_numeric(out.get("pumping_pressure_psi", pd.Series(np.nan, index=out.index)), errors="coerce")
+            hidden = pd.to_numeric(out["pumping_pressure_psi__pump_v51"], errors="coerce")
+            out["pumping_pressure_psi"] = base.combine_first(hidden)
+            out = out.drop(columns=["pumping_pressure_psi__pump_v51"], errors="ignore")
+
+        # Second: datetime only, but only when there is a single real well in the uploaded table.
+        if pd.to_numeric(out.get("pumping_pressure_psi", pd.Series(np.nan, index=out.index)), errors="coerce").notna().sum() == 0:
+            real_wells = [w for w in out["well_key_v51"].dropna().unique().tolist() if w and w != "Unknown"]
+            if len(real_wells) == 1:
+                tmp2 = pump_df[["datetime", "pumping_pressure_psi"]].drop_duplicates("datetime", keep="last")
+                out = out.drop(columns=[c for c in out.columns if c.endswith("__pump_v51")], errors="ignore")
+                out = out.merge(tmp2, on="datetime", how="left", suffixes=("", "__pump_v51"))
+                if "pumping_pressure_psi__pump_v51" in out.columns:
+                    base = pd.to_numeric(out.get("pumping_pressure_psi", pd.Series(np.nan, index=out.index)), errors="coerce")
+                    hidden = pd.to_numeric(out["pumping_pressure_psi__pump_v51"], errors="coerce")
+                    out["pumping_pressure_psi"] = base.combine_first(hidden)
+                    out = out.drop(columns=["pumping_pressure_psi__pump_v51"], errors="ignore")
+
+        # Third: row-order fallback for the same single-well sheet when datetime parsing differs slightly.
+        current_count = pd.to_numeric(out.get("pumping_pressure_psi", pd.Series(np.nan, index=out.index)), errors="coerce").notna().sum()
+        if current_count == 0:
+            real_wells = [w for w in out["well_key_v51"].dropna().unique().tolist() if w and w != "Unknown"]
+            if len(real_wells) == 1 and abs(len(out) - len(pump_df)) <= max(3, int(0.15 * max(len(out), len(pump_df)))):
+                out_sorted_idx = out.sort_values("datetime").index.tolist()
+                pump_sorted = pump_df.sort_values("datetime")["pumping_pressure_psi"].reset_index(drop=True)
+                n = min(len(out_sorted_idx), len(pump_sorted))
+                out["pumping_pressure_psi"] = pd.to_numeric(out.get("pumping_pressure_psi", pd.Series(np.nan, index=out.index)), errors="coerce")
+                for pos in range(n):
+                    if pd.isna(out.at[out_sorted_idx[pos], "pumping_pressure_psi"]):
+                        out.at[out_sorted_idx[pos], "pumping_pressure_psi"] = pump_sorted.iloc[pos]
+
+        final_count = pd.to_numeric(out.get("pumping_pressure_psi", pd.Series(np.nan, index=out.index)), errors="coerce").notna().sum()
+        if final_count > 0:
+            used_any = True
+        out = out.drop(columns=["well_key_v51"], errors="ignore")
+        merged_tables.append(out)
+
+    # If no existing table accepted the pumping series, append it so the user can still see it.
+    if not used_any:
+        merged_tables.append(pump_df.drop(columns=["well_key_v51"], errors="ignore"))
+    return merged_tables
+
+
+def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: int = 1000) -> List[pd.DataFrame]:
+    data, name = _uploaded_bytes_v49(uploaded_file)
+    suffix = str(name).split(".")[-1].lower()
+    base_tables = _load_tabular_file_v50_final(UploadedBytes(data, name), parse_images=parse_images, max_ocr_images=max_ocr_images)
+    fixed_tables = [ensure_pumping_pressure_column_v48(t) for t in (base_tables or []) if t is not None and not t.empty]
+    if suffix in {"xlsx", "xls"}:
+        # Speed guard: if the normal/v49 parser already found Pumping Pressure,
+        # do not run the heavier raw/openpyxl rescue again.  This also avoids
+        # repeated workbook reads on Streamlit Cloud.
+        has_pump = False
+        for _t in fixed_tables:
+            if "pumping_pressure_psi" in _t.columns and pd.to_numeric(_t["pumping_pressure_psi"], errors="coerce").notna().sum() > 0:
+                has_pump = True
+                break
+        if not has_pump:
+            pump_df = extract_any_pumping_pressure_from_excel_v51(data, name)
+            fixed_tables = merge_pumping_pressure_tables_v51(fixed_tables, pump_df)
+            fixed_tables = [ensure_pumping_pressure_column_v48(t) for t in fixed_tables if t is not None and not t.empty]
+    return fixed_tables
+
+
+# -----------------------------------------------------------------------------
+# v52: very fast XML-based pumping-pressure rescue for hidden/far-right columns.
+# This solves templates such as S8-58 where Pumping Pressure is in hidden/far
+# right column EG with header "pumping.p" / unit "psi".  It reads the XLSX XML
+# directly instead of relying only on the main table parser, so Excel hidden
+# columns, styled empty columns, and max-column=16384 artifacts do not hide the
+# field.
+# -----------------------------------------------------------------------------
+import zipfile as _zipfile_v52
+import xml.etree.ElementTree as _ET_v52
+
+
+def _xlsx_col_to_num_v52(col_letters: str) -> int:
+    n = 0
+    for ch in str(col_letters).upper():
+        if "A" <= ch <= "Z":
+            n = n * 26 + (ord(ch) - ord("A") + 1)
+    return n
+
+
+def _xlsx_cell_ref_parts_v52(ref: str):
+    m = re.match(r"^([A-Z]+)(\d+)$", str(ref).upper())
+    if not m:
+        return None, None
+    return _xlsx_col_to_num_v52(m.group(1)), int(m.group(2))
+
+
+def _read_shared_strings_v52(zf) -> list:
+    try:
+        data = zf.read("xl/sharedStrings.xml")
+    except Exception:
+        return []
+    ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    root = _ET_v52.fromstring(data)
+    out = []
+    for si in root.findall("m:si", ns):
+        parts = []
+        for t in si.findall(".//m:t", ns):
+            parts.append(t.text or "")
+        out.append("".join(parts))
+    return out
+
+
+def _iter_xlsx_sheet_cells_v52(zf, sheet_path: str, shared_strings: list):
+    """Yield (row, col, value) for non-empty worksheet cells."""
+    ns_uri = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    try:
+        with zf.open(sheet_path) as fh:
+            for event, elem in _ET_v52.iterparse(fh, events=("end",)):
+                if elem.tag != ns_uri + "c":
+                    continue
+                ref = elem.attrib.get("r", "")
+                col, row = _xlsx_cell_ref_parts_v52(ref)
+                if not row or not col:
+                    elem.clear()
+                    continue
+                typ = elem.attrib.get("t")
+                value = None
+                if typ == "inlineStr":
+                    parts = []
+                    for tnode in elem.findall(".//" + ns_uri + "t"):
+                        parts.append(tnode.text or "")
+                    value = "".join(parts)
+                else:
+                    vnode = elem.find(ns_uri + "v")
+                    if vnode is not None and vnode.text is not None:
+                        raw = vnode.text
+                        if typ == "s":
+                            try:
+                                value = shared_strings[int(float(raw))]
+                            except Exception:
+                                value = raw
+                        else:
+                            value = raw
+                if value not in [None, ""]:
+                    yield row, col, value
+                elem.clear()
+    except Exception:
+        return
+
+
+def _workbook_sheet_paths_v52(zf):
+    """Return list of (sheet_name, sheet_path) for workbook sheets."""
+    ns_main = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main", "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships"}
+    rel_ns = {"pr": "http://schemas.openxmlformats.org/package/2006/relationships"}
+    try:
+        wb_root = _ET_v52.fromstring(zf.read("xl/workbook.xml"))
+        rel_root = _ET_v52.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+    except Exception:
+        return []
+    rels = {}
+    for rel in rel_root.findall("pr:Relationship", rel_ns):
+        rid = rel.attrib.get("Id")
+        target = rel.attrib.get("Target", "")
+        if rid:
+            if not target.startswith("xl/"):
+                target = "xl/" + target.lstrip("/")
+            rels[rid] = target
+    sheets = []
+    for sh in wb_root.findall(".//m:sheet", ns_main):
+        name = sh.attrib.get("name", "Sheet")
+        rid = sh.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+        path = rels.get(rid)
+        if path:
+            sheets.append((name, path))
+    return sheets
+
+
+def _excel_datetime_from_values_v52(date_val, time_val):
+    def _to_float(x):
+        try:
+            if x is None or str(x).strip() == "":
+                return np.nan
+            return float(str(x).strip())
+        except Exception:
+            return np.nan
+
+    # Date may be Excel serial, a datetime-like string, or already parsed text.
+    d = pd.NaT
+    fv = _to_float(date_val)
+    if pd.notna(fv) and fv > 1000:
+        try:
+            d = pd.Timestamp("1899-12-30") + pd.to_timedelta(float(fv), unit="D")
+        except Exception:
+            d = pd.NaT
+    if pd.isna(d):
+        d = pd.to_datetime(date_val, errors="coerce", dayfirst=True)
+
+    # Time may be Excel serial fraction, serial datetime, datetime.time string, HH:MM, or text.
+    t = None
+    tf = _to_float(time_val)
+    if pd.notna(tf):
+        frac = tf % 1.0
+        try:
+            seconds = int(round(frac * 24 * 3600))
+            t = (pd.Timestamp("1900-01-01") + pd.Timedelta(seconds=seconds)).time()
+        except Exception:
+            t = None
+    if t is None:
+        ts = pd.to_datetime(str(time_val), errors="coerce")
+        if pd.notna(ts):
+            t = pd.Timestamp(ts).time()
+    if pd.isna(d) or t is None:
+        return pd.NaT
+    return pd.Timestamp.combine(pd.Timestamp(d).date(), t)
+
+
+def _well_from_sheet_or_file_v52(sheet_name: str, name: str) -> str:
+    source = f"{sheet_name} {name}"
+    # Preserve field names like B3 C18-7 / B3C18-7.  Older generic guessing may
+    # return only C18-7, which blocks well+datetime merging.
+    m = re.search(r"\b(B\d+)\s*[-_ ]?\s*(C\d{1,3}[-_ ]?\d+)\b", source, flags=re.I)
+    if m:
+        return (m.group(1) + m.group(2)).replace(" ", "").replace("_", "-").upper()
+    m = re.search(r"\b(S\d+[-_ ]?\d+)\b", source, flags=re.I)
+    if m:
+        return m.group(1).replace(" ", "").replace("_", "-").upper()
+    return guess_well_from_name(str(sheet_name)) or guess_well_from_name(str(name)) or "Unknown"
+
+
+def _extract_pumping_pressure_from_xlsx_xml_v52(data: bytes, name: str) -> pd.DataFrame:
+    rows = []
+    try:
+        zf = _zipfile_v52.ZipFile(io.BytesIO(data))
+    except Exception:
+        return pd.DataFrame()
+    with zf:
+        shared = _read_shared_strings_v52(zf)
+        sheet_paths = _workbook_sheet_paths_v52(zf)
+        for sheet_name, sheet_path in sheet_paths:
+            sparse = {}
+            max_row = 0
+            for r, c, v in _iter_xlsx_sheet_cells_v52(zf, sheet_path, shared):
+                sparse[(r, c)] = v
+                max_row = max(max_row, r)
+            if not sparse:
+                continue
+
+            # Find all credible pumping-pressure header cells.  Reject operation
+            # comments like "start pumping N2" because they do not look like Pump P.
+            header_cells = []
+            for (r, c), v in sparse.items():
+                current_txt = clean_header(v)
+                # Only the header cell itself may identify the field.  Neighboring
+                # cells are used only for units/context, not to turn a plain "PSI"
+                # unit cell into a Pumping Pressure header.
+                if not re.search(r"pump|pumping|circulation", current_txt, flags=re.I):
+                    continue
+                unit_context = " ".join(str(sparse.get((rr, cc), "")) for rr in range(r - 2, r + 3) for cc in range(c - 1, c + 2))
+                if _looks_like_pumping_pressure_header_v51(v, unit_context):
+                    header_cells.append((r, c, v))
+            if not header_cells:
+                continue
+
+            # Find date/time columns from header rows.  If template does not label
+            # them, default to A=date, B=time, which is used by the field templates.
+            date_col, time_col = 1, 2
+            for rr in range(1, min(12, max_row) + 1):
+                for cc in range(1, 12):
+                    txt = clean_header(sparse.get((rr, cc), ""))
+                    if txt in {"date", "d mm yyy", "d mmm yyyy"} or txt.startswith("date"):
+                        date_col = cc
+                    if txt in {"time", "hh mm", "hh:mm"} or txt.startswith("time"):
+                        time_col = cc
+
+            well = _well_from_sheet_or_file_v52(str(sheet_name), str(name))
+            for hr, pc, hv in header_cells:
+                for r in range(hr + 1, max_row + 1):
+                    pump_raw = sparse.get((r, pc))
+                    pump_val = extract_number(pump_raw)
+                    if pd.isna(pump_val):
+                        continue
+                    dt = _excel_datetime_from_values_v52(sparse.get((r, date_col)), sparse.get((r, time_col)))
+                    if pd.isna(dt):
+                        continue
+                    rows.append({
+                        "source": name,
+                        "sheet": sheet_name,
+                        "well": well,
+                        "datetime": dt,
+                        "date": pd.Timestamp(dt).normalize(),
+                        "time_text": pd.Timestamp(dt).strftime("%H:%M"),
+                        "pumping_pressure_psi": float(pump_val),
+                        "source_type": "excel_xml_pumping_pressure_v52",
+                        "pump_header_cell": f"R{hr}C{pc}",
+                    })
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows)
+    out["well"] = out["well"].map(_clean_merge_well_v51)
+    out["well_key_v51"] = out["well"].map(_clean_merge_well_v51)
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+    out["pumping_pressure_psi"] = pd.to_numeric(out["pumping_pressure_psi"], errors="coerce")
+    out = out.dropna(subset=["datetime", "pumping_pressure_psi"])
+    out = out.drop_duplicates(subset=["well_key_v51", "datetime"], keep="last")
+    return out
+
+
+def extract_any_pumping_pressure_from_excel_v52(data: bytes, name: str) -> pd.DataFrame:
+    # Fast XML first.  If it succeeds, trust it and skip the slow pandas/openpyxl
+    # fallbacks.  This is critical for templates whose used range extends to XFD.
+    try:
+        xml_df = _extract_pumping_pressure_from_xlsx_xml_v52(data, name)
+        if xml_df is not None and not xml_df.empty:
+            out = xml_df.copy()
+        else:
+            raise ValueError("XML pump extraction found no rows")
+    except Exception:
+        frames = []
+        for fn in [_extract_pumping_pressure_from_pandas_raw_v51, _extract_pumping_pressure_from_openpyxl_v51, extract_hidden_pumping_pressure_from_excel_v49]:
+            try:
+                df = fn(data, name)
+                if df is not None and not df.empty:
+                    frames.append(df)
+            except Exception:
+                pass
+        if not frames:
+            return pd.DataFrame()
+        out = pd.concat(frames, ignore_index=True, sort=False)
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+    out["well"] = out.get("well", "Unknown").map(_clean_merge_well_v51) if isinstance(out.get("well", None), pd.Series) else "Unknown"
+    out["well_key_v51"] = out["well"].map(_clean_merge_well_v51)
+    out["pumping_pressure_psi"] = pd.to_numeric(out["pumping_pressure_psi"], errors="coerce")
+    out = out.dropna(subset=["datetime", "pumping_pressure_psi"])
+    # Prefer XML/header-specific rows over broad pandas/openpyxl rows when duplicates exist.
+    out["_pump_priority_v52"] = out.get("source_type", "").astype(str).str.contains("xml|hidden", case=False, na=False).astype(int)
+    out = out.sort_values(["well_key_v51", "datetime", "_pump_priority_v52"]).drop_duplicates(subset=["well_key_v51", "datetime"], keep="last")
+    out = out.drop(columns=["_pump_priority_v52"], errors="ignore")
+    return out
+
+
+def force_restore_pumping_pressure_v52(tables, pump_df: pd.DataFrame):
+    """Always merge pump rescue; append pump-only table only if merge still fails."""
+    if pump_df is None or pump_df.empty:
+        return tables
+    fixed = merge_pumping_pressure_tables_v51(tables, pump_df)
+    # Make sure the canonical column is numeric and visible in every returned table.
+    out_tables = []
+    any_visible = False
+    for t in fixed or []:
+        if t is None or t.empty:
+            continue
+        t = ensure_pumping_pressure_column_v48(t)
+        if "pumping_pressure_psi" in t.columns:
+            t["pumping_pressure_psi"] = pd.to_numeric(t["pumping_pressure_psi"], errors="coerce")
+            if t["pumping_pressure_psi"].notna().sum() > 0:
+                any_visible = True
+        out_tables.append(t)
+    if not any_visible:
+        out_tables.append(pump_df.drop(columns=["well_key_v51"], errors="ignore"))
+    return out_tables
+
+
+# Keep previous loader, but force cache-busted XML Pumping Pressure rescue for Excel.
+_load_tabular_file_v51_final = load_tabular_file
+
+def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: int = 1000) -> List[pd.DataFrame]:
+    data, name = _uploaded_bytes_v49(uploaded_file)
+    suffix = str(name).split(".")[-1].lower()
+    # Use v50 base loader to avoid v51 slow openpyxl rescue. v52 XML rescue is applied below.
+    base_loader = globals().get("_load_tabular_file_v50_final", _load_tabular_file_v51_final)
+    base_tables = base_loader(UploadedBytes(data, name), parse_images=parse_images, max_ocr_images=max_ocr_images)
+    fixed_tables = [ensure_pumping_pressure_column_v48(t) for t in (base_tables or []) if t is not None and not t.empty]
+    if suffix in {"xlsx", "xls"}:
+        pump_df = extract_any_pumping_pressure_from_excel_v52(data, name)
+        fixed_tables = force_restore_pumping_pressure_v52(fixed_tables, pump_df)
+        fixed_tables = [ensure_pumping_pressure_column_v48(t) for t in fixed_tables if t is not None and not t.empty]
+    return fixed_tables
