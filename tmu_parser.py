@@ -4073,3 +4073,189 @@ def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: 
         if t is not None and not t.empty:
             fixed.append(ensure_pumping_pressure_column_v48(t))
     return fixed
+
+
+# -----------------------------------------------------------------------------
+# v49: robust hidden-column Pumping Pressure extraction from Excel.
+# Some TMU Excel files keep the real Pumping Pressure column far to the right
+# (for example hidden column EG with header "pumping.p" / unit "psi").  The
+# standard table parser may reject or rename hidden helper columns, so this
+# final pass scans the raw workbook and merges that pressure series by datetime.
+# -----------------------------------------------------------------------------
+_load_tabular_file_v48_streamlit_final = load_tabular_file
+
+
+def _uploaded_bytes_v49(uploaded_file):
+    name = getattr(uploaded_file, "name", "uploaded")
+    try:
+        data = uploaded_file.getvalue()
+    except Exception:
+        try:
+            uploaded_file.seek(0)
+        except Exception:
+            pass
+        data = uploaded_file.read()
+    return data, name
+
+
+def _parse_time_series_v49(series: pd.Series) -> pd.Series:
+    """Improved Excel time parser: supports values like 1.5 as 12:00 next-day fraction."""
+    import datetime as _dt
+    def one(x):
+        if pd.isna(x):
+            return pd.NaT
+        if isinstance(x, pd.Timestamp):
+            return pd.Timestamp("1900-01-01") + pd.Timedelta(hours=x.hour, minutes=x.minute, seconds=x.second)
+        if isinstance(x, _dt.datetime):
+            return pd.Timestamp("1900-01-01") + pd.Timedelta(hours=x.hour, minutes=x.minute, seconds=x.second)
+        if isinstance(x, _dt.time):
+            return pd.Timestamp("1900-01-01") + pd.Timedelta(hours=x.hour, minutes=x.minute, seconds=x.second)
+        if isinstance(x, (int, float, np.number)) and not isinstance(x, bool):
+            xf = float(x)
+            if xf >= 0:
+                frac = xf % 1.0
+                seconds = int(round(frac * 24 * 3600))
+                return pd.Timestamp("1900-01-01") + pd.Timedelta(seconds=seconds)
+        s = str(x)
+        m = re.search(r"(\d{1,2})[:.](\d{2})(?:[:.](\d{2}))?", s)
+        if m:
+            hh = int(m.group(1))
+            mm = int(m.group(2))
+            ss = int(m.group(3) or 0)
+            return pd.Timestamp("1900-01-01") + pd.Timedelta(hours=hh, minutes=mm, seconds=ss)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            return pd.to_datetime(s, errors="coerce")
+    return series.map(one)
+
+
+def _combine_date_time_v49(date_series, time_series):
+    dates = parse_date_series(date_series)
+    times = _parse_time_series_v49(time_series)
+    out = []
+    for d, t, raw_t in zip(dates, times, time_series):
+        if pd.isna(d):
+            out.append(pd.NaT)
+            continue
+        extra_days = 0
+        try:
+            if isinstance(raw_t, (int, float, np.number)) and not isinstance(raw_t, bool):
+                extra_days = int(np.floor(float(raw_t)))
+        except Exception:
+            extra_days = 0
+        if pd.notna(t):
+            out.append(pd.Timestamp(d.date()) + pd.Timedelta(days=extra_days, hours=t.hour, minutes=t.minute, seconds=t.second))
+        else:
+            out.append(pd.Timestamp(d.date()))
+    return pd.Series(out, index=date_series.index, dtype="datetime64[ns]")
+
+
+def _looks_like_pumping_pressure_header_v49(value: object, unit_value: object = "") -> bool:
+    c = clean_header(value)
+    ck = canonical_key(value)
+    u = clean_header(unit_value)
+    txt = f" {c} {ck} {u} "
+    if not re.search(r"pump|pumping|circulation", txt, flags=re.I):
+        return False
+    if re.search(r"freq|frequency|hz|speed|rate|n2|nitrogen|temp|temperature|depth|total", txt, flags=re.I):
+        if not re.search(r"pump[\s._/-]*p\b|pumping[\s._/-]*p\b|pump[\s._/-]*pressure|pumping[\s._/-]*pressure|circulation[\s._/-]*pressure", txt, flags=re.I):
+            return False
+    return bool(re.search(r"pump[\s._/-]*p\b|pumping[\s._/-]*p\b|pump[\s._/-]*pressure|pumping[\s._/-]*pressure|pumping\.p|circulation[\s._/-]*pressure", txt, flags=re.I))
+
+
+def extract_hidden_pumping_pressure_from_excel_v49(data: bytes, name: str) -> pd.DataFrame:
+    suffix = str(name).split(".")[-1].lower()
+    if suffix not in {"xlsx", "xls"}:
+        return pd.DataFrame()
+    rows = []
+    try:
+        sheets = pd.read_excel(io.BytesIO(data), sheet_name=None, header=None, dtype=object)
+    except Exception:
+        return pd.DataFrame()
+
+    for sheet_name, raw in sheets.items():
+        if raw is None or raw.empty:
+            continue
+        default_well = extract_well_from_raw(raw, source_name=name, sheet_name=str(sheet_name)) or "Unknown"
+        scan_rows = min(25, len(raw))
+        candidate_cols = []
+        for r in range(scan_rows):
+            for c in range(raw.shape[1]):
+                val = raw.iat[r, c] if c < raw.shape[1] else None
+                unit = raw.iat[r + 1, c] if r + 1 < len(raw) else ""
+                if _looks_like_pumping_pressure_header_v49(val, unit):
+                    candidate_cols.append((r, c))
+        for header_r, c in candidate_cols:
+            value_series = pd.to_numeric(
+                pd.Series(raw.iloc[header_r + 1 :, c]).astype(str)
+                .str.replace(",", "", regex=False)
+                .str.extract(r"([-+]?\d+(?:\.\d+)?)", expand=False),
+                errors="coerce",
+            )
+            if value_series.notna().sum() < 3:
+                continue
+            idx = value_series.index
+            # Prefer first two columns as Date/Time, which is how these TMU sheets are structured.
+            dt = _combine_date_time_v49(raw.iloc[idx, 0], raw.iloc[idx, 1])
+            valid = value_series.notna() & dt.notna()
+            if valid.sum() < 3:
+                continue
+            for row_idx in value_series[valid].index:
+                rows.append({
+                    "source": name,
+                    "sheet": str(sheet_name),
+                    "well": clean_well_name_value(default_well),
+                    "datetime": pd.Timestamp(dt.loc[row_idx]),
+                    "date": pd.Timestamp(dt.loc[row_idx]).floor("D"),
+                    "time_text": pd.Timestamp(dt.loc[row_idx]).strftime("%H:%M"),
+                    "pumping_pressure_psi": float(value_series.loc[row_idx]),
+                    "source_type": "excel_hidden_pumping_pressure",
+                })
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows).drop_duplicates(subset=["well", "datetime"], keep="last")
+    return out
+
+
+def merge_pumping_pressure_tables_v49(tables, pump_df: pd.DataFrame):
+    if pump_df is None or pump_df.empty:
+        return tables
+    if not tables:
+        return [pump_df]
+    merged_tables = []
+    pump_df = pump_df.copy()
+    pump_df["datetime"] = pd.to_datetime(pump_df["datetime"], errors="coerce")
+    for df in tables:
+        if df is None or df.empty:
+            merged_tables.append(df)
+            continue
+        out = df.copy()
+        if "datetime" not in out.columns:
+            merged_tables.append(out)
+            continue
+        out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+        if "well" not in out.columns:
+            out["well"] = "Unknown"
+        tmp = pump_df[["well", "datetime", "pumping_pressure_psi"]].copy()
+        tmp["well"] = tmp["well"].astype(str)
+        out["well"] = out["well"].astype(str)
+        out = out.merge(tmp, on=["well", "datetime"], how="left", suffixes=("", "__hidden"))
+        if "pumping_pressure_psi__hidden" in out.columns:
+            base = pd.to_numeric(out.get("pumping_pressure_psi", pd.Series(np.nan, index=out.index)), errors="coerce")
+            hidden = pd.to_numeric(out["pumping_pressure_psi__hidden"], errors="coerce")
+            out["pumping_pressure_psi"] = base.combine_first(hidden)
+            out = out.drop(columns=["pumping_pressure_psi__hidden"], errors="ignore")
+        merged_tables.append(out)
+    return merged_tables
+
+
+def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: int = 1000) -> List[pd.DataFrame]:
+    data, name = _uploaded_bytes_v49(uploaded_file)
+    suffix = str(name).split(".")[-1].lower()
+    base_tables = _load_tabular_file_v48_streamlit_final(UploadedBytes(data, name), parse_images=parse_images, max_ocr_images=max_ocr_images)
+    fixed_tables = [ensure_pumping_pressure_column_v48(t) for t in (base_tables or []) if t is not None and not t.empty]
+    if suffix in {"xlsx", "xls"}:
+        pump_df = extract_hidden_pumping_pressure_from_excel_v49(data, name)
+        fixed_tables = merge_pumping_pressure_tables_v49(fixed_tables, pump_df)
+        fixed_tables = [ensure_pumping_pressure_column_v48(t) for t in fixed_tables if t is not None and not t.empty]
+    return fixed_tables

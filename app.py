@@ -1359,30 +1359,55 @@ with st.sidebar:
         help="Use separate panels for normal reports. Use overlay to compare actual values on one axis.",
     )
 
-    add_dual_axis_chart = False
-    dual_axis_left_feature = None
-    dual_axis_right_feature = None
+    # Optional combined dual-axis charts.  These do not replace the normal
+    # multi-panel report; they add extra comparison charts above it.
+    dual_axis_charts = []
     if len(numeric_cols) >= 2 and selected_features:
-        add_dual_axis_chart = st.checkbox(
-            "Add one combined chart with secondary Y-axis",
-            value=False,
-            help="Adds one extra chart above the normal charts. The remaining selected features still stay in the multi-chart report.",
-        )
-        if add_dual_axis_chart:
-            dual_defaults = selected_features if len(selected_features) >= 2 else (default_features if len(default_features) >= 2 else numeric_cols[:2])
-            dual_axis_left_feature = st.selectbox(
-                "Left Y-axis feature",
-                numeric_cols,
-                index=numeric_cols.index(dual_defaults[0]) if dual_defaults and dual_defaults[0] in numeric_cols else 0,
-                format_func=column_label,
+        with st.expander("Combined charts with secondary Y-axis", expanded=False):
+            st.caption(
+                "Create one, two, or three combined charts. Each combined chart can have one or more "
+                "features on the left Y-axis and one or more features on the right Y-axis. "
+                "The normal selected-feature report remains below."
             )
-            right_default = dual_defaults[1] if len(dual_defaults) > 1 else numeric_cols[min(1, len(numeric_cols) - 1)]
-            dual_axis_right_feature = st.selectbox(
-                "Right Y-axis feature",
-                numeric_cols,
-                index=numeric_cols.index(right_default) if right_default in numeric_cols else min(1, len(numeric_cols) - 1),
-                format_func=column_label,
+            n_dual_axis_charts = st.number_input(
+                "Number of combined secondary-axis charts",
+                min_value=0,
+                max_value=3,
+                value=0,
+                step=1,
+                help="Use 0 for no combined charts. Use 1-3 when you want several custom overlays.",
             )
+            dual_defaults = selected_features if selected_features else numeric_cols[:2]
+            for chart_i in range(int(n_dual_axis_charts)):
+                st.markdown(f"**Combined chart {chart_i + 1}**")
+                default_left = [dual_defaults[min(chart_i * 2, len(dual_defaults) - 1)]] if dual_defaults else [numeric_cols[0]]
+                default_right_seed = dual_defaults[min(chart_i * 2 + 1, len(dual_defaults) - 1)] if len(dual_defaults) > 1 else numeric_cols[min(1, len(numeric_cols) - 1)]
+                left_features_i = st.multiselect(
+                    f"Chart {chart_i + 1} - left Y-axis feature(s)",
+                    numeric_cols,
+                    default=[f for f in default_left if f in numeric_cols],
+                    format_func=column_label,
+                    key=f"dual_left_features_{chart_i}",
+                )
+                right_features_i = st.multiselect(
+                    f"Chart {chart_i + 1} - right Y-axis feature(s)",
+                    numeric_cols,
+                    default=[default_right_seed] if default_right_seed in numeric_cols else [],
+                    format_func=column_label,
+                    key=f"dual_right_features_{chart_i}",
+                )
+                chart_title_i = st.text_input(
+                    f"Chart {chart_i + 1} title suffix",
+                    value="",
+                    placeholder="Optional, e.g. Rates vs Pumping Pressure",
+                    key=f"dual_title_suffix_{chart_i}",
+                ).strip()
+                if left_features_i and right_features_i:
+                    dual_axis_charts.append({
+                        "left": left_features_i,
+                        "right": right_features_i,
+                        "title": chart_title_i or f"Combined chart {chart_i + 1}",
+                    })
 
     # Keep markers off automatically on large datasets for speed/readability, but allow the user to turn them on.
     estimated_points_for_speed = int(len(data)) if "data" in globals() else 0
@@ -1489,7 +1514,7 @@ with st.sidebar:
     enable_drag_annotations = st.checkbox(
         "Allow dragging event labels on the interactive chart",
         value=False,
-        help="Lets you move annotations by mouse inside the interactive Plotly chart. Drag changes are visual only and are not saved into exports.",
+        help="Mouse drag is for on-screen adjustment only. Downloaded PNG/PDF charts use the clean automatic note layout and do not save dragged positions.",
     )
 
     st.caption("Select a start date/time and write a note. Add an optional end date/time only when the note should cover a period.")
@@ -1595,8 +1620,6 @@ with st.sidebar:
                     "datetime": start_dt_note,
                     "label": note_label_input.strip(),
                     "target": note_target,
-                    "x_shift_px": 0,
-                    "y_level": "Auto",
                 }
             )
             st.success(f"Added event: {start_dt_note:%Y-%m-%d %H:%M} | {note_label_input.strip()}")
@@ -1606,10 +1629,10 @@ with st.sidebar:
         events_df_sidebar = pd.DataFrame(st.session_state.manual_events_table)
         events_df_sidebar["datetime"] = pd.to_datetime(events_df_sidebar["datetime"])
         events_df_sidebar = events_df_sidebar.sort_values("datetime").reset_index(drop=True)
-        if "x_shift_px" not in events_df_sidebar.columns:
-            events_df_sidebar["x_shift_px"] = 0
-        if "y_level" not in events_df_sidebar.columns:
-            events_df_sidebar["y_level"] = "Auto"
+        # Note dragging is intentionally interactive-only. Do not keep manual
+        # x/y note position columns because exported charts should use the clean
+        # automatic layout, independent from any on-screen drag movement.
+        events_df_sidebar = events_df_sidebar.drop(columns=["x_shift_px", "y_level"], errors="ignore")
         display_events = events_df_sidebar.copy()
         display_events["datetime"] = display_events["datetime"].dt.strftime("%Y-%m-%d %H:%M")
         display_events.insert(0, "No.", range(1, len(display_events) + 1))
@@ -1617,23 +1640,21 @@ with st.sidebar:
             display_events,
             use_container_width=True,
             height=185,
-            key="point_notes_editor_v48",
+            key="point_notes_editor_v50",
             column_config={
                 "No.": st.column_config.NumberColumn("No.", disabled=True),
                 "datetime": st.column_config.TextColumn("Date/time", disabled=True),
                 "target": st.column_config.TextColumn("Target", disabled=True),
                 "label": st.column_config.TextColumn("Label"),
-                "x_shift_px": st.column_config.NumberColumn("X shift px", min_value=-250, max_value=250, step=5),
-                "y_level": st.column_config.SelectboxColumn("Y level", options=["Auto", "0", "1", "2", "3", "4", "5", "6", "7"]),
             },
             disabled=["No.", "datetime", "target"],
         )
-        # Save label/position edits immediately without changing the original datetime.
+        # Save label edits immediately without changing the original datetime.
+        # Position edits are not stored because mouse dragging is on-screen only.
         if len(edited_events) == len(events_df_sidebar):
             for _i in range(len(events_df_sidebar)):
-                for _c in ["label", "x_shift_px", "y_level"]:
-                    if _c in edited_events.columns:
-                        events_df_sidebar.at[_i, _c] = edited_events.at[_i, _c]
+                if "label" in edited_events.columns:
+                    events_df_sidebar.at[_i, "label"] = edited_events.at[_i, "label"]
             st.session_state.manual_events_table = events_df_sidebar.to_dict("records")
 
         event_options = {
@@ -1769,8 +1790,6 @@ for e in st.session_state.get("manual_events_table", []):
             "datetime": pd.Timestamp(e["datetime"]),
             "label": str(e["label"]),
             "target": str(e.get("target", "All selected wells")),
-            "x_shift_px": float(e.get("x_shift_px", 0) or 0),
-            "y_level": str(e.get("y_level", "Auto") or "Auto"),
         })
     except Exception:
         pass
@@ -1946,7 +1965,7 @@ if selected_features and not filtered.empty:
         return intervals[: int(max_visible_notes_per_chart)]
 
     def visible_events_for_notes(x_values=None):
-        events = note_event_levels(plot_events, x_values=x_values, max_levels=4)
+        events = note_event_levels(plot_events, x_values=x_values, max_levels=10)
         if not auto_hide_crowded_notes:
             return events
         remaining = int(max_visible_notes_per_chart) - len(visible_intervals_for_notes())
@@ -2053,16 +2072,16 @@ if selected_features and not filtered.empty:
                         row=r,
                         col=1,
                     )
-                    y_note = max(0.30, 0.98 - 0.075 * min(level, 7))
+                    y_note = max(0.16, 0.98 - 0.060 * min(level, 12))
                     text_angle = 0
                     x_anchor = "center"
                     # In Auto mode, switch crowded/nested notes to vertical labels automatically.
                     if event_label_style == "Vertical labels" or (event_label_style == "Auto staggered" and total_note_count() >= 3):
                         text_angle = -90
-                        y_note = max(0.20, 0.94 - 0.055 * min(level, 7))
+                        y_note = max(0.12, 0.94 - 0.050 * min(level, 12))
                         x_anchor = "right"
                     elif event_label_style == "Compact top labels":
-                        y_note = max(0.64, 0.99 - 0.045 * min(level, 7))
+                        y_note = max(0.40, 0.99 - 0.040 * min(level, 12))
                         x_anchor = "center"
                     fig.add_annotation(
                         x=x,
@@ -2164,35 +2183,45 @@ if selected_features and not filtered.empty:
     def report_label_indices(g, feature):
         """Readable labels for dense field reports.
 
-        Keeps first/last, min/max, selected time points, and major local changes.
-        It intentionally does not label every zero because repeated zeros make
-        field-test charts unreadable.
+        v49 policy: keep labels sparse enough to read.  It keeps first/last,
+        min/max, a small number of evenly spaced points, and only the strongest
+        local peaks/troughs.  Repeated zero labels are suppressed unless the
+        series is very small.
         """
         g = g.reset_index(drop=True)
         n = len(g)
-        idxs = {0, n - 1} if n else set()
         if n == 0 or feature not in g.columns:
-            return idxs
+            return set()
 
         y = pd.to_numeric(g[feature], errors="coerce").reset_index(drop=True)
         valid = y.dropna()
         if valid.empty:
-            return idxs
+            return set()
 
-        idxs.add(int(valid.idxmin()))
-        idxs.add(int(valid.idxmax()))
+        important = {0, n - 1, int(valid.idxmin()), int(valid.idxmax())}
+        idxs = set(important)
 
-        # Add significant local peaks/troughs only when the change is meaningful.
+        yrange = float(valid.max() - valid.min()) if valid.notna().any() else 0.0
+        eps_zero = max(abs(float(valid.max())) * 1e-9, 1e-9)
+
+        # Add only strong local peaks/troughs.  This avoids the dense blue-number
+        # clutter seen when every small zig-zag is labeled.
         try:
-            yrange = float(valid.max() - valid.min())
-            threshold = max(abs(float(valid.mean())) * 0.08, yrange * 0.12, 1e-9)
+            threshold = max(yrange * 0.22, abs(float(valid.mean())) * 0.12, 1.0)
+            candidates = []
             for i in range(1, n - 1):
                 if pd.isna(y.iloc[i - 1]) or pd.isna(y.iloc[i]) or pd.isna(y.iloc[i + 1]):
                     continue
+                if abs(float(y.iloc[i])) <= eps_zero and n > 20:
+                    continue
                 is_peak = y.iloc[i] > y.iloc[i - 1] and y.iloc[i] > y.iloc[i + 1]
                 is_trough = y.iloc[i] < y.iloc[i - 1] and y.iloc[i] < y.iloc[i + 1]
-                if (is_peak or is_trough) and max(abs(y.iloc[i] - y.iloc[i - 1]), abs(y.iloc[i] - y.iloc[i + 1])) >= threshold:
-                    idxs.add(i)
+                amp = max(abs(float(y.iloc[i] - y.iloc[i - 1])), abs(float(y.iloc[i] - y.iloc[i + 1])))
+                if (is_peak or is_trough) and amp >= threshold:
+                    candidates.append((amp, i))
+            # Keep only strongest candidates.
+            candidates = sorted(candidates, reverse=True)[:6]
+            idxs.update(i for _, i in candidates)
         except Exception:
             pass
 
@@ -2202,22 +2231,48 @@ if selected_features and not filtered.empty:
             if len(hourly) < 3:
                 hourly = list(dt.reset_index(drop=True)[(dt.dt.minute.isin([0, 30])) & dt.notna()].index)
             idxs.update(hourly)
+            max_labels = 16 if chart_view_mode == "Mobile-friendly" else 22
         else:
-            idxs.update(label_indices(n, "Clean readable - recommended"))
-
-        # Prevent too many labels on one panel. Exports use the same cap.
-        max_labels = 14 if chart_view_mode == "Mobile-friendly" else 20
-        if value_label_mode == "Hourly + min/max":
-            max_labels = 18 if chart_view_mode == "Mobile-friendly" else 26
-        if len(idxs) > max_labels:
-            important = {0, n - 1, int(valid.idxmin()), int(valid.idxmax())}
-            remaining = [i for i in sorted(idxs) if i not in important]
-            keep_n = max(0, max_labels - len(important))
-            if keep_n and remaining:
-                chosen = [remaining[i] for i in sorted(set(np.linspace(0, len(remaining) - 1, keep_n).round().astype(int).tolist()))]
+            # Clean readable: fewer labels, wider spacing.
+            max_labels = 8 if chart_view_mode == "Mobile-friendly" else 12
+            if n <= 18:
+                spacing = 4
+            elif n <= 60:
+                spacing = 10
+            elif n <= 160:
+                spacing = 20
             else:
-                chosen = []
-            idxs = set(chosen) | important
+                spacing = max(25, int(round(n / 8)))
+            idxs.update(range(0, n, spacing))
+
+        # Avoid repeated zero labels in long charts.
+        if n > 20:
+            idxs = {i for i in idxs if i in important or (0 <= i < n and pd.notna(y.iloc[i]) and abs(float(y.iloc[i])) > eps_zero)}
+
+        # Enforce minimum horizontal separation; important extrema are always kept.
+        ordered = sorted(i for i in idxs if 0 <= i < n)
+        protected = {i for i in important if 0 <= i < n}
+        min_gap_idx = max(1, int(round(n / max(max_labels, 1))))
+        kept = []
+        for i in ordered:
+            if i in protected:
+                kept.append(i)
+                continue
+            if len(kept) >= max_labels:
+                break
+            if all(abs(i - j) >= min_gap_idx for j in kept if j not in protected):
+                kept.append(i)
+        idxs = set(kept) | protected
+
+        # Hard cap.  Prefer first/last/min/max, then spread the remaining labels.
+        if len(idxs) > max_labels:
+            remaining = [i for i in sorted(idxs) if i not in protected]
+            keep_n = max(0, max_labels - len(protected))
+            if keep_n and remaining:
+                pick = sorted(set(np.linspace(0, len(remaining) - 1, keep_n).round().astype(int).tolist()))
+                idxs = protected | {remaining[i] for i in pick}
+            else:
+                idxs = protected
 
         return {i for i in idxs if 0 <= i < n}
 
@@ -2545,19 +2600,99 @@ if selected_features and not filtered.empty:
                 )
         return fig
 
+    def build_dual_axis_multi_figure(df, left_features, right_features, chart_name=""):
+        """Build one combined chart with multiple left/right Y-axis features."""
+        left_features = [f for f in left_features if f in df.columns]
+        right_features = [f for f in right_features if f in df.columns]
+        if not left_features or not right_features:
+            return go.Figure()
+
+        series_values = sorted(df["series_label"].dropna().astype(str).unique()) if "series_label" in df.columns else (
+            sorted(df["well"].dropna().astype(str).unique()) if "well" in df.columns else ["All"]
+        )
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        line_mode = "lines+markers" if show_points else "lines"
+        plot_items = [(f, False) for f in left_features] + [(f, True) for f in right_features]
+
+        for f_idx, (feature, secondary) in enumerate(plot_items):
+            for series_idx, series_label in enumerate(series_values):
+                g_all = df[df["series_label"].astype(str) == series_label].copy() if "series_label" in df.columns else df.copy()
+                if g_all.empty or feature not in g_all.columns:
+                    continue
+                color = feature_color(feature, series_idx + f_idx)
+                first_segment = True
+                for g in iter_plot_segments(g_all):
+                    if g.empty:
+                        continue
+                    text, textposition = build_text_and_positions(g, feature)
+                    trace_name = f"{series_label} - {column_label(feature)}" if len(series_values) > 1 else column_label(feature)
+                    fig.add_trace(
+                        go.Scatter(
+                            x=x_values(g),
+                            y=pd.to_numeric(g[feature], errors="coerce"),
+                            mode=line_mode + ("+text" if value_label_mode != "Off" else ""),
+                            text=text,
+                            textposition=textposition,
+                            textfont=dict(size=9 if chart_view_mode == "Mobile-friendly" else 11, color=color, family="Arial, sans-serif"),
+                            cliponaxis=False,
+                            name=trace_name,
+                            legendgroup=trace_name,
+                            showlegend=first_segment,
+                            line=dict(color=color, width=2.8),
+                            marker=dict(color=color, size=5 if chart_view_mode == "Mobile-friendly" else 7),
+                        ),
+                        secondary_y=secondary,
+                    )
+                    first_segment = False
+
+        suffix = f" - {chart_name}" if chart_name else ""
+        fig.update_layout(
+            height=820 if chart_view_mode != "Mobile-friendly" else 640,
+            width=None if chart_view_mode == "Mobile-friendly" else 1700,
+            title=dict(text=chart_title_from_data(df, custom_chart_title) + suffix, font=dict(size=26, color="#0f172a", family="Arial Black, Arial, sans-serif")),
+            xaxis_title=x_axis_title,
+            hovermode="x unified",
+            margin=dict(l=85, r=95, t=115, b=80),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+            font=dict(color="#111827", size=15),
+            legend=dict(font=dict(size=13, color="#111827"), bgcolor="rgba(255,255,255,0.90)", bordercolor="#e5e7eb", borderwidth=1),
+            title_x=0.5,
+            title_xanchor="center",
+        )
+        fig.update_xaxes(showgrid=True, gridcolor="#dddddd", zeroline=False, tickfont=dict(size=13, color="#111827"), **axis_tick_settings)
+        fig.update_yaxes(
+            title_text=" / ".join(column_label(f) for f in left_features[:3]),
+            secondary_y=False,
+            showgrid=True,
+            gridcolor="#eeeeee",
+            zeroline=False,
+        )
+        fig.update_yaxes(
+            title_text=" / ".join(column_label(f) for f in right_features[:3]),
+            secondary_y=True,
+            showgrid=False,
+            zeroline=False,
+        )
+        return add_manual_events_to_plotly(fig, [left_features[0]])
+
     plotly_config_common = {
         "responsive": True,
         "displaylogo": False,
         "editable": bool(enable_drag_annotations),
         "edits": {"annotationPosition": bool(enable_drag_annotations)},
-        "toImageButtonOptions": {"format": "png", "scale": 3},
+        # Hide Plotly's browser camera button because it captures the current
+        # dragged on-screen view. Use the app download buttons instead; they
+        # generate clean export charts using automatic note layout.
+        "modeBarButtonsToRemove": ["toImage"],
         "scrollZoom": True,
     }
 
-    if add_dual_axis_chart and dual_axis_left_feature and dual_axis_right_feature:
-        st.markdown("### Combined secondary Y-axis chart")
-        dual_fig = build_figure(filtered, [dual_axis_left_feature, dual_axis_right_feature], "Overlay two features with secondary Y-axis")
-        st.plotly_chart(dual_fig, use_container_width=True, config=plotly_config_common)
+    if dual_axis_charts:
+        for cfg_i, cfg in enumerate(dual_axis_charts, start=1):
+            st.markdown(f"### Combined secondary Y-axis chart {cfg_i}")
+            dual_fig = build_dual_axis_multi_figure(filtered, cfg.get("left", []), cfg.get("right", []), cfg.get("title", ""))
+            st.plotly_chart(dual_fig, use_container_width=True, config=plotly_config_common)
 
     fig = build_figure(filtered, selected_features, plot_mode)
     st.plotly_chart(fig, use_container_width=True, config=plotly_config_common)
@@ -2956,7 +3091,7 @@ if selected_features and not filtered.empty:
             for idx, event in enumerate(event_rows):
                 level = int(event.get("level", 0))
                 note_col = note_color(idx + len(plot_intervals or []))
-                y_frac = max(0.30, base_frac - 0.075 * min(level, 7))
+                y_frac = max(0.12, base_frac - 0.060 * min(level, 12))
                 ax.axvline(event["plot_x"], color=note_col, linestyle="--", linewidth=1.5, alpha=0.78)
                 rotation = 90 if (event_label_style == "Vertical labels" or (event_label_style == "Auto staggered" and total_note_count() >= 3)) else 0
                 ha = "right" if rotation else "center"
