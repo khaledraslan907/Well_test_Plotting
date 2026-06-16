@@ -51,6 +51,7 @@ available_numeric_columns = _tmu_parser.available_numeric_columns
 _parser_column_label = _tmu_parser.column_label
 load_tabular_file = _tmu_parser.load_tabular_file
 parse_many_tmu_messages = _tmu_parser.parse_many_tmu_messages
+PARSER_BUILD_ID = getattr(_tmu_parser, 'PARSER_BUILD_ID', 'v51')
 assign_test_ids = getattr(_tmu_parser, "assign_test_ids", lambda df, gap_hours=12.0: df)
 
 DISPLAY_LABEL_FILE = Path(__file__).with_name("user_display_labels.json")
@@ -583,6 +584,9 @@ with st.sidebar:
         accept_multiple_files=True,
         help="Upload normal test files or a WhatsApp exported ZIP. ZIP can contain _chat.txt, Excel/PDF/DOCX/CSV attachments, and CTU screen images.",
     )
+    if st.button("Re-parse uploaded files / clear cache", help="Use this after updating the parser or when a previously uploaded file still shows old detected columns."):
+        st.cache_data.clear()
+        st.rerun()
 
     st.header("2) Test split and CTU image OCR")
     keep_same_well_one_test = st.checkbox(
@@ -635,7 +639,7 @@ Pumping P= 849 Psi""",
     )
 
 @st.cache_data(show_spinner=False, ttl=3600, max_entries=24)
-def cached_load_uploaded_file(file_name: str, file_bytes: bytes, parse_images: bool, max_ocr_images: int):
+def cached_load_uploaded_file(file_name: str, file_bytes: bytes, parse_images: bool, max_ocr_images: int, parser_build_id: str):
     class CachedUploadedFile(io.BytesIO):
         def __init__(self, data: bytes, name: str):
             super().__init__(data)
@@ -654,7 +658,7 @@ if uploaded_files:
         try:
             file_bytes = f.getvalue()
             parsed_tables = cached_load_uploaded_file(
-                f.name, file_bytes, bool(enable_ctu_ocr), int(max_ocr_images)
+                f.name, file_bytes, bool(enable_ctu_ocr), int(max_ocr_images), PARSER_BUILD_ID
             )
             if parsed_tables:
                 frames.extend(parsed_tables)
@@ -2002,51 +2006,51 @@ if selected_features and not filtered.empty:
             x0 = interval["x0"]
             x1 = interval["x1"]
             label = interval["label"]
-            level = interval.get("level", 0)
+            level = int(interval.get("level", 0) or 0)
             note_col = note_color(idx)
 
-            # Draw only the interval start and end lines. No shaded background.
-            for r in range(1, len(features) + 1):
-                for x_val in [x0, x1]:
-                    try:
-                        fig.add_vline(
-                            x=x_val,
-                            line_width=2.2,
-                            line_dash="dash",
-                            line_color=note_col,
-                            opacity=0.90,
-                            row=r,
-                            col=1,
-                        )
-                    except Exception:
-                        pass
+            # v51: use whole-figure shapes instead of repeated labels in each subplot.
+            # One draggable event/interval line spans all charts, so moving it in the
+            # interactive Plotly view affects the whole multi-chart figure visually.
+            for x_val in [x0, x1]:
+                try:
+                    fig.add_shape(
+                        type="line",
+                        x0=x_val,
+                        x1=x_val,
+                        y0=0,
+                        y1=1,
+                        xref="x",
+                        yref="paper",
+                        line=dict(color=note_col, width=2.2, dash="dash"),
+                        opacity=0.90,
+                    )
+                except Exception:
+                    pass
 
             try:
                 x_mid = x0 + (x1 - x0) / 2
             except Exception:
                 x_mid = x0
 
-            # Put parent interval on the highest row and child intervals below it.
-            # Keep labels compact so nested events do not cover the curves.
-            for r in range(1, len(features) + 1):
-                try:
-                    xref = f"x{r if r > 1 else ''}"
-                    yref = f"y{r if r > 1 else ''} domain"
-                    y_row = max(0.66, 0.96 - 0.10 * min(level, 3))
-                    fig.add_annotation(
-                        x=x_mid,
-                        y=y_row,
-                        xref=xref,
-                        yref=yref,
-                        text=label,
-                        showarrow=False,
-                        bgcolor="rgba(255,255,255,0.98)",
-                        bordercolor=note_col,
-                        borderwidth=1,
-                        font=dict(size=interval_font_size, color=note_col),
-                    )
-                except Exception:
-                    pass
+            try:
+                y_row = max(0.86, 1.03 - 0.045 * min(level, 4))
+                fig.add_annotation(
+                    x=x_mid,
+                    y=y_row,
+                    xref="x",
+                    yref="paper",
+                    text=label,
+                    showarrow=False,
+                    xanchor="center",
+                    yanchor="bottom",
+                    bgcolor="rgba(255,255,255,0.98)",
+                    bordercolor=note_col,
+                    borderwidth=1,
+                    font=dict(size=interval_font_size, color=note_col),
+                )
+            except Exception:
+                pass
         return fig
 
     def add_manual_events_to_plotly(fig, features):
@@ -2059,48 +2063,50 @@ if selected_features and not filtered.empty:
         for idx, event in enumerate(decorated_events):
             x = event["plot_x"]
             label = event["label"]
-            level = int(event.get("level", 0))
+            level = int(event.get("level", 0) or 0)
             note_col = note_color(idx + len(plot_intervals or []))
-            for r in range(1, len(features) + 1):
-                try:
-                    fig.add_vline(
-                        x=x,
-                        line_width=2,
-                        line_dash="dash",
-                        line_color=note_col,
-                        opacity=0.75,
-                        row=r,
-                        col=1,
-                    )
-                    y_note = max(0.16, 0.98 - 0.060 * min(level, 12))
-                    text_angle = 0
+            try:
+                fig.add_shape(
+                    type="line",
+                    x0=x,
+                    x1=x,
+                    y0=0,
+                    y1=1,
+                    xref="x",
+                    yref="paper",
+                    line=dict(color=note_col, width=2, dash="dash"),
+                    opacity=0.75,
+                )
+            except Exception:
+                pass
+            try:
+                y_note = max(0.82, 1.04 - 0.045 * min(level, 8))
+                text_angle = 0
+                x_anchor = "center"
+                if event_label_style == "Vertical labels" or (event_label_style == "Auto staggered" and total_note_count() >= 3):
+                    text_angle = -90
+                    y_note = max(0.80, 1.02 - 0.035 * min(level, 8))
+                    x_anchor = "right"
+                elif event_label_style == "Compact top labels":
+                    y_note = max(0.90, 1.04 - 0.035 * min(level, 8))
                     x_anchor = "center"
-                    # In Auto mode, switch crowded/nested notes to vertical labels automatically.
-                    if event_label_style == "Vertical labels" or (event_label_style == "Auto staggered" and total_note_count() >= 3):
-                        text_angle = -90
-                        y_note = max(0.12, 0.94 - 0.050 * min(level, 12))
-                        x_anchor = "right"
-                    elif event_label_style == "Compact top labels":
-                        y_note = max(0.40, 0.99 - 0.040 * min(level, 12))
-                        x_anchor = "center"
-                    fig.add_annotation(
-                        x=x,
-                        y=y_note,
-                        xref=f"x{r if r > 1 else ''}",
-                        yref=f"y{r if r > 1 else ''} domain",
-                        text=label,
-                        showarrow=False,
-                        xanchor=x_anchor,
-                        yanchor="top",
-                        textangle=text_angle,
-                        xshift=float(event.get("x_shift_px", 0) or 0),
-                        font=dict(size=event_font_size, color=note_col),
-                        bgcolor="rgba(255,255,255,0.92)",
-                        bordercolor=note_col,
-                        borderwidth=1,
-                    )
-                except Exception:
-                    pass
+                fig.add_annotation(
+                    x=x,
+                    y=y_note,
+                    xref="x",
+                    yref="paper",
+                    text=label,
+                    showarrow=False,
+                    xanchor=x_anchor,
+                    yanchor="bottom",
+                    textangle=text_angle,
+                    font=dict(size=event_font_size, color=note_col),
+                    bgcolor="rgba(255,255,255,0.92)",
+                    bordercolor=note_col,
+                    borderwidth=1,
+                )
+            except Exception:
+                pass
         return fig
 
     def x_values(df):
@@ -2680,7 +2686,7 @@ if selected_features and not filtered.empty:
         "responsive": True,
         "displaylogo": False,
         "editable": bool(enable_drag_annotations),
-        "edits": {"annotationPosition": bool(enable_drag_annotations)},
+        "edits": {"annotationPosition": bool(enable_drag_annotations), "shapePosition": bool(enable_drag_annotations)},
         # Hide Plotly's browser camera button because it captures the current
         # dragged on-screen view. Use the app download buttons instead; they
         # generate clean export charts using automatic note layout.
