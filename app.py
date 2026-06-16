@@ -48,10 +48,32 @@ if _missing_required:
 
 apply_fill_method = _tmu_parser.apply_fill_method
 available_numeric_columns = _tmu_parser.available_numeric_columns
-column_label = _tmu_parser.column_label
+_parser_column_label = _tmu_parser.column_label
 load_tabular_file = _tmu_parser.load_tabular_file
 parse_many_tmu_messages = _tmu_parser.parse_many_tmu_messages
 assign_test_ids = getattr(_tmu_parser, "assign_test_ids", lambda df, gap_hours=12.0: df)
+
+DISPLAY_LABEL_FILE = Path(__file__).with_name("user_display_labels.json")
+
+def load_display_label_overrides() -> dict:
+    try:
+        if DISPLAY_LABEL_FILE.exists():
+            data = json.loads(DISPLAY_LABEL_FILE.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+def save_display_label_overrides(overrides: dict) -> None:
+    safe = {str(k): str(v).strip() for k, v in (overrides or {}).items() if str(v).strip()}
+    DISPLAY_LABEL_FILE.write_text(json.dumps(safe, indent=2, sort_keys=True), encoding="utf-8")
+
+def column_label(col) -> str:
+    overrides = st.session_state.get("display_label_overrides")
+    if overrides is None:
+        overrides = load_display_label_overrides()
+        st.session_state["display_label_overrides"] = overrides
+    return str(overrides.get(str(col), _parser_column_label(col)))
 
 
 def canonical_key(s: object) -> str:
@@ -563,18 +585,25 @@ with st.sidebar:
     )
 
     st.header("2) Test split and CTU image OCR")
+    keep_same_well_one_test = st.checkbox(
+        "Keep same well as one test regardless of time gap",
+        value=False,
+        help="Use this when a long test has large inactive periods but still belongs to the same well test.",
+    )
     test_gap_hours = st.number_input(
         "Start a new test for the same well if gap exceeds (hours)",
         min_value=1.0,
-        max_value=72.0,
-        value=12.0,
+        max_value=8760.0,
+        value=72.0,
         step=1.0,
-        help="Same well continues the same test until this inactive gap is exceeded. A different well is always treated as another test stream.",
+        disabled=keep_same_well_one_test,
+        help="Same well continues the same test until this inactive gap is exceeded. Use a large value or the checkbox above for long tests.",
     )
+    effective_test_gap_hours = 1_000_000.0 if keep_same_well_one_test else float(test_gap_hours)
     enable_ctu_ocr = st.checkbox(
         "Process CTU/HMI images with OCR",
-        value=True,
-        help="Turn OFF when a WhatsApp ZIP contains many irrelevant photos.",
+        value=False,
+        help="Turn ON only when you need CTU/HMI screen readings. Keeping OCR off makes large WhatsApp ZIP uploads much faster.",
     )
     max_ocr_images = st.number_input(
         "CTU/HMI image OCR limit per ZIP (0 = no limit)",
@@ -605,17 +634,32 @@ Salinity = 35K PPM of NaCl
 Pumping P= 849 Psi""",
     )
 
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=24)
+def cached_load_uploaded_file(file_name: str, file_bytes: bytes, parse_images: bool, max_ocr_images: int):
+    class CachedUploadedFile(io.BytesIO):
+        def __init__(self, data: bytes, name: str):
+            super().__init__(data)
+            self.name = name
+    return load_tabular_file(
+        CachedUploadedFile(file_bytes, file_name),
+        parse_images=bool(parse_images),
+        max_ocr_images=int(max_ocr_images),
+    )
+
 frames = []
 errors = []
 
 if uploaded_files:
     for f in uploaded_files:
         try:
-            parsed_tables = load_tabular_file(f, parse_images=bool(enable_ctu_ocr), max_ocr_images=int(max_ocr_images))
+            file_bytes = f.getvalue()
+            parsed_tables = cached_load_uploaded_file(
+                f.name, file_bytes, bool(enable_ctu_ocr), int(max_ocr_images)
+            )
             if parsed_tables:
                 frames.extend(parsed_tables)
             else:
-                errors.append(f"{f.name}: no usable time-series table detected. The file may be blank, or it has no date/time plus numeric readings after all Excel fallback parsers were tried.")
+                errors.append(f"{f.name}: no usable time-series table detected. The file may be blank, or it has no date/time plus numeric readings after all parsers were tried.")
         except Exception as e:
             errors.append(f"{f.name}: {e}")
             with st.expander(f"Technical error details for {f.name}", expanded=False):
@@ -642,7 +686,7 @@ data = pd.concat(frames, ignore_index=True, sort=False)
 
 # Test segmentation: same well continues until the selected gap is exceeded;
 # a different well is always a separate test stream.
-data = assign_test_ids(data, gap_hours=float(test_gap_hours))
+data = assign_test_ids(data, gap_hours=float(effective_test_gap_hours))
 
 if "datetime" in data.columns:
     data["datetime"] = pd.to_datetime(data["datetime"], errors="coerce")
@@ -1128,8 +1172,7 @@ with st.sidebar:
         index=0,
         help=(
             "Real calendar time keeps true dates and gaps. "
-            "Compressed real dates removes long empty gaps between test periods. "
-            "Aligned elapsed time starts every well/test at 0 hours, which is best for comparing two wells or several tests without squeezing one curve into a cluster."
+            "Compressed real dates removes long empty gaps between test periods."
         ),
     )
     if is_compressed_real_date_mode(x_axis_mode):
@@ -1200,26 +1243,11 @@ with st.sidebar:
         all_wells = []
     selected_wells = st.multiselect("Choose wells", all_wells, default=all_wells[:1] if all_wells else [])
 
-    if "test_id" in data.columns:
-        test_filter_df = data.copy()
-        if selected_wells:
-            test_filter_df = test_filter_df[test_filter_df["well"].astype(str).isin(selected_wells)]
-        useful_mask_for_tests = _has_any_plot_numeric(test_filter_df)
-        if useful_mask_for_tests.any():
-            test_filter_df = test_filter_df[useful_mask_for_tests]
-        test_filter_df = test_filter_df[test_filter_df["test_id"].notna() & ~test_filter_df["test_id"].astype(str).str.startswith("Unlinked")]
-        if not test_filter_df.empty and "datetime" in test_filter_df.columns and test_filter_df["datetime"].notna().any():
-            all_tests = test_filter_df.groupby(test_filter_df["test_id"].astype(str))["datetime"].max().sort_values(ascending=False).index.tolist()
-        else:
-            all_tests = sorted([t for t in test_filter_df["test_id"].dropna().astype(str).unique() if not str(t).startswith("Unlinked")])
-        selected_tests = st.multiselect(
-            "Choose tests / periods",
-            all_tests,
-            default=all_tests[:1] if all_tests else [],
-            help="Tests are detected by well name and time gap. Select one test period or compare several.",
-        )
-    else:
-        selected_tests = []
+    # Test/period filtering removed from the sidebar.
+    # Tests are still detected internally and shown in the data preview/export,
+    # but the main workflow now filters by well and time range only.
+    selected_tests = []
+    all_tests = []
 
     select_all_features = st.checkbox(
         "Select all numeric columns",
@@ -1317,9 +1345,28 @@ with st.sidebar:
 
     plot_mode = st.selectbox(
         "Plot style",
-        ["Separate panels like report", "Overlay actual values"],
+        ["Separate panels like report", "Overlay actual values", "Overlay two features with secondary Y-axis"],
         index=0,
     )
+
+    dual_axis_left_feature = None
+    dual_axis_right_feature = None
+    if plot_mode == "Overlay two features with secondary Y-axis" and numeric_cols:
+        dual_defaults = selected_features if len(selected_features) >= 2 else (default_features if len(default_features) >= 2 else numeric_cols[:2])
+        dual_axis_left_feature = st.selectbox(
+            "Left Y-axis feature",
+            numeric_cols,
+            index=numeric_cols.index(dual_defaults[0]) if dual_defaults and dual_defaults[0] in numeric_cols else 0,
+            format_func=column_label,
+        )
+        right_default = dual_defaults[1] if len(dual_defaults) > 1 else numeric_cols[min(1, len(numeric_cols) - 1)]
+        dual_axis_right_feature = st.selectbox(
+            "Right Y-axis feature",
+            numeric_cols,
+            index=numeric_cols.index(right_default) if right_default in numeric_cols else min(1, len(numeric_cols) - 1),
+            format_func=column_label,
+        )
+        selected_features = [c for c in [dual_axis_left_feature, dual_axis_right_feature] if c]
 
     show_points = st.checkbox("Show markers", value=True)
 
@@ -1329,8 +1376,8 @@ with st.sidebar:
             "Hourly + min/max - best for reports",
             "Auto sparse - recommended",
             "All values - use wide export",
-            "Every 4 readings",
             "Every 8 readings",
+            "Every 20 readings",
             "First and last only",
             "Off",
         ],
@@ -1347,11 +1394,48 @@ with st.sidebar:
         "Auto sparse labels evenly spaced points to reduce overlap."
     )
 
-    label_decimals = st.selectbox(
-        "Number format on labels",
+    label_decimals_default = st.selectbox(
+        "Default number format on labels",
         ["Auto", "0 decimals", "1 decimal", "2 decimals"],
         index=0,
     )
+    label_decimals_by_feature = {}
+    if selected_features:
+        with st.expander("Number format per graph", expanded=False):
+            st.caption("Use this when one curve needs 0 decimals and another needs 1 or 2 decimals.")
+            for feature in selected_features:
+                label_decimals_by_feature[feature] = st.selectbox(
+                    column_label(feature),
+                    ["Use default", "Auto", "0 decimals", "1 decimal", "2 decimals"],
+                    index=0,
+                    key=f"label_decimals_{feature_key_text(feature)}",
+                )
+
+    with st.expander("Rename column labels for view/export", expanded=False):
+        st.caption("Rename how columns appear in charts and tables without changing the parser field names.")
+        current_overrides = dict(st.session_state.get("display_label_overrides", {}))
+        edited_overrides = dict(current_overrides)
+        for feature in selected_features:
+            parser_label = _parser_column_label(feature)
+            edited_overrides[str(feature)] = st.text_input(
+                parser_label,
+                value=str(current_overrides.get(str(feature), parser_label)),
+                key=f"display_label_{feature_key_text(feature)}",
+            ).strip()
+        c_save, c_clear = st.columns(2)
+        with c_save:
+            if st.button("Save label names"):
+                save_display_label_overrides(edited_overrides)
+                st.session_state["display_label_overrides"] = edited_overrides
+                st.success("Saved label names for future uploads.")
+        with c_clear:
+            if st.button("Reset saved label names"):
+                try:
+                    DISPLAY_LABEL_FILE.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                st.session_state["display_label_overrides"] = {}
+                st.success("Saved label names cleared.")
 
     note_color_theme = "High contrast"
 
@@ -1376,6 +1460,18 @@ with st.sidebar:
         step=1,
         disabled=not auto_hide_crowded_notes,
         help="Used only when auto-hide is enabled.",
+    )
+
+    event_label_style = st.selectbox(
+        "Event label layout",
+        ["Auto staggered", "Vertical labels", "Compact top labels"],
+        index=0,
+        help="Use Vertical labels or Compact top labels when many notes are close together.",
+    )
+    enable_drag_annotations = st.checkbox(
+        "Allow dragging event labels on the interactive chart",
+        value=False,
+        help="Lets you move annotations by mouse inside the interactive Plotly chart. Drag changes are visual only and are not saved into exports.",
     )
 
     st.caption("Select a start date/time and write a note. Add an optional end date/time only when the note should cover a period.")
@@ -1892,15 +1988,26 @@ if selected_features and not filtered.empty:
                         row=r,
                         col=1,
                     )
+                    y_note = max(0.58, 0.98 - 0.08 * min(level, 4))
+                    text_angle = 0
+                    x_anchor = "left"
+                    if event_label_style == "Vertical labels":
+                        text_angle = -90
+                        y_note = max(0.25, 0.88 - 0.05 * min(level, 6))
+                        x_anchor = "right"
+                    elif event_label_style == "Compact top labels":
+                        y_note = max(0.72, 0.99 - 0.05 * min(level, 6))
+                        x_anchor = "center"
                     fig.add_annotation(
                         x=x,
-                        y=max(0.58, 0.98 - 0.08 * min(level, 4)),
+                        y=y_note,
                         xref=f"x{r if r > 1 else ''}",
                         yref=f"y{r if r > 1 else ''} domain",
                         text=label,
                         showarrow=False,
-                        xanchor="left",
+                        xanchor=x_anchor,
                         yanchor="top",
+                        textangle=text_angle,
                         font=dict(size=event_font_size, color=note_col),
                         bgcolor="rgba(255,255,255,0.88)",
                         bordercolor=note_col,
@@ -1938,11 +2045,11 @@ if selected_features and not filtered.empty:
         if mode == "All values - use wide export":
             return set(range(n))
 
-        if mode == "Every 4 readings":
-            return set(list(range(0, n, 4)) + [n - 1])
-
         if mode == "Every 8 readings":
             return set(list(range(0, n, 8)) + [n - 1])
+
+        if mode == "Every 20 readings":
+            return set(list(range(0, n, 20)) + [n - 1])
 
         if mode == "First and last only":
             return {0, n - 1}
@@ -1967,11 +2074,15 @@ if selected_features and not filtered.empty:
 
         v = float(value)
 
-        if label_decimals == "0 decimals":
+        fmt_choice = label_decimals_by_feature.get(feature, "Use default")
+        if fmt_choice == "Use default":
+            fmt_choice = label_decimals_default
+
+        if fmt_choice == "0 decimals":
             return f"{v:.0f}"
-        if label_decimals == "1 decimal":
+        if fmt_choice == "1 decimal":
             return f"{v:.1f}"
-        if label_decimals == "2 decimals":
+        if fmt_choice == "2 decimals":
             return f"{v:.2f}"
 
         # Auto compact format to prevent label overlap.
@@ -2074,6 +2185,79 @@ if selected_features and not filtered.empty:
             sorted(df["well"].dropna().astype(str).unique()) if "well" in df.columns else ["All"]
         )
         line_mode = "lines+markers" if show_points else "lines"
+
+        if mode == "Overlay two features with secondary Y-axis":
+            dual_features = [f for f in features if f in df.columns][:2]
+            if len(dual_features) < 2:
+                return go.Figure()
+
+            left_feature, right_feature = dual_features[0], dual_features[1]
+            fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+            for f_idx, feature in enumerate([left_feature, right_feature]):
+                secondary = (f_idx == 1)
+                for series_idx, series_label in enumerate(series_values):
+                    g_all = df[df["series_label"].astype(str) == series_label].copy() if "series_label" in df.columns else df.copy()
+                    if g_all.empty or feature not in g_all.columns:
+                        continue
+                    color = feature_color(feature, series_idx + f_idx)
+                    first_segment = True
+                    for g in iter_plot_segments(g_all):
+                        if g.empty:
+                            continue
+                        text, textposition = build_text_and_positions(g, feature)
+                        trace_name = f"{series_label} - {column_label(feature)}" if len(series_values) > 1 else column_label(feature)
+                        fig.add_trace(
+                            go.Scatter(
+                                x=x_values(g),
+                                y=pd.to_numeric(g[feature], errors="coerce"),
+                                mode=line_mode + ("+text" if value_label_mode != "Off" else ""),
+                                text=text,
+                                textposition=textposition,
+                                textfont=dict(size=12 if chart_view_mode == "Mobile-friendly" else 15, color=color, family="Arial, sans-serif"),
+                                cliponaxis=False,
+                                name=trace_name,
+                                legendgroup=trace_name,
+                                showlegend=first_segment,
+                                line=dict(color=color, width=3.0),
+                                marker=dict(color=color, size=6 if chart_view_mode == "Mobile-friendly" else 8),
+                            ),
+                            secondary_y=secondary,
+                        )
+                        first_segment = False
+
+            fig.update_layout(
+                height=850 if chart_view_mode != "Mobile-friendly" else 680,
+                width=None if chart_view_mode == "Mobile-friendly" else 1700,
+                title=dict(text=chart_title_from_data(df, custom_chart_title), font=dict(size=28, color="#0f172a", family="Arial Black, Arial, sans-serif")),
+                xaxis_title=x_axis_title,
+                hovermode="x unified",
+                margin=dict(l=85, r=90, t=115, b=80),
+                plot_bgcolor="white",
+                paper_bgcolor="white",
+                font=dict(color="#111827", size=15),
+                legend=dict(font=dict(size=15, color="#111827"), bgcolor="rgba(255,255,255,0.90)", bordercolor="#e5e7eb", borderwidth=1),
+                title_x=0.5,
+                title_xanchor="center",
+            )
+            fig.update_xaxes(showgrid=True, gridcolor="#dddddd", zeroline=False, tickfont=dict(size=14, color="#111827"), **axis_tick_settings)
+            fig.update_yaxes(
+                title_text=column_label(left_feature),
+                secondary_y=False,
+                showgrid=True,
+                gridcolor="#eeeeee",
+                zeroline=False,
+                range=custom_y_ranges.get(left_feature),
+            )
+            fig.update_yaxes(
+                title_text=column_label(right_feature),
+                secondary_y=True,
+                showgrid=False,
+                zeroline=False,
+                range=custom_y_ranges.get(right_feature),
+            )
+            fig = add_manual_events_to_plotly(fig, [left_feature])
+            return fig
 
         if mode == "Separate panels like report":
             show_chart_legend = len(series_values) > 1
@@ -2295,6 +2479,8 @@ if selected_features and not filtered.empty:
         config={
             "responsive": True,
             "displaylogo": False,
+            "editable": bool(enable_drag_annotations),
+            "edits": {"annotationPosition": bool(enable_drag_annotations)},
             "toImageButtonOptions": {"format": "png", "scale": 3},
         },
     )
@@ -2315,6 +2501,9 @@ if selected_features and not filtered.empty:
         """Label points that matter for a printed chart."""
         g2 = g.reset_index(drop=True)
         n = len(g2)
+        if value_label_mode != "Hourly + min/max - best for reports":
+            return label_indices(n, value_label_mode)
+
         idxs = {0, n - 1} if n else set()
 
         y = pd.to_numeric(g2[feature], errors="coerce").reset_index(drop=True)
@@ -2389,12 +2578,13 @@ if selected_features and not filtered.empty:
                         )
 
                         idxs = chart_label_indices_for_export(g, feature)
-                        max_lbl = 16 if chart_view_mode == "Mobile-friendly" else 24
-                        if len(idxs) > max_lbl:
-                            keep = sorted(idxs)
-                            step = max(1, len(keep) // max_lbl)
-                            idxs = set(keep[::step])
-                            idxs.update({0, len(g) - 1})
+                        if value_label_mode in ["Hourly + min/max - best for reports", "Auto sparse - recommended"]:
+                            max_lbl = 16 if chart_view_mode == "Mobile-friendly" else 24
+                            if len(idxs) > max_lbl:
+                                keep = sorted(idxs)
+                                step = max(1, len(keep) // max_lbl)
+                                idxs = set(keep[::step])
+                                idxs.update({0, len(g) - 1})
                         for i in sorted(idxs):
                             if i >= len(g) or pd.isna(y.iloc[i]):
                                 continue
@@ -2716,14 +2906,16 @@ if selected_features and not filtered.empty:
                 note_col = note_color(idx + len(plot_intervals or []))
                 y_frac = max(0.56, base_frac - 0.08 * min(level, 4))
                 ax.axvline(event["plot_x"], color=note_col, linestyle="--", linewidth=1.5, alpha=0.78)
+                rotation = 90 if event_label_style in ["Auto staggered", "Vertical labels"] else 0
+                ha = "right" if rotation else "center"
                 ax.text(
                     event["plot_x"],
                     y_frac,
                     event["label"],
                     transform=ax.get_xaxis_transform(),
-                    rotation=90,
+                    rotation=rotation,
                     va="top",
-                    ha="right",
+                    ha=ha,
                     fontsize=event_font_size,
                     color=note_col,
                     bbox=dict(boxstyle="round,pad=0.15", fc="white", ec=note_col, alpha=0.82),
@@ -2872,12 +3064,13 @@ if selected_features and not filtered.empty:
                     )
 
                     idxs = chart_label_indices_for_export(g, feature)
-                    max_lbl = 14 if chart_view_mode == "Mobile-friendly" else 22
-                    if len(idxs) > max_lbl:
-                        keep = sorted(idxs)
-                        step = max(1, len(keep) // max_lbl)
-                        idxs = set(keep[::step])
-                        idxs.update({0, len(g) - 1})
+                    if value_label_mode in ["Hourly + min/max - best for reports", "Auto sparse - recommended"]:
+                        max_lbl = 14 if chart_view_mode == "Mobile-friendly" else 22
+                        if len(idxs) > max_lbl:
+                            keep = sorted(idxs)
+                            step = max(1, len(keep) // max_lbl)
+                            idxs = set(keep[::step])
+                            idxs.update({0, len(g) - 1})
                     for i in sorted(idxs):
                         if i >= len(g) or pd.isna(y.iloc[i]):
                             continue

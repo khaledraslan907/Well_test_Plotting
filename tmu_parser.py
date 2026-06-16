@@ -475,11 +475,11 @@ def canonical_candidate_score(canon: str, column_name: str) -> int:
         score += 20
     if canon == "gas_formation_mmscfd" and ("formation gas" in c or "gas formation" in c):
         score += 30
-    if canon == "pumping_pressure_psi" and ("pump p" in c or "pumping p" in c or "pump pressure" in c):
+    if canon == "pumping_pressure_psi" and ("pump p" in c or "pumping p" in c or "pumping.p" in c or "pump.p" in c or "pump pressure" in c or "pumping pressure" in c):
         score += 25
     if canon == "gas_formation_mmscfd" and ("formation gas" in c or "gas formation" in c):
         score += 30
-    if canon == "pumping_pressure_psi" and ("pump p" in c or "pumping p" in c or "pump pressure" in c):
+    if canon == "pumping_pressure_psi" and ("pump p" in c or "pumping p" in c or "pumping.p" in c or "pump.p" in c or "pump pressure" in c or "pumping pressure" in c):
         score += 25
     if canon == "sep_p_psi" and ("sep" in c or "separator" in c):
         score += 20
@@ -754,7 +754,7 @@ def best_canonical_name(column_name: str) -> Optional[str]:
         return "sep_p_psi"
     if " dp " in f" {c} " or (re.search(r"\bdiff\b", c) and ("h2o" in c or "mbar" in c)):
         return "dp_mbar" if "mbar" in c else "sep_dp_inh2o"
-    if re.search(r"\bpump\s*p\b|\bpumping\s*p\b|pumping pressure|pump pressure|circulation pressure", c):
+    if re.search(r"\bpump\s*[.\-/ ]?\s*p\b|\bpumping\s*[.\-/ ]?\s*p\b|pumping[. ]*pressure|pump[. ]*pressure|circulation pressure", c):
         return "pumping_pressure_psi"
     if re.search(r"\bct pressure\b|ct press", c):
         return "ct_pressure_psi"
@@ -1958,7 +1958,7 @@ def parse_tmu_message(message: str, source_name: str = "WhatsApp_Text") -> Dict[
         "h2s_ppm": [r"\bh2s\b"],
         "co2_mole_pct": [r"\bco2\b", r"\bco₂\b"],
         "water_cum_bbl": [r"\bwater cum\b", r"\bwater cumulative\b"],
-        "pumping_pressure_psi": [r"\bpumping\s*p\b", r"\bpumping pressure\b", r"\bpump pressure\b"],
+        "pumping_pressure_psi": [r"\bpumping\s*[.\-/ ]?\s*p\b", r"\bpumping pressure\b", r"\bpump pressure\b"],
         "n2_rate_scfm": [r"\bn2 standard rate\b", r"\bn2 rate\b", r"\bnitrogen rate\b"],
         "note": [r"\bnote\b"],
     }

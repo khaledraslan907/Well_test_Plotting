@@ -1,0 +1,12 @@
+v47 changes:
+- Test gap can now be effectively unlimited: added "Keep same well as one test regardless of time gap" and expanded gap limit up to 8760 hours.
+- Removed the visible "Choose tests / periods" filter. Tests are still detected internally but the sidebar workflow now filters by well + time range.
+- Removed Aligned elapsed wording from the X-axis help text.
+- Fixed pumping pressure detection in Excel headers like "pumping.p / psi".
+- Added plot style: "Overlay two features with secondary Y-axis" with left/right Y-axis feature selectors.
+- Replaced "Every 4 readings" label mode with "Every 20 readings"; kept Every 8 readings.
+- Export labels now respect the selected value-label mode instead of forcing the old sparse export logic.
+- Added per-feature number label decimals so one graph can use 0 decimals and another can use 1 or 2 decimals.
+- Added display label overrides so users can rename chart/table labels without changing parser field names.
+- Added event label layout options and optional draggable annotations in the interactive Plotly chart.
+- Added cached upload parsing to speed up Streamlit reruns; OCR is OFF by default to reduce slowdowns on large WhatsApp ZIPs.
