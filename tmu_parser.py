@@ -4917,7 +4917,8 @@ def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: 
 import zipfile as _zipfile_v53
 import xml.etree.ElementTree as _ET_v53
 
-PARSER_BUILD_ID_V53 = "v53-safe-xlsx-dedupe-20260621"
+PARSER_BUILD_ID_V53 = "v54-safe-xlsx-object-dtype-20260621"
+PARSER_BUILD_ID_V54 = "v54-safe-xlsx-object-dtype-20260621"
 
 # Internal bookkeeping columns must never appear as plot features.
 try:
@@ -5076,7 +5077,17 @@ def _excel_serial_time_v53(value):
 def _normalize_excel_date_time_columns_v53(raw: pd.DataFrame) -> pd.DataFrame:
     if raw is None or raw.empty:
         return raw
-    out = raw.copy()
+    # Pandas 3 / Python 3.14 may infer Arrow-backed string columns. Assigning
+    # Timestamp or datetime.time values into those columns raises:
+    #   TypeError: Invalid value for dtype 'str'
+    # Rebuild the raw worksheet as a true object-dtype frame before converting
+    # Excel serial dates/times. Mixed Excel cells are expected here.
+    out = pd.DataFrame(
+        raw.to_numpy(dtype=object, copy=True),
+        index=raw.index.copy(),
+        columns=raw.columns.copy(),
+        dtype=object,
+    )
     date_cols = []
     time_cols = []
     header_end_by_col = {}
@@ -5098,10 +5109,12 @@ def _normalize_excel_date_time_columns_v53(raw: pd.DataFrame) -> pd.DataFrame:
         time_cols = [1]
     for c in sorted(set(date_cols)):
         start = header_end_by_col.get(c, 0) + 1
-        out.iloc[start:, c] = out.iloc[start:, c].map(_excel_serial_date_v53)
+        converted = out.iloc[start:, c].map(_excel_serial_date_v53).astype(object)
+        out.loc[out.index[start:], out.columns[c]] = converted.to_numpy(dtype=object)
     for c in sorted(set(time_cols)):
         start = header_end_by_col.get(c, 0) + 1
-        out.iloc[start:, c] = out.iloc[start:, c].map(_excel_serial_time_v53)
+        converted = out.iloc[start:, c].map(_excel_serial_time_v53).astype(object)
+        out.loc[out.index[start:], out.columns[c]] = converted.to_numpy(dtype=object)
     return out
 
 
@@ -5121,7 +5134,7 @@ def _raw_dataframe_from_sheet_xml_v53(zf, sheet_path: str, shared_strings: list,
     matrix = [[None] * max_c for _ in range(max_r)]
     for (r, c), v in sparse.items():
         matrix[r - 1][c - 1] = v
-    raw = pd.DataFrame(matrix)
+    raw = pd.DataFrame(matrix, dtype=object)
     raw = raw.dropna(how="all").dropna(axis=1, how="all")
     return _normalize_excel_date_time_columns_v53(raw)
 

@@ -52,7 +52,7 @@ available_numeric_columns = _tmu_parser.available_numeric_columns
 _parser_column_label = _tmu_parser.column_label
 load_tabular_file = _tmu_parser.load_tabular_file
 parse_many_tmu_messages = _tmu_parser.parse_many_tmu_messages
-PARSER_BUILD_ID = getattr(_tmu_parser, 'PARSER_BUILD_ID_V53', getattr(_tmu_parser, 'PARSER_BUILD_ID', 'v53'))
+PARSER_BUILD_ID = getattr(_tmu_parser, 'PARSER_BUILD_ID_V54', getattr(_tmu_parser, 'PARSER_BUILD_ID_V53', getattr(_tmu_parser, 'PARSER_BUILD_ID', 'v54')))
 assign_test_ids = getattr(_tmu_parser, "assign_test_ids", lambda df, gap_hours=12.0: df)
 
 DISPLAY_LABEL_FILE = Path(__file__).with_name("user_display_labels.json")

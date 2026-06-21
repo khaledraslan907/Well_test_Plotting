@@ -1,0 +1,10 @@
+Validation completed on the 17 uploaded B15-38 XLSX files.
+
+Result:
+- 17/17 files parsed successfully.
+- 753 source rows loaded.
+- 500 unique well + minute rows after merge.
+- 253 repeated rows merged.
+- The large workbook with an inflated used range parsed through the bounded XML reader.
+
+The test also confirmed that incomplete and final versions are merged by normalized well and timestamp while filling missing values from the more complete row.
