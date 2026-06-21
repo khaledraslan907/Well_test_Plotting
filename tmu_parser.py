@@ -4903,3 +4903,412 @@ def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: 
         fixed_tables = force_restore_pumping_pressure_v52(fixed_tables, pump_df)
         fixed_tables = [ensure_pumping_pressure_column_v48(t) for t in fixed_tables if t is not None and not t.empty]
     return fixed_tables
+
+# =============================================================================
+# v53 — safe XLSX preflight / fast XML loader + cross-file de-duplication
+# =============================================================================
+# Why this exists:
+# Some field workbooks have an accidentally inflated Excel used range such as
+# A1:FU1048518 or A1:XFC56.  pandas/openpyxl may allocate or scan the entire
+# range, which can exhaust Streamlit Cloud memory and show the generic
+# "Oh no. Error running app" page.  v53 detects those workbooks before the
+# normal loader and reads only non-empty XML cells in a bounded data region.
+
+import zipfile as _zipfile_v53
+import xml.etree.ElementTree as _ET_v53
+
+PARSER_BUILD_ID_V53 = "v53-safe-xlsx-dedupe-20260621"
+
+# Internal bookkeeping columns must never appear as plot features.
+try:
+    BASE_NON_PLOT_COLS.update({
+        "_upload_order", "_table_order", "_source_row_order",
+        "_well_key_v53", "_datetime_key_v53", "_completeness_v53",
+    })
+except Exception:
+    pass
+
+
+def _xlsx_col_number_v53(col_letters: str) -> int:
+    n = 0
+    for ch in str(col_letters or "").upper():
+        if "A" <= ch <= "Z":
+            n = n * 26 + (ord(ch) - 64)
+    return n
+
+
+def _xlsx_ref_parts_v53(ref: str):
+    m = re.match(r"^([A-Za-z]+)(\d+)$", str(ref or ""))
+    if not m:
+        return 0, 0
+    return int(m.group(2)), _xlsx_col_number_v53(m.group(1))
+
+
+def _xlsx_dimension_parts_v53(ref: str):
+    last = str(ref or "A1").split(":")[-1]
+    return _xlsx_ref_parts_v53(last)
+
+
+def xlsx_preflight_v53(data: bytes) -> dict:
+    """Inspect XLSX dimensions without loading cells into pandas/openpyxl."""
+    result = {
+        "is_xlsx": False,
+        "suspicious": False,
+        "max_declared_row": 0,
+        "max_declared_col": 0,
+        "sheet_xml_uncompressed": 0,
+        "reasons": [],
+    }
+    try:
+        with _zipfile_v53.ZipFile(io.BytesIO(data)) as zf:
+            result["is_xlsx"] = True
+            for info in zf.infolist():
+                if not (info.filename.startswith("xl/worksheets/sheet") and info.filename.endswith(".xml")):
+                    continue
+                result["sheet_xml_uncompressed"] += int(info.file_size or 0)
+                try:
+                    with zf.open(info.filename) as fh:
+                        head = fh.read(32768)
+                    m = re.search(br"<dimension\s+ref=\"([^\"]+)\"", head)
+                    if m:
+                        r, c = _xlsx_dimension_parts_v53(m.group(1).decode("utf-8", errors="ignore"))
+                        result["max_declared_row"] = max(result["max_declared_row"], r)
+                        result["max_declared_col"] = max(result["max_declared_col"], c)
+                except Exception:
+                    pass
+    except Exception:
+        return result
+
+    # These limits are far above normal TMU sheets but below pathological Excel
+    # used ranges.  Actual non-empty cells outside the bounds are exceptionally
+    # unlikely for production-test sheets.
+    if result["max_declared_row"] > 20000:
+        result["reasons"].append("inflated row dimension")
+    if result["max_declared_col"] > 512:
+        result["reasons"].append("inflated column dimension")
+    if result["sheet_xml_uncompressed"] > 25_000_000:
+        result["reasons"].append("very large worksheet XML")
+    result["suspicious"] = bool(result["reasons"])
+    return result
+
+
+def _read_shared_strings_fast_v53(zf) -> list:
+    try:
+        root = _ET_v53.fromstring(zf.read("xl/sharedStrings.xml"))
+    except Exception:
+        return []
+    ns_uri = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    out = []
+    for si in root.findall(ns_uri + "si"):
+        out.append("".join((t.text or "") for t in si.findall(".//" + ns_uri + "t")))
+    return out
+
+
+def _iter_sheet_cells_limited_v53(zf, sheet_path: str, shared_strings: list,
+                                  max_rows: int = 20000, max_cols: int = 512):
+    """Yield non-empty cells, stopping before inflated empty worksheet tails."""
+    ns_uri = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    with zf.open(sheet_path) as fh:
+        for _, elem in _ET_v53.iterparse(fh, events=("end",)):
+            if elem.tag != ns_uri + "c":
+                continue
+            row, col = _xlsx_ref_parts_v53(elem.attrib.get("r", ""))
+            if row <= 0 or col <= 0:
+                elem.clear()
+                continue
+            # Excel serializes cells in row order. Once the bound is exceeded,
+            # the remaining million-row formatted tail can be ignored safely.
+            if row > max_rows:
+                elem.clear()
+                break
+            if col > max_cols:
+                elem.clear()
+                continue
+            typ = elem.attrib.get("t")
+            value = None
+            if typ == "inlineStr":
+                value = "".join((tn.text or "") for tn in elem.findall(".//" + ns_uri + "t"))
+            else:
+                vnode = elem.find(ns_uri + "v")
+                if vnode is not None and vnode.text is not None:
+                    raw = vnode.text
+                    if typ == "s":
+                        try:
+                            value = shared_strings[int(float(raw))]
+                        except Exception:
+                            value = raw
+                    elif typ == "b":
+                        value = str(raw).strip() == "1"
+                    else:
+                        value = raw
+            if value not in (None, ""):
+                yield row, col, value
+            elem.clear()
+
+
+def _excel_serial_date_v53(value):
+    try:
+        f = float(str(value).strip())
+    except Exception:
+        return value
+    if 1000 < f < 100000:
+        try:
+            return pd.Timestamp("1899-12-30") + pd.to_timedelta(f, unit="D")
+        except Exception:
+            return value
+    return value
+
+
+def _excel_serial_time_v53(value):
+    try:
+        f = float(str(value).strip())
+    except Exception:
+        return value
+    if 0 <= f < 2:
+        try:
+            seconds = int(round((f % 1.0) * 86400)) % 86400
+            return (pd.Timestamp("1900-01-01") + pd.Timedelta(seconds=seconds)).time()
+        except Exception:
+            return value
+    return value
+
+
+def _normalize_excel_date_time_columns_v53(raw: pd.DataFrame) -> pd.DataFrame:
+    if raw is None or raw.empty:
+        return raw
+    out = raw.copy()
+    date_cols = []
+    time_cols = []
+    header_end_by_col = {}
+    for r in range(min(30, len(out))):
+        for c in range(out.shape[1]):
+            txt = clean_header(out.iat[r, c])
+            if not txt:
+                continue
+            if re.search(r"(^|\b)date($|\b)|d/mm|d-mmm|yyyy", txt):
+                date_cols.append(c)
+                header_end_by_col[c] = max(header_end_by_col.get(c, 0), r)
+            if re.search(r"(^|\b)time($|\b)|hh:mm", txt):
+                time_cols.append(c)
+                header_end_by_col[c] = max(header_end_by_col.get(c, 0), r)
+    # Field templates overwhelmingly use A/B even if a merged header was missed.
+    if not date_cols and out.shape[1] >= 1:
+        date_cols = [0]
+    if not time_cols and out.shape[1] >= 2:
+        time_cols = [1]
+    for c in sorted(set(date_cols)):
+        start = header_end_by_col.get(c, 0) + 1
+        out.iloc[start:, c] = out.iloc[start:, c].map(_excel_serial_date_v53)
+    for c in sorted(set(time_cols)):
+        start = header_end_by_col.get(c, 0) + 1
+        out.iloc[start:, c] = out.iloc[start:, c].map(_excel_serial_time_v53)
+    return out
+
+
+def _raw_dataframe_from_sheet_xml_v53(zf, sheet_path: str, shared_strings: list,
+                                      max_rows: int = 20000, max_cols: int = 512):
+    sparse = {}
+    max_r = 0
+    max_c = 0
+    for r, c, v in _iter_sheet_cells_limited_v53(
+        zf, sheet_path, shared_strings, max_rows=max_rows, max_cols=max_cols
+    ):
+        sparse[(r, c)] = v
+        max_r = max(max_r, r)
+        max_c = max(max_c, c)
+    if not sparse or max_r <= 0 or max_c <= 0:
+        return pd.DataFrame()
+    matrix = [[None] * max_c for _ in range(max_r)]
+    for (r, c), v in sparse.items():
+        matrix[r - 1][c - 1] = v
+    raw = pd.DataFrame(matrix)
+    raw = raw.dropna(how="all").dropna(axis=1, how="all")
+    return _normalize_excel_date_time_columns_v53(raw)
+
+
+def _load_suspicious_xlsx_fast_v53(data: bytes, name: str) -> List[pd.DataFrame]:
+    tables = []
+    try:
+        with _zipfile_v53.ZipFile(io.BytesIO(data)) as zf:
+            shared = _read_shared_strings_fast_v53(zf)
+            sheet_paths = _workbook_sheet_paths_v52(zf)
+            for sheet_name, sheet_path in sheet_paths:
+                raw = _raw_dataframe_from_sheet_xml_v53(zf, sheet_path, shared)
+                if raw is None or raw.empty:
+                    continue
+                default_well = extract_well_from_raw(raw, source_name=name, sheet_name=str(sheet_name))
+                candidates = parse_excel_sheet_attempts(
+                    raw, source_name=name, sheet_name=str(sheet_name), default_well=default_well
+                )
+                if candidates:
+                    best = candidates[0].copy()
+                    best["source_type"] = "excel_fast_xml_v53"
+                    tables.append(best)
+    except Exception as exc:
+        raise RuntimeError(f"Safe XML parser could not read {name}: {exc}")
+    return filter_usable_tables(filter_preferred_tables(tables))
+
+
+def _missing_value_v53(value) -> bool:
+    if value is None:
+        return True
+    try:
+        if pd.isna(value):
+            return True
+    except Exception:
+        pass
+    if isinstance(value, str) and value.strip().lower() in {"", "nan", "nat", "none", "unknown"}:
+        return True
+    return False
+
+
+def _normalized_well_key_v53(value) -> str:
+    try:
+        key = _clean_merge_well_v51(value)
+    except Exception:
+        key = str(value or "").strip().upper()
+    key = re.sub(r"\s+", "", str(key or "").upper()).replace("_", "-")
+    key = re.sub(r"-+", "-", key).strip("-*")
+    if key in {"", "UNKNOWN", "NAN", "NONE", "*"}:
+        return ""
+    return key
+
+
+def merge_duplicate_test_rows_v53(df: pd.DataFrame) -> pd.DataFrame:
+    """Merge repeated uploads by normalized well + minute timestamp.
+
+    A later/complete report often repeats rows from an earlier incomplete report.
+    For each duplicate timestamp, keep the most complete row, then fill any gaps
+    from the other copies. Conflicting populated values stay with the most
+    complete row; ties prefer the later uploaded file.
+    """
+    if df is None or df.empty or "datetime" not in df.columns:
+        return df
+    out = df.copy().reset_index(drop=True)
+    if "well" not in out.columns:
+        out["well"] = "Unknown"
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+    out["_source_row_order"] = np.arange(len(out), dtype=int)
+    if "_upload_order" not in out.columns:
+        out["_upload_order"] = 0
+    if "_table_order" not in out.columns:
+        out["_table_order"] = 0
+    out["_well_key_v53"] = out["well"].map(_normalized_well_key_v53)
+    out["_datetime_key_v53"] = out["datetime"].dt.floor("min")
+
+    numeric_cols = [
+        c for c in available_numeric_columns(out)
+        if not str(c).startswith("_") and c not in {"duplicate_rows_merged"}
+    ]
+    canonical_cols = [c for c in numeric_cols if not str(c).startswith("raw__")]
+    raw_cols = [c for c in numeric_cols if str(c).startswith("raw__")]
+    canonical_score = out[canonical_cols].notna().sum(axis=1) * 3 if canonical_cols else 0
+    raw_score = out[raw_cols].notna().sum(axis=1) if raw_cols else 0
+    out["_completeness_v53"] = canonical_score + raw_score
+
+    valid_key = (
+        out["_well_key_v53"].astype(str).str.len().gt(0)
+        & out["_datetime_key_v53"].notna()
+    )
+    keep_records = []
+    used = set()
+
+    # Only group rows that have a trustworthy well and time. Unknown/NaT rows are
+    # kept separately to avoid accidental cross-well merges.
+    grouped = out.loc[valid_key].groupby(["_well_key_v53", "_datetime_key_v53"], sort=False, dropna=False)
+    for (_, dt_key), group in grouped:
+        idxs = list(group.index)
+        used.update(idxs)
+        if len(idxs) == 1:
+            rec = out.loc[idxs[0]].copy()
+            rec["datetime"] = dt_key
+            keep_records.append(rec)
+            continue
+        ranked = group.sort_values(
+            ["_completeness_v53", "_upload_order", "_table_order", "_source_row_order"],
+            ascending=[False, False, False, False],
+            kind="stable",
+        )
+        base = ranked.iloc[0].copy()
+        notes = []
+        for _, row in ranked.iterrows():
+            for c in out.columns:
+                if c in {"_well_key_v53", "_datetime_key_v53", "_completeness_v53"}:
+                    continue
+                val = row.get(c)
+                if c == "note":
+                    if not _missing_value_v53(val):
+                        txt = str(val).strip()
+                        if txt and txt not in notes:
+                            notes.append(txt)
+                    continue
+                if _missing_value_v53(base.get(c)) and not _missing_value_v53(val):
+                    base[c] = val
+        if notes:
+            base["note"] = "; ".join(notes)
+        base["datetime"] = dt_key
+        base["date"] = pd.Timestamp(dt_key).normalize()
+        base["time_text"] = pd.Timestamp(dt_key).strftime("%H:%M")
+        keep_records.append(base)
+
+    for idx in out.index:
+        if idx not in used:
+            keep_records.append(out.loc[idx].copy())
+
+    if not keep_records:
+        return out.drop(columns=["_well_key_v53", "_datetime_key_v53", "_completeness_v53", "_source_row_order"], errors="ignore")
+    result = pd.DataFrame(keep_records)
+    result = result.sort_values(["well", "datetime", "_upload_order", "_source_row_order"], na_position="last", kind="stable")
+    result = result.drop(columns=["_well_key_v53", "_datetime_key_v53", "_completeness_v53", "_source_row_order"], errors="ignore")
+    return result.reset_index(drop=True)
+
+
+# Final loader override. Keep the prior v52 loader for normal workbooks and use
+# bounded XML parsing only for suspicious/inflated XLSX files.
+_load_tabular_file_v52_before_v53 = load_tabular_file
+
+def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: int = 1000) -> List[pd.DataFrame]:
+    data, name = _uploaded_bytes_v49(uploaded_file)
+    suffix = str(name).split(".")[-1].lower()
+    if suffix == "xlsx":
+        preflight = xlsx_preflight_v53(data)
+        if preflight.get("suspicious"):
+            tables = _load_suspicious_xlsx_fast_v53(data, name)
+            # XML-only pump rescue is safe even for inflated worksheets. Do not
+            # invoke pandas/openpyxl fallbacks on these files.
+            try:
+                pump_df = _extract_pumping_pressure_from_xlsx_xml_v52(data, name)
+            except Exception:
+                pump_df = pd.DataFrame()
+            tables = force_restore_pumping_pressure_v52(tables, pump_df)
+            return [ensure_pumping_pressure_column_v48(t) for t in tables if t is not None and not t.empty]
+    return _load_tabular_file_v52_before_v53(
+        UploadedBytes(data, name), parse_images=parse_images, max_ocr_images=max_ocr_images
+    )
+
+# v53.1: use the bounded XML reader as the primary path for every XLSX.  This
+# avoids slow openpyxl/pandas behaviour not only for million-row used ranges but
+# also for files with accidental XFC column formatting.  Normal loader remains a
+# fallback only for non-suspicious XLSX files when XML parsing finds no table.
+_load_tabular_file_v53_prefer_xml_previous = load_tabular_file
+
+def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: int = 1000) -> List[pd.DataFrame]:
+    data, name = _uploaded_bytes_v49(uploaded_file)
+    suffix = str(name).split(".")[-1].lower()
+    if suffix == "xlsx":
+        preflight = xlsx_preflight_v53(data)
+        tables = _load_suspicious_xlsx_fast_v53(data, name)
+        try:
+            pump_df = _extract_pumping_pressure_from_xlsx_xml_v52(data, name)
+        except Exception:
+            pump_df = pd.DataFrame()
+        if tables:
+            tables = force_restore_pumping_pressure_v52(tables, pump_df)
+            return [ensure_pumping_pressure_column_v48(t) for t in tables if t is not None and not t.empty]
+        # Never send a suspicious workbook into pandas/openpyxl after the safe
+        # parser fails; returning no table is safer than crashing the whole app.
+        if preflight.get("suspicious"):
+            return []
+    return _load_tabular_file_v53_prefer_xml_previous(
+        UploadedBytes(data, name), parse_images=parse_images, max_ocr_images=max_ocr_images
+    )

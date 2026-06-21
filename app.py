@@ -4,6 +4,7 @@ import json
 import re
 import zipfile
 import traceback
+import gc
 from pathlib import Path
 from typing import Optional
 
@@ -51,7 +52,7 @@ available_numeric_columns = _tmu_parser.available_numeric_columns
 _parser_column_label = _tmu_parser.column_label
 load_tabular_file = _tmu_parser.load_tabular_file
 parse_many_tmu_messages = _tmu_parser.parse_many_tmu_messages
-PARSER_BUILD_ID = getattr(_tmu_parser, 'PARSER_BUILD_ID', 'v51')
+PARSER_BUILD_ID = getattr(_tmu_parser, 'PARSER_BUILD_ID_V53', getattr(_tmu_parser, 'PARSER_BUILD_ID', 'v53'))
 assign_test_ids = getattr(_tmu_parser, "assign_test_ids", lambda df, gap_hours=12.0: df)
 
 DISPLAY_LABEL_FILE = Path(__file__).with_name("user_display_labels.json")
@@ -654,20 +655,39 @@ frames = []
 errors = []
 
 if uploaded_files:
-    for f in uploaded_files:
+    upload_progress = st.progress(0.0, text="Reading uploaded files...") if len(uploaded_files) > 1 else None
+    for upload_order, f in enumerate(uploaded_files):
         try:
+            if upload_progress is not None:
+                upload_progress.progress(
+                    upload_order / max(len(uploaded_files), 1),
+                    text=f"Reading {upload_order + 1}/{len(uploaded_files)}: {f.name}",
+                )
             file_bytes = f.getvalue()
             parsed_tables = cached_load_uploaded_file(
                 f.name, file_bytes, bool(enable_ctu_ocr), int(max_ocr_images), PARSER_BUILD_ID
             )
             if parsed_tables:
-                frames.extend(parsed_tables)
+                for table_order, table in enumerate(parsed_tables):
+                    if table is None or table.empty:
+                        continue
+                    table = table.copy()
+                    table["_upload_order"] = int(upload_order)
+                    table["_table_order"] = int(table_order)
+                    frames.append(table)
             else:
                 errors.append(f"{f.name}: no usable time-series table detected. The file may be blank, or it has no date/time plus numeric readings after all parsers were tried.")
         except Exception as e:
             errors.append(f"{f.name}: {e}")
             with st.expander(f"Technical error details for {f.name}", expanded=False):
                 st.code(traceback.format_exc())
+        finally:
+            # Release temporary workbook/XML objects before the next file. This
+            # is important on Streamlit Community Cloud when many Excel files
+            # are uploaded together.
+            gc.collect()
+    if upload_progress is not None:
+        upload_progress.progress(1.0, text="Uploaded files parsed")
 
 if whatsapp_text.strip():
     try:
@@ -687,6 +707,20 @@ if not frames:
     st.stop()
 
 data = pd.concat(frames, ignore_index=True, sort=False)
+
+# Merge repeated/incomplete reports before assigning tests. The same well and
+# minute timestamp becomes one row: the most complete upload wins and missing
+# fields are filled from the other copy. Unknown wells or missing timestamps are
+# never merged automatically.
+rows_before_dedup = len(data)
+try:
+    if hasattr(_tmu_parser, "merge_duplicate_test_rows_v53"):
+        data = _tmu_parser.merge_duplicate_test_rows_v53(data)
+except Exception as dedup_error:
+    errors.append(f"Duplicate-row merge was skipped: {dedup_error}")
+rows_merged = max(0, rows_before_dedup - len(data))
+if rows_merged:
+    st.caption(f"Merged {rows_merged:,} repeated row(s) with the same well and date/time, keeping the most complete values.")
 
 # Test segmentation: same well continues until the selected gap is exceeded;
 # a different well is always a separate test stream.
