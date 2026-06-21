@@ -53,7 +53,7 @@ available_numeric_columns = _tmu_parser.available_numeric_columns
 _parser_column_label = _tmu_parser.column_label
 load_tabular_file = _tmu_parser.load_tabular_file
 parse_many_tmu_messages = _tmu_parser.parse_many_tmu_messages
-PARSER_BUILD_ID = getattr(_tmu_parser, 'PARSER_BUILD_ID_V57', getattr(_tmu_parser, 'PARSER_BUILD_ID_V56', getattr(_tmu_parser, 'PARSER_BUILD_ID_V55', getattr(_tmu_parser, 'PARSER_BUILD_ID', 'v57'))))
+PARSER_BUILD_ID = getattr(_tmu_parser, 'PARSER_BUILD_ID_V58', getattr(_tmu_parser, 'PARSER_BUILD_ID_V57', getattr(_tmu_parser, 'PARSER_BUILD_ID_V56', getattr(_tmu_parser, 'PARSER_BUILD_ID_V55', getattr(_tmu_parser, 'PARSER_BUILD_ID', 'v58')))))
 assign_test_ids = getattr(_tmu_parser, "assign_test_ids", lambda df, gap_hours=12.0: df)
 
 DISPLAY_LABEL_FILE = Path(__file__).with_name("user_display_labels.json")
@@ -72,16 +72,65 @@ def save_display_label_overrides(overrides: dict) -> None:
     DISPLAY_LABEL_FILE.write_text(json.dumps(safe, indent=2, sort_keys=True), encoding="utf-8")
 
 def column_label(col) -> str:
-    # The unified choke field keeps one stable internal name while its displayed
-    # engineering unit follows the user's selected conversion target.
+    # Stable internal feature names are kept while only the displayed unit changes.
+    # This prevents feature selections from resetting when the user changes units.
     if str(col) == "choke_unified":
         return str(st.session_state.get("choke_unified_label", "Unified Choke"))
     overrides = st.session_state.get("display_label_overrides")
     if overrides is None:
         overrides = load_display_label_overrides()
         st.session_state["display_label_overrides"] = overrides
-    return str(overrides.get(str(col), _parser_column_label(col)))
+    base = str(overrides.get(str(col), _parser_column_label(col)))
+    unit_labels = st.session_state.get("unit_display_labels", {}) or {}
+    return str(unit_labels.get(str(col), base))
 
+
+
+PRESSURE_COLUMNS_PSI = {
+    "whp_psi", "flp_psi", "flow_press_psi", "sep_p_psi", "pumping_pressure_psi",
+    "ctu_wellhead_pressure_psi", "ctu_circulation_pressure_psi", "ct_pressure_psi",
+    "ds_press_psi", "us_press_psi", "pump_intake_pressure_psi",
+    "pump_discharge_pressure_psi", "pi_psi", "pd_psi",
+    "u2_pass_side_pump_pressure_psi",
+}
+
+def _replace_unit_in_label(label: str, unit_text: str) -> str:
+    txt = re.sub(r"\s*\((?:psi|bar|°C|°F|C|F)\)\s*$", "", str(label), flags=re.I).strip()
+    return f"{txt} ({unit_text})"
+
+def apply_display_unit_conversions(df: pd.DataFrame, pressure_unit: str, temperature_unit: str) -> pd.DataFrame:
+    """Convert only the working display copy; parser/source values remain cached unchanged."""
+    if df is None or df.empty:
+        st.session_state["unit_display_labels"] = {}
+        return df
+    out = df.copy(deep=False)
+    labels = {}
+
+    # Canonical pressure fields are stored in psi by the parser.
+    for col in [c for c in out.columns if c in PRESSURE_COLUMNS_PSI or str(c).endswith("_psi")]:
+        vals = pd.to_numeric(out[col], errors="coerce")
+        if pressure_unit == "bar":
+            out[col] = vals * 0.0689475729
+            labels[col] = _replace_unit_in_label(_parser_column_label(col), "bar")
+        else:
+            out[col] = vals
+            labels[col] = _replace_unit_in_label(_parser_column_label(col), "psi")
+
+    # Temperature field names state their canonical source unit. Keep the same
+    # internal feature key so changing °C/°F cannot reset the selected features.
+    temp_cols = [c for c in out.columns if str(c).endswith("_c") or str(c).endswith("_f")]
+    for col in temp_cols:
+        vals = pd.to_numeric(out[col], errors="coerce")
+        source_is_c = str(col).endswith("_c")
+        if temperature_unit == "°C":
+            out[col] = vals if source_is_c else (vals - 32.0) * (5.0 / 9.0)
+            labels[col] = _replace_unit_in_label(_parser_column_label(col), "°C")
+        elif temperature_unit == "°F":
+            out[col] = vals * (9.0 / 5.0) + 32.0 if source_is_c else vals
+            labels[col] = _replace_unit_in_label(_parser_column_label(col), "°F")
+
+    st.session_state["unit_display_labels"] = labels
+    return out
 
 def canonical_key(s: object) -> str:
     """Stable normalized key for user-taught aliases.
@@ -518,6 +567,59 @@ def compressed_separator_positions(df):
     return seps
 
 
+def detected_test_separator_positions(df):
+    """Return visual boundaries between separate tests/plot segments."""
+    if df is None or df.empty or "plot_x" not in df.columns:
+        return []
+    group_col = "series_group_key" if "series_group_key" in df.columns else ("well" if "well" in df.columns else None)
+    groups = df.groupby(group_col, dropna=False) if group_col else [("All", df)]
+    found = []
+    for _, g in groups:
+        sort_col = "datetime" if "datetime" in g.columns else "plot_x"
+        g = g.sort_values(sort_col).copy()
+        if len(g) < 2:
+            continue
+        prev = g.iloc[0]
+        test_no = 1
+        for i in range(1, len(g)):
+            cur = g.iloc[i]
+            changed_test = ("test_id" in g.columns and str(cur.get("test_id", "")) != str(prev.get("test_id", "")))
+            changed_segment = ("series_segment_id" in g.columns and cur.get("series_segment_id") != prev.get("series_segment_id"))
+            source_cols = [c for c in ["source", "sheet"] if c in g.columns]
+            changed_source = bool(source_cols) and any(str(cur.get(c, "")) != str(prev.get(c, "")) for c in source_cols)
+            if changed_test or changed_segment:
+                x0, x1 = prev.get("plot_x"), cur.get("plot_x")
+                try:
+                    x_sep = x0 + (x1 - x0) / 2
+                except Exception:
+                    try:
+                        x_sep = pd.Timestamp(x0) + (pd.Timestamp(x1) - pd.Timestamp(x0)) / 2
+                    except Exception:
+                        x_sep = x1
+                if changed_test or changed_source:
+                    test_no += 1
+                    sep_label = f"Test {test_no}"
+                else:
+                    sep_label = "Data gap"
+                found.append({"x": x_sep, "label": sep_label})
+            prev = cur
+    dedup, seen = [], set()
+    for item in found:
+        key = str(item.get("x"))
+        if key not in seen:
+            seen.add(key)
+            dedup.append(item)
+    return dedup
+
+def chart_separator_positions(df):
+    items = list(detected_test_separator_positions(df))
+    existing = {str(x.get("x")) for x in items}
+    for x in compressed_separator_positions(df):
+        if str(x) not in existing:
+            items.append({"x": x, "label": "New test"})
+    return items
+
+
 
 st.markdown(
     """
@@ -594,13 +696,8 @@ with st.sidebar:
         accept_multiple_files=True,
         help="Upload normal test files or a WhatsApp exported ZIP. ZIP can contain _chat.txt, Excel/PDF/DOCX/CSV attachments, and CTU screen images.",
     )
-    if st.button("Re-parse uploaded files / clear cache", help="Use this after updating the parser or when a previously uploaded file still shows old detected columns."):
-        st.cache_data.clear()
-        st.session_state.pop("upload_parse_bundle_v57", None)
-        st.session_state.pop("upload_parse_key_v57", None)
-        st.session_state.pop("combined_data_bundle_v57", None)
-        st.session_state.pop("combined_data_key_v57", None)
-        st.rerun()
+    # Parsing caches invalidate automatically when file content or parser build changes.
+    # A manual clear-cache button is intentionally omitted from the normal user workflow.
 
     st.header("2) Test split and CTU image OCR")
     keep_same_well_one_test = st.checkbox(
@@ -668,7 +765,7 @@ frames = []
 errors = []
 
 
-def _uploaded_file_identity_v57(uploaded_file):
+def _uploaded_file_identity_v58(uploaded_file):
     """Fast stable identity without hashing the full workbook on every rerun."""
     name = str(getattr(uploaded_file, "name", "uploaded"))
     size = int(getattr(uploaded_file, "size", 0) or 0)
@@ -692,10 +789,10 @@ if uploaded_files:
         PARSER_BUILD_ID,
         bool(enable_ctu_ocr),
         int(max_ocr_images),
-        tuple(_uploaded_file_identity_v57(f) for f in uploaded_files),
+        tuple(_uploaded_file_identity_v58(f) for f in uploaded_files),
     )
-    cached_bundle = st.session_state.get("upload_parse_bundle_v57")
-    cached_key = st.session_state.get("upload_parse_key_v57")
+    cached_bundle = st.session_state.get("upload_parse_bundle_v58")
+    cached_key = st.session_state.get("upload_parse_key_v58")
 
     if cached_bundle is not None and cached_key == upload_key:
         # UI changes now reuse the already parsed DataFrames directly. This
@@ -736,8 +833,8 @@ if uploaded_files:
         if upload_progress is not None:
             upload_progress.progress(1.0, text="Uploaded files parsed")
 
-        st.session_state["upload_parse_key_v57"] = upload_key
-        st.session_state["upload_parse_bundle_v57"] = {
+        st.session_state["upload_parse_key_v58"] = upload_key
+        st.session_state["upload_parse_bundle_v58"] = {
             "frames": parsed_frames,
             "errors": list(parsed_errors),
         }
@@ -767,11 +864,11 @@ if not frames:
 # Streamlit rerun.
 _whatsapp_key = hashlib.sha1(whatsapp_text.encode("utf-8", errors="ignore")).hexdigest() if whatsapp_text.strip() else ""
 _combined_key = (PARSER_BUILD_ID, upload_key, _whatsapp_key)
-_combined_cached = st.session_state.get("combined_data_bundle_v57")
-_combined_cached_key = st.session_state.get("combined_data_key_v57")
+_combined_cached = st.session_state.get("combined_data_bundle_v58")
+_combined_cached_key = st.session_state.get("combined_data_key_v58")
 
 if _combined_cached is not None and _combined_cached_key == _combined_key:
-    data = _combined_cached["data"].copy(deep=True)
+    data = _combined_cached["data"].copy(deep=False)
     rows_merged = int(_combined_cached.get("rows_merged", 0))
 else:
     data = pd.concat(frames, ignore_index=True, sort=False)
@@ -785,8 +882,8 @@ else:
     except Exception as dedup_error:
         errors.append(f"Duplicate-row merge was skipped: {dedup_error}")
     rows_merged = max(0, rows_before_dedup - len(data))
-    st.session_state["combined_data_key_v57"] = _combined_key
-    st.session_state["combined_data_bundle_v57"] = {
+    st.session_state["combined_data_key_v58"] = _combined_key
+    st.session_state["combined_data_bundle_v58"] = {
         "data": data.copy(deep=True),
         "rows_merged": int(rows_merged),
     }
@@ -929,12 +1026,23 @@ def aggregate_time_data(df, agg_choice):
         return df
 
     pieces = []
-    for well, g in df.dropna(subset=["datetime"]).groupby("well", dropna=False):
+    # Never average two separate tests into one resampling bin. Keep test_id in
+    # the grouping whenever available, then preserve source/report context.
+    agg_group_cols = [c for c in ["well", "test_id"] if c in df.columns]
+    if not agg_group_cols:
+        agg_group_cols = ["well"] if "well" in df.columns else []
+    grouped = df.dropna(subset=["datetime"]).groupby(agg_group_cols, dropna=False) if agg_group_cols else [("All", df.dropna(subset=["datetime"]))]
+    for group_key, g in grouped:
+        if not isinstance(group_key, tuple):
+            group_key = (group_key,)
+        group_meta = dict(zip(agg_group_cols, group_key))
         g = g.sort_values("datetime").set_index("datetime")
         res = g[numeric].resample(rule).mean().dropna(how="all")
         if res.empty:
             continue
-        res["well"] = well
+        res["well"] = group_meta.get("well", "All")
+        if "test_id" in agg_group_cols:
+            res["test_id"] = group_meta.get("test_id", "")
         res["source"] = ", ".join(sorted(set(map(str, g.get("source", pd.Series(dtype=str)).dropna().unique())))) if "source" in g else ""
         res["sheet"] = "Aggregated"
         res = res.reset_index()
@@ -1042,16 +1150,24 @@ def add_plot_axis_columns(df, x_axis_mode, trace_grouping="Auto", continuous_gap
             g0 = out.loc[idx].copy().sort_values("datetime")
             seg_id = 0
             prev_dt = None
+            prev_test = None
+            prev_source = None
             for row_idx, dt in zip(g0.index, pd.to_datetime(g0["datetime"], errors="coerce")):
+                current_test = str(g0.loc[row_idx, "test_id"]) if "test_id" in g0.columns else ""
+                current_source = "|".join(str(g0.loc[row_idx, c]) for c in ["source", "sheet"] if c in g0.columns)
                 if pd.isna(dt):
                     out.loc[row_idx, "series_segment_id"] = seg_id
                     continue
                 if prev_dt is not None:
                     diff_h = max((pd.Timestamp(dt) - pd.Timestamp(prev_dt)).total_seconds() / 3600.0, 0.0)
-                    if diff_h > max(float(continuous_gap_hours or 0), 0.0):
+                    changed_test = bool(current_test and prev_test and current_test != prev_test)
+                    changed_report_after_gap = bool(current_source != prev_source and diff_h > max(float(continuous_gap_hours or 0), 0.0))
+                    if changed_test or changed_report_after_gap or diff_h > max(float(continuous_gap_hours or 0), 0.0):
                         seg_id += 1
                 out.loc[row_idx, "series_segment_id"] = seg_id
                 prev_dt = dt
+                prev_test = current_test
+                prev_source = current_source
 
     if x_axis_mode == "Real calendar time":
         if "datetime" in out.columns and out["datetime"].notna().any():
@@ -1240,7 +1356,50 @@ def convert_intervals_for_plot(operation_intervals, df, x_axis_mode):
 
 
 # ---------------------------------------------------------------------------
-# Unified choke conversion for plotting (v57)
+# Display-unit conversion (v58)
+# ---------------------------------------------------------------------------
+with st.sidebar:
+    st.header("Display units")
+    pressure_display_unit = st.selectbox(
+        "Pressure unit", ["psi", "bar"], index=0, key="pressure_display_unit_v58",
+        help="Changes plot/table display only. Uploaded source values remain unchanged.",
+    )
+    temperature_display_unit = st.selectbox(
+        "Temperature unit", ["Keep detected unit", "°C", "°F"], index=0, key="temperature_display_unit_v58",
+        help="Converts all detected temperature features consistently for display and export.",
+    )
+
+# Keep previously entered custom axis ranges physically consistent when units change.
+_prev_pressure_unit = st.session_state.get("_prev_pressure_display_unit_v58", pressure_display_unit)
+if _prev_pressure_unit != pressure_display_unit:
+    _pressure_factor = 0.0689475729 if (_prev_pressure_unit == "psi" and pressure_display_unit == "bar") else (1.0 / 0.0689475729)
+    for _pc in [c for c in data.columns if c in PRESSURE_COLUMNS_PSI or str(c).endswith("_psi")]:
+        for _prefix in ["ymin_", "ymax_"]:
+            _k = _prefix + feature_key_text(_pc)
+            if _k in st.session_state:
+                try:
+                    st.session_state[_k] = float(st.session_state[_k]) * _pressure_factor
+                except Exception:
+                    pass
+st.session_state["_prev_pressure_display_unit_v58"] = pressure_display_unit
+
+_prev_temp_unit = st.session_state.get("_prev_temperature_display_unit_v58", temperature_display_unit)
+if _prev_temp_unit != temperature_display_unit and _prev_temp_unit in {"°C", "°F"} and temperature_display_unit in {"°C", "°F"}:
+    for _tc in [c for c in data.columns if str(c).endswith("_c") or str(c).endswith("_f")]:
+        for _prefix in ["ymin_", "ymax_"]:
+            _k = _prefix + feature_key_text(_tc)
+            if _k in st.session_state:
+                try:
+                    _v = float(st.session_state[_k])
+                    st.session_state[_k] = (_v * 9.0 / 5.0 + 32.0) if temperature_display_unit == "°F" else ((_v - 32.0) * 5.0 / 9.0)
+                except Exception:
+                    pass
+st.session_state["_prev_temperature_display_unit_v58"] = temperature_display_unit
+
+data = apply_display_unit_conversions(data, pressure_display_unit, temperature_display_unit)
+
+# ---------------------------------------------------------------------------
+# Unified choke conversion for plotting (v58)
 # ---------------------------------------------------------------------------
 # This is a configurable calibration, not a universal choke law.  The default
 # requested by the user is 100% opening = 128/64 in.  The original percentage
@@ -1365,6 +1524,24 @@ if _has_choke_pct or _has_choke_size or _has_choke_ambiguous:
     else:
         data.drop(columns=["choke_unified"], inplace=True, errors="ignore")
         st.session_state["choke_unified_label"] = "Unified Choke"
+
+    # Choke is a step setting. A reported zero while the well is clearly flowing
+    # is usually a blank/template zero, not a closed choke. Treat it as missing,
+    # then carry the nearest stated setting only inside the same detected test.
+    if "choke_unified" in data.columns:
+        _flowing = pd.Series(False, index=data.index)
+        for _fc in ["gross_rate_bpd", "oil_rate_stbd", "water_rate_bpd", "gas_rate_mmscfd", "whp_psi", "flp_psi"]:
+            if _fc in data.columns:
+                _flowing |= pd.to_numeric(data[_fc], errors="coerce").fillna(0).gt(0)
+        _choke_vals = pd.to_numeric(data["choke_unified"], errors="coerce")
+        _suspicious_zero = _choke_vals.eq(0) & _flowing
+        if _suspicious_zero.any():
+            data.loc[_suspicious_zero, "choke_unified"] = np.nan
+        _choke_group_cols = [c for c in ["well", "test_id", "source", "sheet"] if c in data.columns]
+        if _choke_group_cols:
+            data["choke_unified"] = data.groupby(_choke_group_cols, dropna=False)["choke_unified"].transform(
+                lambda x: pd.to_numeric(x, errors="coerce").ffill().bfill()
+            )
 
     with st.sidebar:
         if not choke_plot_mode.startswith("Keep"):
@@ -1550,12 +1727,36 @@ with st.sidebar:
         ] if c in numeric_cols
     ] or numeric_cols[: min(6, len(numeric_cols))]
 
+    feature_state_key = "selected_features_v58"
+    desired_default_features = numeric_cols if select_all_features else default_features
+    select_all_prev_key = "select_all_features_prev_v58"
+    if feature_state_key not in st.session_state:
+        st.session_state[feature_state_key] = list(desired_default_features)
+    elif select_all_features and not st.session_state.get(select_all_prev_key, False):
+        st.session_state[feature_state_key] = list(numeric_cols)
+    else:
+        previous = list(st.session_state.get(feature_state_key, []))
+        # Keep every still-valid selection. If the user previously selected a raw
+        # choke feature and then enables unified choke, preserve intent by using
+        # the stable choke_unified feature instead of resetting all defaults.
+        had_choke = any(x in {"choke_pct", "choke_size_64", "choke_ambiguous", "choke_unified"} for x in previous)
+        reconciled = [x for x in previous if x in numeric_cols]
+        if had_choke and "choke_unified" in numeric_cols and "choke_unified" not in reconciled:
+            reconciled.append("choke_unified")
+        elif had_choke and "choke_unified" not in numeric_cols:
+            for _raw_choke in ["choke_pct", "choke_size_64", "choke_ambiguous"]:
+                if _raw_choke in numeric_cols and _raw_choke not in reconciled:
+                    reconciled.append(_raw_choke)
+        st.session_state[feature_state_key] = reconciled
     selected_features = st.multiselect(
         "Choose features to plot",
         numeric_cols,
-        default=numeric_cols if select_all_features else default_features,
         format_func=column_label,
+        key=feature_state_key,
     )
+    st.session_state[select_all_prev_key] = bool(select_all_features)
+
+    st.caption("Unit changes keep the same selected feature keys. Conversions affect display/export only; source values remain unchanged.")
 
     if selected_tests:
         if len(selected_tests) == 1:
@@ -2247,23 +2448,29 @@ if selected_features and not filtered.empty:
         return _evenly_limit_items(events, max(0, remaining))
 
     def add_compressed_test_separators_to_plotly(fig, features):
-        if not is_compressed_real_date_mode(x_axis_mode):
-            return fig
-
-        for x_sep in compressed_separator_positions(filtered):
+        separators = chart_separator_positions(filtered)
+        for sep_i, item in enumerate(separators):
+            x_sep = item.get("x")
+            if x_sep is None:
+                continue
             for r in range(1, len(features) + 1):
                 try:
                     fig.add_vline(
-                        x=x_sep,
-                        line_width=1.8,
-                        line_dash="dot",
-                        line_color="#64748b",
-                        opacity=0.75,
-                        row=r,
-                        col=1,
+                        x=x_sep, line_width=1.8, line_dash="dot",
+                        line_color="#64748b", opacity=0.78, row=r, col=1,
                     )
                 except Exception:
                     pass
+            try:
+                fig.add_annotation(
+                    x=x_sep, y=1.01, xref="x", yref="paper",
+                    text=f"<b>{item.get('label', 'New test')}</b>", showarrow=False,
+                    textangle=-90, xanchor="left", yanchor="bottom",
+                    font=dict(size=10, color="#475569"),
+                    bgcolor="rgba(255,255,255,0.88)",
+                )
+            except Exception:
+                pass
         return fig
 
     def add_operation_intervals_to_plotly(fig, features):
@@ -2624,7 +2831,7 @@ if selected_features and not filtered.empty:
                                 name=trace_name,
                                 legendgroup=trace_name,
                                 showlegend=first_segment,
-                                line=dict(color=color, width=3.0),
+                                line=dict(color=color, width=3.0, shape=("hv" if feature in {"choke_unified", "choke_pct", "choke_size_64", "choke_ambiguous"} else "linear")),
                                 marker=dict(color=color, size=6 if chart_view_mode == "Mobile-friendly" else 8),
                             ),
                             secondary_y=secondary,
@@ -2707,7 +2914,7 @@ if selected_features and not filtered.empty:
                                 name=f"{series_label}",
                                 legendgroup=str(series_label),
                                 showlegend=(show_chart_legend and row_idx == 1 and first_segment),
-                                line=dict(color=color, width=3.0),
+                                line=dict(color=color, width=3.0, shape=("hv" if feature in {"choke_unified", "choke_pct", "choke_size_64", "choke_ambiguous"} else "linear")),
                                 marker=dict(color=color, size=6 if chart_view_mode == "Mobile-friendly" else 8),
                             ),
                             row=row_idx,
@@ -2817,7 +3024,7 @@ if selected_features and not filtered.empty:
                             name=plot_name,
                             legendgroup=plot_name,
                             showlegend=first_segment,
-                            line=dict(color=color, width=2.5),
+                            line=dict(color=color, width=2.5, shape=("hv" if feature in {"choke_unified", "choke_pct", "choke_size_64", "choke_ambiguous"} else "linear")),
                             marker=dict(color=color, size=7),
                         )
                     )
@@ -2915,7 +3122,7 @@ if selected_features and not filtered.empty:
                             name=trace_name,
                             legendgroup=trace_name,
                             showlegend=first_segment,
-                            line=dict(color=color, width=2.8),
+                            line=dict(color=color, width=2.8, shape=("hv" if feature in {"choke_unified", "choke_pct", "choke_size_64", "choke_ambiguous"} else "linear")),
                             marker=dict(color=color, size=5 if chart_view_mode == "Mobile-friendly" else 7),
                         ),
                         secondary_y=secondary,
@@ -3038,6 +3245,7 @@ if selected_features and not filtered.empty:
                             markersize=4.6,
                             linewidth=2.2,
                             color=color,
+                            drawstyle="steps-post" if feature in {"choke_unified", "choke_pct", "choke_size_64", "choke_ambiguous"} else "default",
                             label=series_label if (len(series_values) > 1 and first_segment) else None,
                         )
 
@@ -3105,8 +3313,6 @@ if selected_features and not filtered.empty:
                     if tick_settings:
                         ax.set_xticks(tick_settings.get("tickvals", []))
                         ax.set_xticklabels([str(t).replace("<br>", "\n") for t in tick_settings.get("ticktext", [])], rotation=30, ha="right")
-                    for x_sep in compressed_separator_positions(df):
-                        ax.axvline(x_sep, color="#64748b", linestyle=":", linewidth=1.5, alpha=0.75)
 
                 if len(series_values) > 1:
                     ax.legend(fontsize=12, loc="best")
@@ -3146,7 +3352,9 @@ if selected_features and not filtered.empty:
                     y = pd.to_numeric(g[feature], errors="coerce")
                     color = feature_color(feature, wi)
 
-                    ax.plot(x, y, marker="o", markersize=5, linewidth=2.6, color=color, label=series_label if len(series_values) > 1 else None)
+                    ax.plot(x, y, marker="o", markersize=5, linewidth=2.6, color=color,
+                            drawstyle="steps-post" if feature in {"choke_unified", "choke_pct", "choke_size_64", "choke_ambiguous"} else "default",
+                            label=series_label if len(series_values) > 1 else None)
 
                     idxs = chart_label_indices_for_export(g, feature)
                     for i in sorted(idxs):
@@ -3248,8 +3456,6 @@ if selected_features and not filtered.empty:
                     if tick_settings:
                         ax.set_xticks(tick_settings.get("tickvals", []))
                         ax.set_xticklabels([str(t).replace("<br>", "\n") for t in tick_settings.get("ticktext", [])], rotation=30, ha="right")
-                    for x_sep in compressed_separator_positions(df):
-                        ax.axvline(x_sep, color="#64748b", linestyle=":", linewidth=1.5, alpha=0.75)
 
                 if len(series_values) > 1:
                     ax.legend(fontsize=12, loc="best")
@@ -3312,14 +3518,20 @@ if selected_features and not filtered.empty:
             if tick_settings:
                 ax.set_xticks(tick_settings.get("tickvals", []))
                 ax.set_xticklabels([str(t).replace("<br>", "\n") for t in tick_settings.get("ticktext", [])], rotation=30, ha="right")
-            for x_sep in compressed_separator_positions(df_for_ticks):
-                ax.axvline(x_sep, color="#64748b", linestyle=":", linewidth=1.4, alpha=0.70)
+
+    def _draw_all_test_separators_matplotlib(ax, df_for_sep):
+        for _sep in chart_separator_positions(df_for_sep):
+            try:
+                ax.axvline(_sep.get("x"), color="#64748b", linestyle=":", linewidth=1.4, alpha=0.72)
+            except Exception:
+                pass
 
     def _matplotlib_event_levels(events, x_values=None, max_levels=4):
         return note_event_levels(events, x_values=x_values, max_levels=max_levels)
 
     def _apply_matplotlib_notes(ax, x_values=None):
         """Apply interval and point notes with staggered rows to avoid overlap in exports."""
+        _draw_all_test_separators_matplotlib(ax, filtered)
         # Interval notes: parent/long intervals on top row, child intervals below.
         note_count = total_note_count()
         interval_font_size, event_font_size = adaptive_note_font_sizes(note_count, mobile=(chart_view_mode == "Mobile-friendly"))
@@ -3442,6 +3654,7 @@ if selected_features and not filtered.empty:
                     markersize=4.8,
                     linewidth=2.4,
                     color=color,
+                    drawstyle="steps-post" if feature in {"choke_unified", "choke_pct", "choke_size_64", "choke_ambiguous"} else "default",
                     label=series_label if len(series_values) > 1 else None,
                 )
 
@@ -3529,6 +3742,7 @@ if selected_features and not filtered.empty:
                         markersize=4.4,
                         linewidth=2.4,
                         color=color,
+                        drawstyle="steps-post" if feature in {"choke_unified", "choke_pct", "choke_size_64", "choke_ambiguous"} else "default",
                         label=series_label if (len(series_values) > 1 and first_segment) else None,
                     )
 

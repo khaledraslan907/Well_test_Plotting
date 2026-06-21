@@ -11,7 +11,8 @@ import pandas as pd
 
 
 PARSER_BUILD_ID_V55 = "v55-safe-datetime-pandas3"
-PARSER_BUILD_ID_V57 = "v57-unified-choke-conversion-20260621"
+PARSER_BUILD_ID_V58 = "v58-persistent-units-test-separation-20260621"
+PARSER_BUILD_ID_V57 = PARSER_BUILD_ID_V58
 PARSER_BUILD_ID_V56 = PARSER_BUILD_ID_V57
 KEYWORDS = [
     "date", "time", "well", "choke", "whp", "w.h.p", "wellhead", "sep", "separator",

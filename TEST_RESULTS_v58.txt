@@ -1,0 +1,16 @@
+TMU Dashboard v58 validation
+
+- Python syntax: app.py PASS
+- Python syntax: tmu_parser.py PASS
+- B15-38 Excel files tested: 17
+- Parsed successfully: 17/17
+- First parse time in test container: approximately 6.05 seconds
+- Source rows: 753
+- Unique rows after duplicate merge: 500
+- Repeated rows merged: 253
+- Detected test IDs at 72-hour setting: 8
+- Unified choke validation rows: 500
+- Unified choke zero values after correction: 0
+- Unified choke range using 128/64 full-open calibration: 14 to 128 /64 in
+- Pressure conversion check: 100 psi = 6.89475729 bar
+- Temperature conversion check: 0 degC = 32 degF
