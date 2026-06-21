@@ -11,6 +11,8 @@ import pandas as pd
 
 
 PARSER_BUILD_ID_V55 = "v55-safe-datetime-pandas3"
+PARSER_BUILD_ID_V57 = "v57-unified-choke-conversion-20260621"
+PARSER_BUILD_ID_V56 = PARSER_BUILD_ID_V57
 KEYWORDS = [
     "date", "time", "well", "choke", "whp", "w.h.p", "wellhead", "sep", "separator",
     "gas", "formation", "gross", "oil", "water", "bsw", "bs&w", "wc", "salinity",
@@ -35,7 +37,7 @@ BASE_NON_PLOT_COLS = {
 }
 
 COLUMN_LABELS = {
-    "choke_pct": "Choke (%)",
+    "choke_pct": "Choke Opening (%)",
     "whp_psi": "WHP (psi)",
     "flp_psi": "FLP (psi)",
     "flt_c": "FLT (°C)",
@@ -68,7 +70,9 @@ COLUMN_LABELS = {
     "ct_running_speed_ftmin": "CT Running Speed (ft/min)",
     "ct_pipe_weight_lbf": "CT Pipe Weight (lbf)",
     "u2_pass_side_pump_pressure_psi": "U2 Pass-side Pump Pressure (psi)",
-    "choke_size_64": "Choke Size (64ths)",
+    "choke_size_64": "Choke Size (/64 in)",
+    "choke_ambiguous": "Choke (unit not stated)",
+    "choke_unified": "Unified Choke",
     "flow_press_psi": "Flow Pressure (psi)",
     "flow_temp_c": "Flow Temp (°C)",
     "wellhead_temp_c": "Wellhead Temp (°C)",
@@ -827,11 +831,20 @@ def extract_number(value: object) -> float:
 def clean_numeric_series(series: pd.Series, canonical_name: str) -> pd.Series:
     s = series.map(extract_number).astype(float)
 
-    # Excel often stores choke as 1.0 for 100% in some TMU templates.
+    # Excel often stores choke opening as a fraction (0.32 = 32%).
     if canonical_name == "choke_pct":
         valid = s.dropna()
         if not valid.empty and valid.median() <= 1.5:
             s = s.where(s > 1.5, s * 100.0)
+        s = s.where((s >= 0) & (s <= 100))
+
+    # Many field templates label the column as in/64 but store 30/64 as
+    # Excel 30% (raw XML value 0.30). Restore the displayed numerator.
+    if canonical_name == "choke_size_64":
+        valid = s.dropna()
+        if not valid.empty and valid.max() < 1.0:
+            s = s * 100.0
+        s = s.where((s >= 0) & (s <= 256))
 
     # BS&W can be stored either as percent (1 = 1%) or fraction (0.006 = 0.6%).
     # Convert only clear fraction-style values, but do not turn 1% into 100%.
@@ -1330,6 +1343,97 @@ def is_useful_raw_numeric_column(column_name: object, series: pd.Series) -> bool
     return nums.notna().any()
 
 
+
+def _choke_header_kind_v56(header: object) -> str:
+    """Return pct, size64, or ambiguous without mixing the two units."""
+    raw = str(header or "").lower()
+    h = clean_header(header)
+    if re.search(r"/\s*64|64\s*(?:th|ths)|in\s*/\s*64|size", raw + " " + h, flags=re.I):
+        return "size64"
+    if "%" in raw or re.search(r"\bpercent(?:age)?\b|\bopening\b", h):
+        return "pct"
+    return "ambiguous"
+
+
+def _split_choke_series_v56(series: pd.Series, header: object):
+    """Split one source choke column without guessing missing units.
+
+    Returns percentage, /64-size, ambiguous-raw, and a confidence score.
+    Explicit text/header units are authoritative. Bare values under a plain
+    "Choke" header are preserved in ``choke_ambiguous`` so the user can choose
+    percentage or /64 interpretation in the dashboard.
+    """
+    idx = series.index
+    pct = pd.Series(np.nan, index=idx, dtype=float)
+    size = pd.Series(np.nan, index=idx, dtype=float)
+    ambiguous = pd.Series(np.nan, index=idx, dtype=float)
+    kind = _choke_header_kind_v56(header)
+    text = series.astype(str).str.strip()
+    explicit_fraction = text.str.contains(r"[-+]?\d+(?:\.\d+)?\s*/\s*64\b", regex=True, case=False, na=False)
+    explicit_pct = text.str.contains(r"%|\bpercent(?:age)?\b", regex=True, case=False, na=False)
+    nums = series.map(extract_number).astype(float)
+    column_has_fraction = bool(explicit_fraction.any())
+
+    if explicit_fraction.any():
+        size.loc[explicit_fraction] = nums.loc[explicit_fraction]
+    if explicit_pct.any():
+        vals = nums.loc[explicit_pct]
+        pct.loc[explicit_pct] = vals.where(vals > 1.0, vals * 100.0)
+
+    remaining = ~(explicit_fraction | explicit_pct) & nums.notna()
+    vals = nums.loc[remaining]
+    if kind == "size64":
+        # Several TMU templates store displayed 30/64 as raw XML 0.30.
+        size.loc[remaining] = vals.where(vals >= 1.0, vals * 100.0)
+    elif kind == "pct":
+        pct.loc[remaining] = vals.where(vals > 1.0, vals * 100.0)
+    elif column_has_fraction:
+        # Once the same column explicitly contains /64 entries, other bare
+        # values above 1 are most consistently interpreted as /64 numerators.
+        # Values <=1 are typical fractional percentage entries.
+        frac_open = vals <= 1.0
+        pct.loc[vals.index[frac_open]] = vals.loc[frac_open] * 100.0
+        as_size = (vals > 1.0) & (vals <= 256.0)
+        size.loc[vals.index[as_size]] = vals.loc[as_size]
+    else:
+        # No unit evidence: preserve the raw number and let the user decide.
+        ambiguous.loc[remaining] = vals
+
+    pct = pct.where((pct >= 0) & (pct <= 100)).round(3)
+    size = size.where((size >= 0) & (size <= 256)).round(3)
+    ambiguous = ambiguous.where((ambiguous >= 0) & (ambiguous <= 256)).round(3)
+    explicit_score = 120 if kind in {"pct", "size64"} else 70
+    return pct, size, ambiguous, explicit_score
+
+
+def _collect_choke_columns_v56(df: pd.DataFrame):
+    pct_candidates = []
+    size_candidates = []
+    ambiguous_candidates = []
+    for col in df.columns:
+        header = str(col)
+        if "choke" not in clean_header(header):
+            continue
+        pct, size, ambiguous, score = _split_choke_series_v56(df[col], header)
+        kind = _choke_header_kind_v56(header)
+        if pct.notna().any():
+            pct_candidates.append((score + (20 if kind == "pct" else 0), pct))
+        if size.notna().any():
+            size_candidates.append((score + (20 if kind == "size64" else 0), size))
+        if ambiguous.notna().any():
+            ambiguous_candidates.append((score, ambiguous))
+
+    def combine(candidates):
+        if not candidates:
+            return None
+        result = pd.Series(np.nan, index=df.index, dtype=float)
+        for _, candidate in sorted(candidates, key=lambda x: x[0], reverse=True):
+            result = result.combine_first(candidate)
+        return result
+
+    return combine(pct_candidates), combine(size_candidates), combine(ambiguous_candidates)
+
+
 def standardize_dataframe(
     df: pd.DataFrame,
     source_name: str = "",
@@ -1379,6 +1483,26 @@ def standardize_dataframe(
             out[canon] = df[col]
         else:
             out[canon] = clean_numeric_series(df[col], canon)
+
+    # Choke needs content-aware unit handling. A single workbook family may use
+    # percentage, /64-inch size, or even both in separate columns. Rebuild the
+    # two canonical series from the original source columns and never combine
+    # unlike units into one plotted curve.
+    choke_pct_v56, choke_size_v56, choke_ambiguous_v57 = _collect_choke_columns_v56(df)
+    mapped_choke_header = str(best_map.get("choke_pct", ("", 0))[0]) if "choke_pct" in best_map else ""
+    mapped_choke_kind = _choke_header_kind_v56(mapped_choke_header) if mapped_choke_header else "ambiguous"
+    if choke_pct_v56 is not None and choke_pct_v56.notna().any():
+        out["choke_pct"] = choke_pct_v56
+    elif "choke_pct" in out.columns and mapped_choke_kind == "pct":
+        out["choke_pct"] = pd.to_numeric(out["choke_pct"], errors="coerce").where(lambda x: (x >= 0) & (x <= 100))
+    else:
+        out.drop(columns=["choke_pct"], inplace=True, errors="ignore")
+    if choke_size_v56 is not None and choke_size_v56.notna().any():
+        out["choke_size_64"] = choke_size_v56
+    elif "choke_size_64" in out.columns:
+        out["choke_size_64"] = pd.to_numeric(out["choke_size_64"], errors="coerce").where(lambda x: (x >= 0) & (x <= 256))
+    if choke_ambiguous_v57 is not None and choke_ambiguous_v57.notna().any():
+        out["choke_ambiguous"] = choke_ambiguous_v57
 
     # Fallback: keep numeric columns not yet recognized by aliases only when the
     # table is mostly unknown. If a TMU template already produced many canonical
@@ -1538,7 +1662,7 @@ def dataframe_quality_score(df: pd.DataFrame) -> int:
 
     # Prefer the common field-test columns that users expect to see by name.
     priority_cols = {
-        "choke_pct", "whp_psi", "flp_psi", "flt_c", "sep_p_psi",
+        "choke_pct", "choke_ambiguous", "whp_psi", "flp_psi", "flt_c", "sep_p_psi",
         "gas_rate_mmscfd", "oil_rate_stbd", "water_rate_bpd", "gross_rate_bpd",
         "bsw_pct", "salinity_kppm",
     }
@@ -1831,7 +1955,7 @@ def parse_expro_mpfm_text(text: str, source_name: str = "EXPRO_MPFM_PDF") -> pd.
     current_date = pd.NaT
     rows = []
     expro_cols = [
-        "choke_size_64", "whp_psi", "flow_press_psi", "flow_temp_c",
+        "choke_size_64", "choke_ambiguous", "whp_psi", "flow_press_psi", "flow_temp_c",
         "mpfm_press_psig", "mpfm_temp_f", "dp_mbar",
         "qoil_s_stbd", "qwat_s_bpd", "qgas_s_mmscfd",
         "qoil_a_bpd", "qwat_a_bpd", "qgas_a_mmcfd",
@@ -2086,7 +2210,6 @@ def parse_tmu_message(message: str, source_name: str = "WhatsApp_Text") -> Dict[
         row["time"] = time_v
 
     fields = {
-        "choke_pct": [r"\bchoke\b"],
         "whp_psi": [r"\bw\.?\s*h\.?\s*p\.?\b", r"\bwellhead pressure\b"],
         "sep_p_psi": [r"\bsep\.?\s*p\.?\b", r"\bseparator pressure\b"],
         "gas_rate_mmscfd": [r"\bgas rate\b"],
@@ -2114,6 +2237,18 @@ def parse_tmu_message(message: str, source_name: str = "WhatsApp_Text") -> Dict[
             row[canon] = parse_salinity_to_kppm(raw_val)
         else:
             row[canon] = extract_number(raw_val)
+
+    # Parse choke separately so 24/64 is never plotted as 24%.
+    choke_raw = value_by_patterns(text, [r"\bchoke\b"])
+    if choke_raw is not None:
+        choke_series = pd.Series([choke_raw])
+        pct_s, size_s, ambiguous_s, _ = _split_choke_series_v56(choke_series, "Choke " + choke_raw)
+        if pct_s.notna().any():
+            row["choke_pct"] = float(pct_s.dropna().iloc[0])
+        if size_s.notna().any():
+            row["choke_size_64"] = float(size_s.dropna().iloc[0])
+        if ambiguous_s.notna().any():
+            row["choke_ambiguous"] = float(ambiguous_s.dropna().iloc[0])
 
     if "date" in row and "time" in row:
         d = pd.to_datetime(row["date"], errors="coerce", dayfirst=True)
@@ -3747,7 +3882,7 @@ PRODUCTION_NUMERIC_FIELDS_V46 = [
     "gross_rate_bpd", "oil_rate_stbd", "water_rate_bpd", "gas_rate_mmscfd",
     "gas_formation_mmscfd", "whp_psi", "sep_p_psi", "flp_psi", "bsw_pct",
     "salinity_kppm", "h2s_ppm", "co2_mole_pct", "pumping_pressure_psi",
-    "n2_rate_scfm", "choke_pct", "choke_size_64",
+    "n2_rate_scfm", "choke_pct", "choke_size_64", "choke_ambiguous",
 ]
 CORE_RATE_OR_PRESSURE_FIELDS_V46 = [
     "gross_rate_bpd", "oil_rate_stbd", "water_rate_bpd", "gas_rate_mmscfd",
@@ -5496,5 +5631,161 @@ def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: 
         if preflight.get("suspicious"):
             return []
     return _load_tabular_file_v53_prefer_xml_previous(
+        UploadedBytes(data, name), parse_images=parse_images, max_ocr_images=max_ocr_images
+    )
+
+# =============================================================================
+# v56 - faster first load + unit-safe choke handling
+# =============================================================================
+
+def _sheet_is_helper_v56(sheet_name: object, raw: pd.DataFrame) -> bool:
+    name = clean_header(sheet_name)
+    helper = bool(re.search(r"\b(form|cover|summary|chart|cmsf|shrinkage|lookup|calculation|calc)\b", name))
+    # Never skip a large sheet only because its title contains a helper word.
+    return helper and (raw is None or raw.shape[0] < 20)
+
+
+def _extract_pumping_pressure_from_raw_v56(raw: pd.DataFrame, name: str, sheet_name: str,
+                                            default_well: str) -> pd.DataFrame:
+    """Extract hidden/far-right Pumping Pressure from an already-read raw sheet.
+
+    v52 re-opened and rescanned the XLSX XML after the main parse. On files with
+    inflated used ranges that doubled the load time. v56 reuses the same raw
+    dataframe, so Pumping Pressure rescue adds only a small header scan.
+    """
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    scan_rows = min(50, len(raw))
+    candidates = []
+    for r in range(scan_rows):
+        for c in range(raw.shape[1]):
+            val = raw.iat[r, c]
+            if val is None or not re.search(r"pump|pumping|circulation", clean_header(val), flags=re.I):
+                continue
+            nearby = []
+            for rr in range(max(0, r - 2), min(len(raw), r + 3)):
+                for cc in range(max(0, c - 1), min(raw.shape[1], c + 2)):
+                    nearby.append(str(raw.iat[rr, cc] or ""))
+            if _looks_like_pumping_pressure_header_v51(val, " ".join(nearby)):
+                candidates.append((r, c))
+    if not candidates:
+        return pd.DataFrame()
+
+    well = _clean_merge_well_v51(default_well or _well_from_sheet_or_file_v52(sheet_name, name))
+    rows = []
+    for header_r, c in candidates:
+        for start_r in (header_r + 1, header_r + 2, header_r + 3):
+            if start_r >= len(raw):
+                continue
+            idx = raw.index[start_r:]
+            vals = _to_number_series_v51(pd.Series(raw.iloc[start_r:, c], index=idx))
+            if vals.notna().sum() < 2:
+                continue
+            dt = _date_time_from_raw_v51(raw, idx)
+            dt = pd.to_datetime(dt, errors="coerce")
+            valid = vals.notna() & dt.notna()
+            if valid.sum() < 2:
+                continue
+            for row_idx in vals[valid].index:
+                dtv = pd.Timestamp(dt.loc[row_idx])
+                rows.append({
+                    "source": name,
+                    "sheet": str(sheet_name),
+                    "well": well,
+                    "datetime": dtv,
+                    "date": dtv.normalize(),
+                    "time_text": dtv.strftime("%H:%M"),
+                    "pumping_pressure_psi": float(vals.loc[row_idx]),
+                    "source_type": "excel_raw_reused_pumping_v56",
+                })
+            break
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows)
+    out["well_key_v51"] = out["well"].map(_clean_merge_well_v51)
+    return out.drop_duplicates(subset=["well_key_v51", "datetime"], keep="last")
+
+
+def _parse_raw_sheet_fast_v56(raw: pd.DataFrame, source_name: str, sheet_name: str,
+                              default_well: str) -> pd.DataFrame:
+    """Use one strong parse for familiar TMU sheets; run all fallbacks only if needed."""
+    try:
+        primary = standardize_dataframe(
+            table_from_raw(raw), source_name=source_name, sheet_name=sheet_name,
+            default_well=default_well,
+        )
+    except Exception:
+        primary = pd.DataFrame()
+
+    if primary is not None and not primary.empty and is_valid_timeseries(primary):
+        canonical = [
+            c for c in available_numeric_columns(primary)
+            if not str(c).startswith("raw__")
+        ]
+        valid_dt = pd.to_datetime(primary.get("datetime"), errors="coerce").notna().sum() if "datetime" in primary.columns else 0
+        if len(canonical) >= 4 and valid_dt >= 2:
+            return primary
+
+    candidates = parse_excel_sheet_attempts(
+        raw, source_name=source_name, sheet_name=sheet_name, default_well=default_well
+    )
+    return candidates[0].copy() if candidates else pd.DataFrame()
+
+
+def _load_xlsx_fast_v56(data: bytes, name: str):
+    tables = []
+    pump_frames = []
+    try:
+        with _zipfile_v53.ZipFile(io.BytesIO(data)) as zf:
+            shared = _read_shared_strings_fast_v53(zf)
+            for sheet_name, sheet_path in _workbook_sheet_paths_v52(zf):
+                raw = _raw_dataframe_from_sheet_xml_v53(zf, sheet_path, shared)
+                if raw is None or raw.empty or _sheet_is_helper_v56(sheet_name, raw):
+                    continue
+                default_well = extract_well_from_raw(raw, source_name=name, sheet_name=str(sheet_name))
+                pump = _extract_pumping_pressure_from_raw_v56(
+                    raw, name=name, sheet_name=str(sheet_name), default_well=default_well
+                )
+                if pump is not None and not pump.empty:
+                    pump_frames.append(pump)
+                best = _parse_raw_sheet_fast_v56(
+                    raw, source_name=name, sheet_name=str(sheet_name), default_well=default_well
+                )
+                if best is not None and not best.empty:
+                    best = best.copy()
+                    best["source_type"] = "excel_fast_xml_v56"
+                    tables.append(best)
+    except Exception as exc:
+        raise RuntimeError(f"Safe XML parser could not read {name}: {exc}")
+
+    tables = filter_usable_tables(filter_preferred_tables(tables))
+    pump_df = pd.concat(pump_frames, ignore_index=True, sort=False) if pump_frames else pd.DataFrame()
+    if not pump_df.empty:
+        pump_df["datetime"] = pd.to_datetime(pump_df["datetime"], errors="coerce")
+        pump_df["pumping_pressure_psi"] = pd.to_numeric(pump_df["pumping_pressure_psi"], errors="coerce")
+        pump_df = pump_df.dropna(subset=["datetime", "pumping_pressure_psi"])
+        pump_df = pump_df.drop_duplicates(subset=["well_key_v51", "datetime"], keep="last")
+    return tables, pump_df
+
+
+_load_tabular_file_v55_final_before_v56 = load_tabular_file
+
+
+def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: int = 1000) -> List[pd.DataFrame]:
+    data, name = _uploaded_bytes_v49(uploaded_file)
+    suffix = str(name).split(".")[-1].lower()
+    if suffix == "xlsx":
+        tables, pump_df = _load_xlsx_fast_v56(data, name)
+        if tables:
+            if pump_df is not None and not pump_df.empty:
+                tables = force_restore_pumping_pressure_v52(tables, pump_df)
+            return [
+                ensure_pumping_pressure_column_v48(t)
+                for t in tables if t is not None and not t.empty
+            ]
+        # Suspicious workbooks must never fall through to a memory-heavy reader.
+        if xlsx_preflight_v53(data).get("suspicious"):
+            return []
+    return _load_tabular_file_v55_final_before_v56(
         UploadedBytes(data, name), parse_images=parse_images, max_ocr_images=max_ocr_images
     )

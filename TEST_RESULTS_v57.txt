@@ -1,0 +1,27 @@
+TMU Dashboard v57 validation
+
+B15-38 batch
+- Files tested: 17/17
+- Parse errors: 0
+- Source rows: 753
+- Rows after duplicate merge: 500
+- Repeated rows merged: 253
+- Local first parse: approximately 6.3 seconds
+
+Choke parsing
+- Explicit 100% -> percentage 100
+- Explicit 50% -> percentage 50
+- Explicit 128/64 -> size 128
+- Explicit 64/64 -> size 64
+- Bare Choke = 64 -> unit-ambiguous 64 for user selection
+- Bare Choke = 0.5 -> unit-ambiguous 0.5 for user selection
+
+Default 128/64 full-open conversion
+- 128/64 -> 100%
+- 64/64 -> 50%
+- 32/64 -> 25%
+- 100% -> 128/64
+- 50% -> 64/64
+- 25% -> 32/64
+
+Pumping Pressure and prior fixes remain included from v56.

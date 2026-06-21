@@ -5,6 +5,7 @@ import re
 import zipfile
 import traceback
 import gc
+import hashlib
 from pathlib import Path
 from typing import Optional
 
@@ -52,7 +53,7 @@ available_numeric_columns = _tmu_parser.available_numeric_columns
 _parser_column_label = _tmu_parser.column_label
 load_tabular_file = _tmu_parser.load_tabular_file
 parse_many_tmu_messages = _tmu_parser.parse_many_tmu_messages
-PARSER_BUILD_ID = getattr(_tmu_parser, 'PARSER_BUILD_ID_V55', getattr(_tmu_parser, 'PARSER_BUILD_ID_V54', getattr(_tmu_parser, 'PARSER_BUILD_ID', 'v55')))
+PARSER_BUILD_ID = getattr(_tmu_parser, 'PARSER_BUILD_ID_V57', getattr(_tmu_parser, 'PARSER_BUILD_ID_V56', getattr(_tmu_parser, 'PARSER_BUILD_ID_V55', getattr(_tmu_parser, 'PARSER_BUILD_ID', 'v57'))))
 assign_test_ids = getattr(_tmu_parser, "assign_test_ids", lambda df, gap_hours=12.0: df)
 
 DISPLAY_LABEL_FILE = Path(__file__).with_name("user_display_labels.json")
@@ -71,6 +72,10 @@ def save_display_label_overrides(overrides: dict) -> None:
     DISPLAY_LABEL_FILE.write_text(json.dumps(safe, indent=2, sort_keys=True), encoding="utf-8")
 
 def column_label(col) -> str:
+    # The unified choke field keeps one stable internal name while its displayed
+    # engineering unit follows the user's selected conversion target.
+    if str(col) == "choke_unified":
+        return str(st.session_state.get("choke_unified_label", "Unified Choke"))
     overrides = st.session_state.get("display_label_overrides")
     if overrides is None:
         overrides = load_display_label_overrides()
@@ -101,8 +106,10 @@ def standard_column_options(include_meta: bool = False) -> dict:
     # Fallback list for older parser builds.  These are safe internal names used
     # by this app; users can map new customer abbreviations to any of them.
     labels.update({
-        "choke_pct": "Choke (%)",
-        "choke_size_64": "Choke Size (64ths)",
+        "choke_pct": "Choke Opening (%)",
+        "choke_size_64": "Choke Size (/64 in)",
+        "choke_ambiguous": "Choke (unit not stated)",
+        "choke_unified": "Unified Choke",
         "whp_psi": "WHP (psi)",
         "flp_psi": "FLP (psi)",
         "flow_press_psi": "Flow Pressure (psi)",
@@ -217,6 +224,8 @@ FEATURE_COLORS = {
     "gor_s_scf_stb": "#ff6692",
     "gvf_a_pct": "#b6e880",
     "choke_size_64": "#e377c2",
+    "choke_ambiguous": "#e377c2",
+    "choke_unified": "#e377c2",
 }
 
 WELL_COLORS = [
@@ -587,6 +596,10 @@ with st.sidebar:
     )
     if st.button("Re-parse uploaded files / clear cache", help="Use this after updating the parser or when a previously uploaded file still shows old detected columns."):
         st.cache_data.clear()
+        st.session_state.pop("upload_parse_bundle_v57", None)
+        st.session_state.pop("upload_parse_key_v57", None)
+        st.session_state.pop("combined_data_bundle_v57", None)
+        st.session_state.pop("combined_data_key_v57", None)
         st.rerun()
 
     st.header("2) Test split and CTU image OCR")
@@ -654,40 +667,82 @@ def cached_load_uploaded_file(file_name: str, file_bytes: bytes, parse_images: b
 frames = []
 errors = []
 
+
+def _uploaded_file_identity_v57(uploaded_file):
+    """Fast stable identity without hashing the full workbook on every rerun."""
+    name = str(getattr(uploaded_file, "name", "uploaded"))
+    size = int(getattr(uploaded_file, "size", 0) or 0)
+    file_id = str(getattr(uploaded_file, "file_id", "") or "")
+    if file_id:
+        return (name, size, file_id)
+    # Fallback for older Streamlit builds: hash only the first/last 64 KB.
+    try:
+        view = uploaded_file.getbuffer()
+        head = bytes(view[: min(len(view), 65536)])
+        tail = bytes(view[max(0, len(view) - 65536):])
+        digest = hashlib.sha1(head + tail + str(len(view)).encode()).hexdigest()
+    except Exception:
+        digest = f"{name}:{size}"
+    return (name, size, digest)
+
+
+upload_key = None
 if uploaded_files:
-    upload_progress = st.progress(0.0, text="Reading uploaded files...") if len(uploaded_files) > 1 else None
-    for upload_order, f in enumerate(uploaded_files):
-        try:
-            if upload_progress is not None:
-                upload_progress.progress(
-                    upload_order / max(len(uploaded_files), 1),
-                    text=f"Reading {upload_order + 1}/{len(uploaded_files)}: {f.name}",
+    upload_key = (
+        PARSER_BUILD_ID,
+        bool(enable_ctu_ocr),
+        int(max_ocr_images),
+        tuple(_uploaded_file_identity_v57(f) for f in uploaded_files),
+    )
+    cached_bundle = st.session_state.get("upload_parse_bundle_v57")
+    cached_key = st.session_state.get("upload_parse_key_v57")
+
+    if cached_bundle is not None and cached_key == upload_key:
+        # UI changes now reuse the already parsed DataFrames directly. This
+        # avoids per-file cache deserialization and repeated workbook handling.
+        frames.extend(cached_bundle.get("frames", []))
+        errors.extend(list(cached_bundle.get("errors", [])))
+    else:
+        parsed_frames = []
+        parsed_errors = []
+        upload_progress = st.progress(0.0, text="Reading uploaded files...") if len(uploaded_files) > 1 else None
+        for upload_order, f in enumerate(uploaded_files):
+            try:
+                if upload_progress is not None:
+                    upload_progress.progress(
+                        upload_order / max(len(uploaded_files), 1),
+                        text=f"Reading {upload_order + 1}/{len(uploaded_files)}: {f.name}",
+                    )
+                file_bytes = f.getvalue()
+                parsed_tables = cached_load_uploaded_file(
+                    f.name, file_bytes, bool(enable_ctu_ocr), int(max_ocr_images), PARSER_BUILD_ID
                 )
-            file_bytes = f.getvalue()
-            parsed_tables = cached_load_uploaded_file(
-                f.name, file_bytes, bool(enable_ctu_ocr), int(max_ocr_images), PARSER_BUILD_ID
-            )
-            if parsed_tables:
-                for table_order, table in enumerate(parsed_tables):
-                    if table is None or table.empty:
-                        continue
-                    table = table.copy()
-                    table["_upload_order"] = int(upload_order)
-                    table["_table_order"] = int(table_order)
-                    frames.append(table)
-            else:
-                errors.append(f"{f.name}: no usable time-series table detected. The file may be blank, or it has no date/time plus numeric readings after all parsers were tried.")
-        except Exception as e:
-            errors.append(f"{f.name}: {e}")
-            with st.expander(f"Technical error details for {f.name}", expanded=False):
-                st.code(traceback.format_exc())
-        finally:
-            # Release temporary workbook/XML objects before the next file. This
-            # is important on Streamlit Community Cloud when many Excel files
-            # are uploaded together.
-            gc.collect()
-    if upload_progress is not None:
-        upload_progress.progress(1.0, text="Uploaded files parsed")
+                if parsed_tables:
+                    for table_order, table in enumerate(parsed_tables):
+                        if table is None or table.empty:
+                            continue
+                        table = table.copy()
+                        table["_upload_order"] = int(upload_order)
+                        table["_table_order"] = int(table_order)
+                        parsed_frames.append(table)
+                else:
+                    parsed_errors.append(f"{f.name}: no usable time-series table detected. The file may be blank, or it has no date/time plus numeric readings after all parsers were tried.")
+            except Exception as e:
+                parsed_errors.append(f"{f.name}: {e}")
+                with st.expander(f"Technical error details for {f.name}", expanded=False):
+                    st.code(traceback.format_exc())
+            finally:
+                gc.collect()
+        if upload_progress is not None:
+            upload_progress.progress(1.0, text="Uploaded files parsed")
+
+        st.session_state["upload_parse_key_v57"] = upload_key
+        st.session_state["upload_parse_bundle_v57"] = {
+            "frames": parsed_frames,
+            "errors": list(parsed_errors),
+        }
+        frames.extend(parsed_frames)
+        errors.extend(parsed_errors)
 
 if whatsapp_text.strip():
     try:
@@ -706,21 +761,42 @@ if not frames:
     st.info("Upload files or paste a WhatsApp TMU message to start.")
     st.stop()
 
-data = pd.concat(frames, ignore_index=True, sort=False)
+# Concatenation and duplicate merging are cached in session state as well as
+# individual file parsing. This keeps sidebar/chart interaction fast after a
+# large multi-file upload instead of rebuilding the same merged dataset on every
+# Streamlit rerun.
+_whatsapp_key = hashlib.sha1(whatsapp_text.encode("utf-8", errors="ignore")).hexdigest() if whatsapp_text.strip() else ""
+_combined_key = (PARSER_BUILD_ID, upload_key, _whatsapp_key)
+_combined_cached = st.session_state.get("combined_data_bundle_v57")
+_combined_cached_key = st.session_state.get("combined_data_key_v57")
 
-# Merge repeated/incomplete reports before assigning tests. The same well and
-# minute timestamp becomes one row: the most complete upload wins and missing
-# fields are filled from the other copy. Unknown wells or missing timestamps are
-# never merged automatically.
-rows_before_dedup = len(data)
-try:
-    if hasattr(_tmu_parser, "merge_duplicate_test_rows_v53"):
-        data = _tmu_parser.merge_duplicate_test_rows_v53(data)
-except Exception as dedup_error:
-    errors.append(f"Duplicate-row merge was skipped: {dedup_error}")
-rows_merged = max(0, rows_before_dedup - len(data))
+if _combined_cached is not None and _combined_cached_key == _combined_key:
+    data = _combined_cached["data"].copy(deep=True)
+    rows_merged = int(_combined_cached.get("rows_merged", 0))
+else:
+    data = pd.concat(frames, ignore_index=True, sort=False)
+    # Merge repeated/incomplete reports before assigning tests. The same well
+    # and minute timestamp becomes one row: the most complete upload wins and
+    # missing fields are filled from the other copy.
+    rows_before_dedup = len(data)
+    try:
+        if hasattr(_tmu_parser, "merge_duplicate_test_rows_v53"):
+            data = _tmu_parser.merge_duplicate_test_rows_v53(data)
+    except Exception as dedup_error:
+        errors.append(f"Duplicate-row merge was skipped: {dedup_error}")
+    rows_merged = max(0, rows_before_dedup - len(data))
+    st.session_state["combined_data_key_v57"] = _combined_key
+    st.session_state["combined_data_bundle_v57"] = {
+        "data": data.copy(deep=True),
+        "rows_merged": int(rows_merged),
+    }
+
 if rows_merged:
     st.caption(f"Merged {rows_merged:,} repeated row(s) with the same well and date/time, keeping the most complete values.")
+
+# Raw choke source columns are preserved. A user-selectable unified curve is
+# created later, after the safe parsing/mapping steps, so changing the display
+# unit never changes the original uploaded values.
 
 # Test segmentation: same well continues until the selected gap is exceeded;
 # a different well is always a separate test stream.
@@ -1163,7 +1239,157 @@ def convert_intervals_for_plot(operation_intervals, df, x_axis_mode):
     return converted
 
 
+# ---------------------------------------------------------------------------
+# Unified choke conversion for plotting (v57)
+# ---------------------------------------------------------------------------
+# This is a configurable calibration, not a universal choke law.  The default
+# requested by the user is 100% opening = 128/64 in.  The original percentage
+# and /64 values stay in the dataframe for audit/review.
+_has_choke_pct = "choke_pct" in data.columns and pd.to_numeric(data["choke_pct"], errors="coerce").notna().any()
+_has_choke_size = "choke_size_64" in data.columns and pd.to_numeric(data["choke_size_64"], errors="coerce").notna().any()
+_has_choke_ambiguous = "choke_ambiguous" in data.columns and pd.to_numeric(data["choke_ambiguous"], errors="coerce").notna().any()
+choke_plot_mode = "Keep source units separate"
+choke_full_open_64 = 128.0
+show_raw_choke_features = True
+ambiguous_choke_unit = "Auto from surrounding source units"
+
+if _has_choke_pct or _has_choke_size or _has_choke_ambiguous:
+    with st.sidebar:
+        st.header("Choke conversion")
+        choke_plot_mode = st.selectbox(
+            "Choke unit to plot",
+            [
+                "Opening (%) - combine both source units",
+                "Size (/64 in) - combine both source units",
+                "Keep source units separate",
+            ],
+            index=0,
+            help=(
+                "Creates one choke curve. Percentage rows and /64-inch rows are converted "
+                "to the selected unit. Original uploaded columns remain unchanged."
+            ),
+        )
+        choke_full_open_64 = st.number_input(
+            "Full-open choke size (/64 in)",
+            min_value=1.0,
+            max_value=256.0,
+            value=128.0,
+            step=1.0,
+            help="Calibration used for conversion. Default: 100% = 128/64 in; therefore 50% = 64/64 in.",
+        )
+        if _has_choke_ambiguous:
+            ambiguous_choke_unit = st.selectbox(
+                "When a choke value has no unit",
+                [
+                    "Auto from surrounding source units",
+                    "Treat as Opening (%)",
+                    "Treat as Size (/64 in)",
+                ],
+                index=0,
+                help=(
+                    "A plain entry such as 'Choke = 64' is impossible to identify from the number alone. "
+                    "Choose its meaning here, or let Auto use explicit values in the same source file."
+                ),
+            )
+        show_raw_choke_features = st.checkbox(
+            "Also show original choke columns in feature list",
+            value=False,
+            help="Off gives one clean converted choke feature. Turn on only to compare raw source units.",
+        )
+
+    _pct = pd.to_numeric(data.get("choke_pct", pd.Series(index=data.index, dtype=float)), errors="coerce")
+    _size = pd.to_numeric(data.get("choke_size_64", pd.Series(index=data.index, dtype=float)), errors="coerce")
+    _amb = pd.to_numeric(data.get("choke_ambiguous", pd.Series(index=data.index, dtype=float)), errors="coerce")
+
+    # Interpret only unit-less entries. Explicit % and /64 values are never
+    # reclassified. Fractional percentage entries such as 0.5 become 50%.
+    _amb_as_pct = pd.Series(np.nan, index=data.index, dtype=float)
+    _amb_as_size = pd.Series(np.nan, index=data.index, dtype=float)
+    _auto_ambiguous_fallback_groups = 0
+    if _amb.notna().any():
+        if ambiguous_choke_unit.startswith("Treat as Opening"):
+            _amb_as_pct = _amb.where(_amb > 1.0, _amb * 100.0)
+        elif ambiguous_choke_unit.startswith("Treat as Size"):
+            _amb_as_size = _amb.where(_amb >= 1.0, _amb * 100.0)
+        else:
+            group_cols = [c for c in ["source", "sheet"] if c in data.columns]
+            if group_cols:
+                grouped_indexes = data.groupby(group_cols, dropna=False, sort=False).groups.values()
+            else:
+                grouped_indexes = [data.index]
+            for _idx in grouped_indexes:
+                _idx = pd.Index(_idx)
+                _a = _amb.loc[_idx]
+                if not _a.notna().any():
+                    continue
+                _group_has_pct = _pct.loc[_idx].notna().any()
+                _group_has_size = _size.loc[_idx].notna().any()
+                if _group_has_size and not _group_has_pct:
+                    _amb_as_size.loc[_idx] = _a.where(_a >= 1.0, _a * 100.0)
+                elif _group_has_pct and not _group_has_size:
+                    _amb_as_pct.loc[_idx] = _a.where(_a > 1.0, _a * 100.0)
+                else:
+                    # No decisive unit evidence (or both units occur): keep the
+                    # historical field convention and treat bare <=100 values as %.
+                    _amb_as_pct.loc[_idx] = _a.where(_a > 1.0, _a * 100.0)
+                    _auto_ambiguous_fallback_groups += 1
+
+    _pct_effective = _pct.combine_first(_amb_as_pct)
+    _size_effective = _size.combine_first(_amb_as_size)
+    _converted_pct = (_size_effective / float(choke_full_open_64)) * 100.0
+    _converted_size = (_pct_effective / 100.0) * float(choke_full_open_64)
+
+    # Reject only impossible conversions above the user-defined full-open size;
+    # keep the original source columns untouched so the user can review them.
+    _oversize_mask = _size_effective.notna() & (_size_effective > float(choke_full_open_64))
+    _converted_pct = _converted_pct.mask(_oversize_mask)
+
+    # When both units exist at the same timestamp, the value already expressed
+    # in the requested target unit wins. The converted other unit fills gaps.
+    _conflict_mask = _pct_effective.notna() & _size_effective.notna()
+    _pct_difference = (_pct_effective - ((_size_effective / float(choke_full_open_64)) * 100.0)).abs()
+    _conflict_count = int((_conflict_mask & (_pct_difference > 2.0)).sum())
+
+    if choke_plot_mode.startswith("Opening"):
+        data["choke_unified"] = _pct_effective.combine_first(_converted_pct)
+        data["choke_unified"] = pd.to_numeric(data["choke_unified"], errors="coerce").where(
+            lambda s: (s >= 0) & (s <= 100)
+        )
+        st.session_state["choke_unified_label"] = "Choke Opening (%)"
+    elif choke_plot_mode.startswith("Size"):
+        data["choke_unified"] = _size_effective.combine_first(_converted_size)
+        data["choke_unified"] = pd.to_numeric(data["choke_unified"], errors="coerce").where(
+            lambda s: (s >= 0) & (s <= float(choke_full_open_64))
+        )
+        st.session_state["choke_unified_label"] = "Choke Size (/64 in)"
+    else:
+        data.drop(columns=["choke_unified"], inplace=True, errors="ignore")
+        st.session_state["choke_unified_label"] = "Unified Choke"
+
+    with st.sidebar:
+        if not choke_plot_mode.startswith("Keep"):
+            st.caption(
+                f"Conversion: Choke % = size ÷ {choke_full_open_64:g} × 100; "
+                f"size (/64) = Choke % ÷ 100 × {choke_full_open_64:g}."
+            )
+            if _conflict_count:
+                st.warning(
+                    f"{_conflict_count} timestamp(s) contain both units but differ by more than 2 percentage points. "
+                    "The original value already in the selected target unit is used."
+                )
+            if int(_oversize_mask.sum()):
+                st.warning(
+                    f"{int(_oversize_mask.sum())} choke-size value(s) exceed the selected full-open size and were not converted."
+                )
+            if ambiguous_choke_unit.startswith("Auto") and _auto_ambiguous_fallback_groups:
+                st.info(
+                    f"For {_auto_ambiguous_fallback_groups} source group(s), the unit of bare choke values could not be proven; "
+                    "Auto treated them as percentage. You can override this above."
+                )
+
 numeric_cols = available_numeric_columns(data)
+if not show_raw_choke_features and "choke_unified" in numeric_cols:
+    numeric_cols = [c for c in numeric_cols if c not in {"choke_pct", "choke_size_64", "choke_ambiguous"}]
 if not numeric_cols:
     st.error("No numeric plotting columns were detected. Check the file headers or paste format.")
     st.stop()
@@ -1319,7 +1545,7 @@ with st.sidebar:
             "water_rate_bpd", "qwat_s_bpd", "gas_rate_mmscfd", "gas_formation_mmscfd",
             "pumping_pressure_psi", "ctu_circulation_pressure_psi", "ctu_wellhead_pressure_psi",
             "ctu_reel_depth_ft", "ctu_reel_speed_ftmin", "ctu_n2_rate_scfm",
-            "bsw_pct", "wlr_s_pct", "whp_psi",
+            "bsw_pct", "wlr_s_pct", "whp_psi", "choke_unified",
             "flow_press_psi", "sep_p_psi", "salinity_kppm",
         ] if c in numeric_cols
     ] or numeric_cols[: min(6, len(numeric_cols))]
@@ -2217,7 +2443,7 @@ if selected_features and not filtered.empty:
         # Auto compact format to prevent label overlap.
         if feature in ["bsw_pct", "co2_mole_pct"]:
             txt = f"{v:.1f}"
-        elif feature in ["salinity_kppm", "choke_pct", "whp_psi", "sep_p_psi", "pumping_pressure_psi"]:
+        elif feature in ["salinity_kppm", "choke_pct", "choke_size_64", "choke_ambiguous", "choke_unified", "whp_psi", "sep_p_psi", "pumping_pressure_psi"]:
             txt = f"{v:.0f}"
         elif abs(v) >= 100:
             txt = f"{v:.0f}"
