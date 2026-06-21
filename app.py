@@ -687,17 +687,36 @@ st.caption(
 )
 
 with st.sidebar:
-    st.header("1) Upload data")
+    st.header("Dashboard controls")
+    st.caption("Open only the section you need.")
+
+with st.sidebar.expander("1. Data input", expanded=True):
     uploaded_files = st.file_uploader(
         "Upload one or many files",
         type=["xlsx", "xls", "csv", "txt", "docx", "pdf", "zip", "jpg", "jpeg", "png"],
         accept_multiple_files=True,
         help="Upload normal test files or a WhatsApp exported ZIP. ZIP can contain _chat.txt, Excel/PDF/DOCX/CSV attachments, and CTU screen images.",
     )
-    # Parsing caches invalidate automatically when file content or parser build changes.
-    # A manual clear-cache button is intentionally omitted from the normal user workflow.
+    whatsapp_text = st.text_area(
+        "Or paste one or many TMU WhatsApp messages",
+        height=180,
+        placeholder="""PICO TMU-02
+Date :06-06-2026
+Well name : B3C18-7
+Time @ 10:30
+Choke = 100%
+W.H.P =60 PSI
+Sep. P = 50 PSI
+Gas rate =1.386 MMSCF/D
+Gross rate = 264 BBL/D
+Oil rate= 0 STB/D
+Water rate = 264 BBL/D
+BS&W = 100 %
+Salinity = 35K PPM of NaCl
+Pumping P= 849 Psi""",
+    )
 
-    st.header("2) Test split and CTU image OCR")
+with st.sidebar.expander("2. Processing options", expanded=False):
     keep_same_well_one_test = st.checkbox(
         "Keep same well as one test regardless of time gap",
         value=False,
@@ -725,26 +744,6 @@ with st.sidebar:
         value=1000,
         step=50,
         help="Use the OCR checkbox above to skip images completely. Set this to 0 only when you want to OCR every image in the ZIP. Excel/text/PDF attachments are always parsed normally.",
-    )
-
-    st.header("3) Paste WhatsApp report")
-    whatsapp_text = st.text_area(
-        "Paste one or many TMU WhatsApp messages",
-        height=260,
-        placeholder="""PICO TMU-02
-Date :06-06-2026
-Well name : B3C18-7
-Time @ 10:30
-Choke = 100%
-W.H.P =60 PSI
-Sep. P = 50 PSI
-Gas rate =1.386 MMSCF/D
-Gross rate = 264 BBL/D
-Oil rate= 0 STB/D
-Water rate = 264 BBL/D
-BS&W = 100 %
-Salinity = 35K PPM of NaCl
-Pumping P= 849 Psi""",
     )
 
 @st.cache_data(show_spinner=False, ttl=3600, max_entries=24)
@@ -1356,8 +1355,8 @@ def convert_intervals_for_plot(operation_intervals, df, x_axis_mode):
 # ---------------------------------------------------------------------------
 # Display-unit conversion (v58)
 # ---------------------------------------------------------------------------
-with st.sidebar:
-    st.header("Display units")
+units_sidebar_section = st.sidebar.expander("3. Units and choke", expanded=False)
+with units_sidebar_section:
     pressure_display_unit = st.selectbox(
         "Pressure unit", ["psi", "bar"], index=0, key="pressure_display_unit_v58",
         help="Changes plot/table display only. Uploaded source values remain unchanged.",
@@ -1407,13 +1406,13 @@ _has_choke_size = "choke_size_64" in data.columns and pd.to_numeric(data["choke_
 _has_choke_ambiguous = "choke_ambiguous" in data.columns and pd.to_numeric(data["choke_ambiguous"], errors="coerce").notna().any()
 choke_plot_mode = "Keep source units separate"
 choke_full_open_64 = 128.0
-show_raw_choke_features = True
+show_raw_choke_features = False
 ambiguous_choke_unit = "Auto from surrounding source units"
 treat_zero_choke_as_missing = True
 
 if _has_choke_pct or _has_choke_size or _has_choke_ambiguous:
-    with st.sidebar:
-        st.header("Choke conversion")
+    with units_sidebar_section:
+        st.markdown("**Choke**")
         choke_plot_mode = st.selectbox(
             "Choke unit to plot",
             [
@@ -1456,11 +1455,6 @@ if _has_choke_pct or _has_choke_size or _has_choke_ambiguous:
                 "Recommended for TMU reports where unused choke cells are stored as 0. "
                 "Turn this off only when 0 truly means the choke was fully closed."
             ),
-        )
-        show_raw_choke_features = st.checkbox(
-            "Also show original choke columns in feature list",
-            value=False,
-            help="Off gives one clean converted choke feature. Turn on only to compare raw source units.",
         )
 
     _pct = pd.to_numeric(data.get("choke_pct", pd.Series(index=data.index, dtype=float)), errors="coerce")
@@ -1584,28 +1578,9 @@ if _has_choke_pct or _has_choke_size or _has_choke_ambiguous:
                 )
             data[_raw_choke_col] = pd.Series(_raw_vals, index=data.index, dtype="float64").mask(lambda x: x.eq(0))
 
-    with st.sidebar:
-        if not choke_plot_mode.startswith("Keep"):
-            st.caption(
-                f"Conversion: Choke % = size ÷ {choke_full_open_64:g} × 100; "
-                f"size (/64) = Choke % ÷ 100 × {choke_full_open_64:g}."
-            )
-            if _conflict_count:
-                st.warning(
-                    f"{_conflict_count} timestamp(s) contain both units but differ by more than 2 percentage points. "
-                    "The original value already in the selected target unit is used."
-                )
-            if int(_oversize_mask.sum()):
-                st.warning(
-                    f"{int(_oversize_mask.sum())} choke-size value(s) exceed the selected full-open size and were not converted."
-                )
-            if ambiguous_choke_unit.startswith("Auto") and _auto_ambiguous_fallback_groups:
-                st.info(
-                    f"For {_auto_ambiguous_fallback_groups} source group(s), the unit of bare choke values could not be proven; "
-                    "Auto treated them as percentage. You can override this above."
-                )
 
 numeric_cols = available_numeric_columns(data)
+show_raw_choke_features = choke_plot_mode.startswith("Keep")
 if not show_raw_choke_features and "choke_unified" in numeric_cols:
     numeric_cols = [c for c in numeric_cols if c not in {"choke_pct", "choke_size_64", "choke_ambiguous"}]
 if not numeric_cols:
@@ -1641,8 +1616,7 @@ with st.expander("Detected columns from uploaded files", expanded=False):
         )
 
 # Sidebar filters
-with st.sidebar:
-    st.header("4) Time scale")
+with st.sidebar.expander("4. Time and timeline", expanded=False):
     time_filter_mode = st.selectbox(
         "Time range control",
         ["Slider", "Manual calendar/time"],
@@ -1717,7 +1691,7 @@ with st.sidebar:
     trace_grouping = "Auto"
 
 
-    st.header("5) Filter and plot")
+with st.sidebar.expander("5. Wells and features", expanded=True):
 
     # Prefer recent wells/tests with actual numeric readings, not alphabetical chat history.
     def _has_any_plot_numeric(_df):
@@ -1797,7 +1771,6 @@ with st.sidebar:
     )
     st.session_state[select_all_prev_key] = bool(select_all_features)
 
-    st.caption("Unit changes keep the same selected feature keys. Conversions affect display/export only; source values remain unchanged.")
 
     if selected_tests:
         if len(selected_tests) == 1:
@@ -1820,6 +1793,7 @@ with st.sidebar:
         key=f"chart_header_{abs(hash(data_title_signature))}_{len(data)}",
     )
 
+with st.sidebar.expander("6. Chart appearance", expanded=False):
     custom_y_ranges = {}
     with st.expander("Y-axis scale per graph", expanded=False):
         use_custom_y_scale = st.checkbox(
@@ -2001,7 +1975,7 @@ with st.sidebar:
 
     show_internal_names = False
 
-    st.header("6) Graph events")
+with st.sidebar.expander("7. Events and notes", expanded=False):
 
     auto_hide_crowded_notes = st.checkbox(
         "Auto hide some notes when too crowded",
