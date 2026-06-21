@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 
+PARSER_BUILD_ID_V55 = "v55-safe-datetime-pandas3"
 KEYWORDS = [
     "date", "time", "well", "choke", "whp", "w.h.p", "wellhead", "sep", "separator",
     "gas", "formation", "gross", "oil", "water", "bsw", "bs&w", "wc", "salinity",
@@ -848,31 +849,153 @@ def clean_numeric_series(series: pd.Series, canonical_name: str) -> pd.Series:
     return s
 
 
-def parse_date_series(series: pd.Series) -> pd.Series:
+def _datetime_year_is_safe_v55(value, min_year: int = 1900, max_year: int = 2100) -> bool:
+    try:
+        if pd.isna(value):
+            return False
+    except Exception:
+        pass
+    try:
+        year = int(pd.Timestamp(value).year)
+        return min_year <= year <= max_year
+    except Exception:
+        return False
+
+
+def _safe_datetime_scalar_v55(value, *, dayfirst: bool = True, allow_excel_serial: bool = False):
+    """Parse one date/datetime without allowing numeric measurements to become years.
+
+    Pandas 3 on Python 3.14 may parse a plain value such as 1423 or 2613 as a
+    real year using second-resolution timestamps. Assigning that result into a
+    nanosecond datetime Series then raises OutOfBoundsDatetime or an internal
+    AssertionError. TMU files also contain many four-digit pressures/rates, so
+    plain numeric values must not be treated as calendar years.
+    """
     import datetime as _dt
 
-    def one(x):
-        if pd.isna(x):
+    try:
+        if value is None or pd.isna(value):
             return pd.NaT
-        if isinstance(x, pd.Timestamp):
-            return pd.Timestamp(x.date())
-        if isinstance(x, _dt.datetime):
-            return pd.Timestamp(x.date())
-        if isinstance(x, _dt.date):
-            return pd.Timestamp(x)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)
-            return pd.to_datetime(x, errors="coerce", dayfirst=True)
+    except Exception:
+        if value is None:
+            return pd.NaT
 
-    return series.map(one)
+    if isinstance(value, pd.Timestamp):
+        return value if _datetime_year_is_safe_v55(value) else pd.NaT
+    if isinstance(value, _dt.datetime):
+        ts = pd.Timestamp(value)
+        return ts if _datetime_year_is_safe_v55(ts) else pd.NaT
+    if isinstance(value, _dt.date):
+        ts = pd.Timestamp(value)
+        return ts if _datetime_year_is_safe_v55(ts) else pd.NaT
+
+    if isinstance(value, (int, float, np.number)) and not isinstance(value, bool):
+        try:
+            number = float(value)
+        except Exception:
+            return pd.NaT
+        # Normal Excel serial dates for the supported 1900-2100 window are
+        # approximately 1..73415. Restrict further to modern field data to avoid
+        # interpreting pressures/rates such as 1423 or 2613 as dates.
+        if allow_excel_serial and 20000.0 <= number <= 80000.0:
+            try:
+                ts = pd.Timestamp("1899-12-30") + pd.to_timedelta(number, unit="D")
+                return ts if _datetime_year_is_safe_v55(ts) else pd.NaT
+            except Exception:
+                return pd.NaT
+        return pd.NaT
+
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "nat", "none", "null", "-"}:
+        return pd.NaT
+
+    # Reject plain numeric strings. In these workbooks they are overwhelmingly
+    # rates, pressures, depths, or counts—not dates. Permit YYYYMMDD explicitly.
+    compact = text.replace(",", "")
+    if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", compact):
+        if re.fullmatch(r"\d{8}", compact):
+            try:
+                ts = pd.to_datetime(compact, format="%Y%m%d", errors="coerce")
+                return ts if _datetime_year_is_safe_v55(ts) else pd.NaT
+            except Exception:
+                return pd.NaT
+        if allow_excel_serial:
+            try:
+                number = float(compact)
+                if 20000.0 <= number <= 80000.0:
+                    ts = pd.Timestamp("1899-12-30") + pd.to_timedelta(number, unit="D")
+                    return ts if _datetime_year_is_safe_v55(ts) else pd.NaT
+            except Exception:
+                pass
+        return pd.NaT
+
+    # Require a recognisable date marker before calling pandas/dateutil. This
+    # prevents arbitrary operational text or isolated values from becoming dates.
+    date_like = bool(
+        re.search(r"\d{1,4}[/-]\d{1,2}[/-]\d{1,4}", text)
+        or re.search(r"\d{1,2}[ -](?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[ -]\d{2,4}", text, re.I)
+        or re.search(r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[ -]\d{1,2}[, -]+\d{2,4}", text, re.I)
+        or re.match(r"^\d{4}-\d{1,2}-\d{1,2}[T ]", text)
+    )
+    if not date_like:
+        return pd.NaT
+
+    iso = bool(re.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}", text))
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ts = pd.to_datetime(text, errors="coerce", dayfirst=False if iso else dayfirst)
+    except Exception:
+        return pd.NaT
+    return ts if _datetime_year_is_safe_v55(ts) else pd.NaT
+
+
+def _safe_datetime_series_v55(series: pd.Series, *, dayfirst: bool = True,
+                              allow_excel_serial: bool = False,
+                              normalize_date: bool = False) -> pd.Series:
+    """Return a nanosecond-safe Series without assigning mixed datetime units."""
+    values = []
+    for value in series.tolist():
+        ts = _safe_datetime_scalar_v55(
+            value, dayfirst=dayfirst, allow_excel_serial=allow_excel_serial
+        )
+        if normalize_date and pd.notna(ts):
+            try:
+                ts = pd.Timestamp(ts).normalize()
+            except Exception:
+                ts = pd.NaT
+        values.append(ts)
+
+    # All out-of-range values have already been removed, so this construction is
+    # safe on pandas 2.x and 3.x and avoids .loc assignment between datetime units.
+    try:
+        arr = pd.to_datetime(values, errors="coerce")
+        return pd.Series(arr, index=series.index, dtype="datetime64[ns]")
+    except Exception:
+        clean = []
+        for value in values:
+            clean.append(value if _datetime_year_is_safe_v55(value) else pd.NaT)
+        return pd.Series(clean, index=series.index, dtype="datetime64[ns]")
+
+
+def parse_date_series(series: pd.Series) -> pd.Series:
+    # Date columns may contain genuine Excel serial dates, but only within the
+    # modern safe range. Four-digit measurements are rejected.
+    return _safe_datetime_series_v55(
+        series, dayfirst=True, allow_excel_serial=True, normalize_date=True
+    )
 
 
 def parse_time_series(series: pd.Series) -> pd.Series:
     import datetime as _dt
 
     def one(x):
-        if pd.isna(x):
-            return pd.NaT
+        try:
+            if x is None or pd.isna(x):
+                return pd.NaT
+        except Exception:
+            if x is None:
+                return pd.NaT
 
         if isinstance(x, pd.Timestamp):
             return pd.Timestamp("1900-01-01") + pd.Timedelta(hours=x.hour, minutes=x.minute, seconds=x.second)
@@ -880,46 +1003,64 @@ def parse_time_series(series: pd.Series) -> pd.Series:
             return pd.Timestamp("1900-01-01") + pd.Timedelta(hours=x.hour, minutes=x.minute, seconds=x.second)
         if isinstance(x, _dt.time):
             return pd.Timestamp("1900-01-01") + pd.Timedelta(hours=x.hour, minutes=x.minute, seconds=x.second)
+        if isinstance(x, (_dt.timedelta, pd.Timedelta)):
+            try:
+                seconds = int(round(pd.Timedelta(x).total_seconds())) % 86400
+                return pd.Timestamp("1900-01-01") + pd.Timedelta(seconds=seconds)
+            except Exception:
+                return pd.NaT
 
         if isinstance(x, (int, float, np.number)) and not isinstance(x, bool):
-            if 0 <= float(x) < 1:
-                seconds = int(round(float(x) * 24 * 3600))
-                return pd.Timestamp("1900-01-01") + pd.Timedelta(seconds=seconds)
+            try:
+                xf = float(x)
+                # Some TMU templates keep cumulative Excel time values above 1
+                # (for example 2.0833 = 02:00 on a later copied date row). Use
+                # only the fractional day, while rejecting large measurements.
+                if 0 <= xf < 10:
+                    seconds = int(round((xf % 1.0) * 24 * 3600)) % 86400
+                    return pd.Timestamp("1900-01-01") + pd.Timedelta(seconds=seconds)
+            except Exception:
+                return pd.NaT
 
-        s = str(x)
-        m = re.search(r"(\d{1,2})[:.](\d{2})(?:[:.](\d{2}))?", s)
+        text = str(x).strip()
+        if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", text):
+            try:
+                xf = float(text)
+                if 0 <= xf < 10:
+                    seconds = int(round((xf % 1.0) * 24 * 3600)) % 86400
+                    return pd.Timestamp("1900-01-01") + pd.Timedelta(seconds=seconds)
+            except Exception:
+                return pd.NaT
+        m = re.fullmatch(r"\s*(\d{1,2})[:.](\d{2})(?:[:.](\d{2}))?\s*(am|pm)?\s*", text, re.I)
         if m:
             hh = int(m.group(1))
             mm = int(m.group(2))
             ss = int(m.group(3) or 0)
-            return pd.Timestamp("1900-01-01") + pd.Timedelta(hours=hh, minutes=mm, seconds=ss)
+            ampm = (m.group(4) or "").lower()
+            if ampm == "pm" and hh < 12:
+                hh += 12
+            if ampm == "am" and hh == 12:
+                hh = 0
+            if 0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 59:
+                return pd.Timestamp("1900-01-01") + pd.Timedelta(hours=hh, minutes=mm, seconds=ss)
+        return pd.NaT
 
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)
-            return pd.to_datetime(s, errors="coerce")
-
-    return series.map(one)
-
-
+    values = [one(x) for x in series.tolist()]
+    return pd.Series(values, index=series.index, dtype="datetime64[ns]")
 
 
 def parse_datetime_series(series: pd.Series) -> pd.Series:
-    """Parse mixed datetime values safely without flooding Streamlit logs with pandas warnings.
+    """Parse mixed datetimes while rejecting numeric measurements as years.
 
-    ISO yyyy-mm-dd strings must not use dayfirst=True. Other field formats such
-    as 10-06-2026 are parsed with dayfirst=True. Any unparseable values become NaT.
+    This implementation deliberately avoids assigning pandas 3 second-resolution
+    timestamps into a nanosecond Series, which caused the internal pandas error
+    reported on Python 3.14.
     """
-    out = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
-    str_s = series.astype(str).str.strip()
-    iso_mask = str_s.str.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}", na=False)
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)
-        if iso_mask.any():
-            out.loc[iso_mask] = pd.to_datetime(series.loc[iso_mask], errors="coerce", dayfirst=False)
-        if (~iso_mask).any():
-            out.loc[~iso_mask] = pd.to_datetime(series.loc[~iso_mask], errors="coerce", dayfirst=True)
-    return out
+    header = clean_header(getattr(series, "name", ""))
+    allow_serial = bool(re.search(r"date|datetime|timestamp", header))
+    return _safe_datetime_series_v55(
+        series, dayfirst=True, allow_excel_serial=allow_serial, normalize_date=False
+    )
 
 def combine_date_time(
     date_series: Optional[pd.Series] = None,
@@ -5048,13 +5189,19 @@ def _iter_sheet_cells_limited_v53(zf, sheet_path: str, shared_strings: list,
 
 
 def _excel_serial_date_v53(value):
+    """Convert only plausible modern Excel serial dates.
+
+    Values such as 1234, 1423, 2600, and 2613 are operational measurements in
+    these TMU sheets and must never be interpreted as calendar years/dates.
+    """
     try:
         f = float(str(value).strip())
     except Exception:
         return value
-    if 1000 < f < 100000:
+    if 20000.0 <= f <= 80000.0:
         try:
-            return pd.Timestamp("1899-12-30") + pd.to_timedelta(f, unit="D")
+            ts = pd.Timestamp("1899-12-30") + pd.to_timedelta(f, unit="D")
+            return ts if 1900 <= int(ts.year) <= 2100 else value
         except Exception:
             return value
     return value
@@ -5065,7 +5212,11 @@ def _excel_serial_time_v53(value):
         f = float(str(value).strip())
     except Exception:
         return value
-    if 0 <= f < 2:
+    # Some copied TMU sheets use cumulative Excel day values above 1 or 2 in
+    # the Time column. Only the fractional day is the clock time. Since this
+    # function is called only for a strongly detected Time column, values below
+    # 10 days are safe to normalize and must not be dropped.
+    if 0 <= f < 10:
         try:
             seconds = int(round((f % 1.0) * 86400)) % 86400
             return (pd.Timestamp("1900-01-01") + pd.Timedelta(seconds=seconds)).time()
@@ -5077,17 +5228,16 @@ def _excel_serial_time_v53(value):
 def _normalize_excel_date_time_columns_v53(raw: pd.DataFrame) -> pd.DataFrame:
     if raw is None or raw.empty:
         return raw
-    # Pandas 3 / Python 3.14 may infer Arrow-backed string columns. Assigning
-    # Timestamp or datetime.time values into those columns raises:
-    #   TypeError: Invalid value for dtype 'str'
-    # Rebuild the raw worksheet as a true object-dtype frame before converting
-    # Excel serial dates/times. Mixed Excel cells are expected here.
+
+    # Rebuild from Python lists. This prevents Arrow/string/datetime extension
+    # arrays from surviving into the raw worksheet and avoids pandas setitem bugs.
     out = pd.DataFrame(
-        raw.to_numpy(dtype=object, copy=True),
+        [[cell for cell in row] for row in raw.to_numpy(dtype=object).tolist()],
         index=raw.index.copy(),
         columns=raw.columns.copy(),
         dtype=object,
     )
+
     date_cols = []
     time_cols = []
     header_end_by_col = {}
@@ -5102,21 +5252,44 @@ def _normalize_excel_date_time_columns_v53(raw: pd.DataFrame) -> pd.DataFrame:
             if re.search(r"(^|\b)time($|\b)|hh:mm", txt):
                 time_cols.append(c)
                 header_end_by_col[c] = max(header_end_by_col.get(c, 0), r)
-    # Field templates overwhelmingly use A/B even if a merged header was missed.
-    if not date_cols and out.shape[1] >= 1:
-        date_cols = [0]
-    if not time_cols and out.shape[1] >= 2:
-        time_cols = [1]
-    for c in sorted(set(date_cols)):
-        start = header_end_by_col.get(c, 0) + 1
-        converted = out.iloc[start:, c].map(_excel_serial_date_v53).astype(object)
-        out.loc[out.index[start:], out.columns[c]] = converted.to_numpy(dtype=object)
-    for c in sorted(set(time_cols)):
-        start = header_end_by_col.get(c, 0) + 1
-        converted = out.iloc[start:, c].map(_excel_serial_time_v53).astype(object)
-        out.loc[out.index[start:], out.columns[c]] = converted.to_numpy(dtype=object)
-    return out
 
+    # Use A/B fallback only when their values actually look like date/time data.
+    if not date_cols and out.shape[1] >= 1:
+        sample = out.iloc[: min(len(out), 100), 0].tolist()
+        plausible = sum(
+            1 for v in sample
+            if isinstance(v, (pd.Timestamp,))
+            or (isinstance(v, (int, float, np.number)) and not isinstance(v, bool) and 20000 <= float(v) <= 80000)
+            or bool(re.search(r"\d{1,4}[/-]\d{1,2}[/-]\d{1,4}", str(v or "")))
+        )
+        if plausible >= 2:
+            date_cols = [0]
+    if not time_cols and out.shape[1] >= 2:
+        sample = out.iloc[: min(len(out), 100), 1].tolist()
+        plausible = sum(
+            1 for v in sample
+            if hasattr(v, "hour") and hasattr(v, "minute") and not isinstance(v, (str, int, float, np.number))
+            or (isinstance(v, (int, float, np.number)) and not isinstance(v, bool) and 0 <= float(v) < 2)
+            or bool(re.fullmatch(r"\s*\d{1,2}[:.]\d{2}(?::\d{2})?\s*(?:am|pm)?\s*", str(v or ""), re.I))
+        )
+        if plausible >= 2:
+            time_cols = [1]
+
+    for c in sorted(set(date_cols)):
+        start = header_end_by_col.get(c, -1) + 1
+        values = out.iloc[:, c].tolist()
+        for i in range(max(0, start), len(values)):
+            values[i] = _excel_serial_date_v53(values[i])
+        out.iloc[:, c] = pd.Series(values, index=out.index, dtype=object).to_numpy(dtype=object)
+
+    for c in sorted(set(time_cols)):
+        start = header_end_by_col.get(c, -1) + 1
+        values = out.iloc[:, c].tolist()
+        for i in range(max(0, start), len(values)):
+            values[i] = _excel_serial_time_v53(values[i])
+        out.iloc[:, c] = pd.Series(values, index=out.index, dtype=object).to_numpy(dtype=object)
+
+    return pd.DataFrame(out.to_numpy(dtype=object), index=out.index, columns=out.columns, dtype=object)
 
 def _raw_dataframe_from_sheet_xml_v53(zf, sheet_path: str, shared_strings: list,
                                       max_rows: int = 20000, max_cols: int = 512):

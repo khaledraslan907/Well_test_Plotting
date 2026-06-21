@@ -1,0 +1,15 @@
+v55 validation completed on the 17 uploaded B15-38 XLSX files.
+
+pandas 2.2.3:
+- 17/17 parsed
+- 753 source rows
+- 500 unique rows after merge
+- 253 duplicates merged
+
+pandas 3.0.3:
+- 17/17 parsed
+- 753 source rows
+- 500 unique rows after merge
+- 253 duplicates merged
+
+No OutOfBoundsDatetime, pandas internal AssertionError, or safe XML parser errors.
