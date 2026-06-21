@@ -53,7 +53,7 @@ available_numeric_columns = _tmu_parser.available_numeric_columns
 _parser_column_label = _tmu_parser.column_label
 load_tabular_file = _tmu_parser.load_tabular_file
 parse_many_tmu_messages = _tmu_parser.parse_many_tmu_messages
-PARSER_BUILD_ID = getattr(_tmu_parser, 'PARSER_BUILD_ID_V58', getattr(_tmu_parser, 'PARSER_BUILD_ID_V57', getattr(_tmu_parser, 'PARSER_BUILD_ID_V56', getattr(_tmu_parser, 'PARSER_BUILD_ID_V55', getattr(_tmu_parser, 'PARSER_BUILD_ID', 'v58')))))
+PARSER_BUILD_ID = getattr(_tmu_parser, 'PARSER_BUILD_ID_V59', getattr(_tmu_parser, 'PARSER_BUILD_ID_V58', getattr(_tmu_parser, 'PARSER_BUILD_ID_V57', getattr(_tmu_parser, 'PARSER_BUILD_ID_V56', getattr(_tmu_parser, 'PARSER_BUILD_ID_V55', getattr(_tmu_parser, 'PARSER_BUILD_ID', 'v59'))))))
 assign_test_ids = getattr(_tmu_parser, "assign_test_ids", lambda df, gap_hours=12.0: df)
 
 DISPLAY_LABEL_FILE = Path(__file__).with_name("user_display_labels.json")
@@ -596,12 +596,10 @@ def detected_test_separator_positions(df):
                         x_sep = pd.Timestamp(x0) + (pd.Timestamp(x1) - pd.Timestamp(x0)) / 2
                     except Exception:
                         x_sep = x1
-                if changed_test or changed_source:
-                    test_no += 1
-                    sep_label = f"Test {test_no}"
-                else:
-                    sep_label = "Data gap"
-                found.append({"x": x_sep, "label": sep_label})
+                # Keep the boundary visual only.  Do not add Test 1/Test 2
+                # labels, because report numbering can be misleading when an
+                # incomplete and final workbook belong to one physical test.
+                found.append({"x": x_sep})
             prev = cur
     dedup, seen = [], set()
     for item in found:
@@ -616,7 +614,7 @@ def chart_separator_positions(df):
     existing = {str(x.get("x")) for x in items}
     for x in compressed_separator_positions(df):
         if str(x) not in existing:
-            items.append({"x": x, "label": "New test"})
+            items.append({"x": x})
     return items
 
 
@@ -1411,6 +1409,7 @@ choke_plot_mode = "Keep source units separate"
 choke_full_open_64 = 128.0
 show_raw_choke_features = True
 ambiguous_choke_unit = "Auto from surrounding source units"
+treat_zero_choke_as_missing = True
 
 if _has_choke_pct or _has_choke_size or _has_choke_ambiguous:
     with st.sidebar:
@@ -1450,6 +1449,14 @@ if _has_choke_pct or _has_choke_size or _has_choke_ambiguous:
                     "Choose its meaning here, or let Auto use explicit values in the same source file."
                 ),
             )
+        treat_zero_choke_as_missing = st.checkbox(
+            "Treat zero choke as blank/template value",
+            value=True,
+            help=(
+                "Recommended for TMU reports where unused choke cells are stored as 0. "
+                "Turn this off only when 0 truly means the choke was fully closed."
+            ),
+        )
         show_raw_choke_features = st.checkbox(
             "Also show original choke columns in feature list",
             value=False,
@@ -1493,8 +1500,25 @@ if _has_choke_pct or _has_choke_size or _has_choke_ambiguous:
                     _amb_as_pct.loc[_idx] = _a.where(_a > 1.0, _a * 100.0)
                     _auto_ambiguous_fallback_groups += 1
 
-    _pct_effective = _pct.combine_first(_amb_as_pct)
-    _size_effective = _size.combine_first(_amb_as_size)
+    # Build the effective source series using plain float64 assignment instead
+    # of combine_first.  This avoids nullable/Arrow dtype surprises on newer
+    # pandas versions and guarantees that missing values never become numeric 0.
+    def _as_float64_series(values):
+        return pd.Series(pd.to_numeric(values, errors="coerce"), index=data.index, dtype="float64")
+
+    _pct = _as_float64_series(_pct)
+    _size = _as_float64_series(_size)
+    _amb_as_pct = _as_float64_series(_amb_as_pct)
+    _amb_as_size = _as_float64_series(_amb_as_size)
+
+    _pct_effective = _pct.copy()
+    _pct_fill_mask = _pct_effective.isna() & _amb_as_pct.notna()
+    _pct_effective.loc[_pct_fill_mask] = _amb_as_pct.loc[_pct_fill_mask]
+
+    _size_effective = _size.copy()
+    _size_fill_mask = _size_effective.isna() & _amb_as_size.notna()
+    _size_effective.loc[_size_fill_mask] = _amb_as_size.loc[_size_fill_mask]
+
     _converted_pct = (_size_effective / float(choke_full_open_64)) * 100.0
     _converted_size = (_pct_effective / 100.0) * float(choke_full_open_64)
 
@@ -1510,38 +1534,55 @@ if _has_choke_pct or _has_choke_size or _has_choke_ambiguous:
     _conflict_count = int((_conflict_mask & (_pct_difference > 2.0)).sum())
 
     if choke_plot_mode.startswith("Opening"):
-        data["choke_unified"] = _pct_effective.combine_first(_converted_pct)
-        data["choke_unified"] = pd.to_numeric(data["choke_unified"], errors="coerce").where(
-            lambda s: (s >= 0) & (s <= 100)
-        )
+        _target = _pct_effective.copy()
+        _fill_mask = _target.isna() & _converted_pct.notna()
+        _target.loc[_fill_mask] = _converted_pct.loc[_fill_mask]
+        _target = _target.where((_target >= 0) & (_target <= 100))
         st.session_state["choke_unified_label"] = "Choke Opening (%)"
     elif choke_plot_mode.startswith("Size"):
-        data["choke_unified"] = _size_effective.combine_first(_converted_size)
-        data["choke_unified"] = pd.to_numeric(data["choke_unified"], errors="coerce").where(
-            lambda s: (s >= 0) & (s <= float(choke_full_open_64))
-        )
+        _target = _size_effective.copy()
+        _fill_mask = _target.isna() & _converted_size.notna()
+        _target.loc[_fill_mask] = _converted_size.loc[_fill_mask]
+        _target = _target.where((_target >= 0) & (_target <= float(choke_full_open_64)))
         st.session_state["choke_unified_label"] = "Choke Size (/64 in)"
     else:
+        _target = None
         data.drop(columns=["choke_unified"], inplace=True, errors="ignore")
         st.session_state["choke_unified_label"] = "Unified Choke"
 
-    # Choke is a step setting. A reported zero while the well is clearly flowing
-    # is usually a blank/template zero, not a closed choke. Treat it as missing,
-    # then carry the nearest stated setting only inside the same detected test.
-    if "choke_unified" in data.columns:
-        _flowing = pd.Series(False, index=data.index)
-        for _fc in ["gross_rate_bpd", "oil_rate_stbd", "water_rate_bpd", "gas_rate_mmscfd", "whp_psi", "flp_psi"]:
-            if _fc in data.columns:
-                _flowing |= pd.to_numeric(data[_fc], errors="coerce").fillna(0).gt(0)
-        _choke_vals = pd.to_numeric(data["choke_unified"], errors="coerce")
-        _suspicious_zero = _choke_vals.eq(0) & _flowing
-        if _suspicious_zero.any():
-            data.loc[_suspicious_zero, "choke_unified"] = np.nan
-        _choke_group_cols = [c for c in ["well", "test_id", "source", "sheet"] if c in data.columns]
+    # TMU workbooks commonly store blank formula/template choke cells as zero.
+    # By default, remove every zero before filling.  This is intentionally not
+    # conditioned on flow columns, because some rows carry choke but no rate or
+    # pressure values.  Users can turn the option off for a genuine shut-in.
+    _choke_group_cols = [c for c in ["well", "source", "sheet"] if c in data.columns]
+    if _target is not None:
+        _target = pd.Series(_target, index=data.index, dtype="float64")
+        if treat_zero_choke_as_missing:
+            _target = _target.mask(_target.eq(0))
         if _choke_group_cols:
-            data["choke_unified"] = data.groupby(_choke_group_cols, dropna=False)["choke_unified"].transform(
-                lambda x: pd.to_numeric(x, errors="coerce").ffill().bfill()
+            _tmp = data[_choke_group_cols].copy()
+            _tmp["__choke_target"] = _target
+            _target = _tmp.groupby(_choke_group_cols, dropna=False, sort=False)["__choke_target"].transform(
+                lambda x: pd.Series(x, dtype="float64").ffill().bfill()
             )
+        if treat_zero_choke_as_missing:
+            _target = pd.Series(_target, index=data.index, dtype="float64").mask(lambda x: x.eq(0))
+        data["choke_unified"] = pd.Series(_target, index=data.index, dtype="float64")
+
+    # Apply the same zero-as-blank rule to optional raw choke plots.  This keeps
+    # an old saved raw-column selection from reintroducing false zero steps.
+    if treat_zero_choke_as_missing:
+        for _raw_choke_col in ["choke_pct", "choke_size_64", "choke_ambiguous"]:
+            if _raw_choke_col not in data.columns:
+                continue
+            _raw_vals = pd.Series(pd.to_numeric(data[_raw_choke_col], errors="coerce"), index=data.index, dtype="float64").mask(lambda x: x.eq(0))
+            if _choke_group_cols:
+                _tmp = data[_choke_group_cols].copy()
+                _tmp["__raw_choke"] = _raw_vals
+                _raw_vals = _tmp.groupby(_choke_group_cols, dropna=False, sort=False)["__raw_choke"].transform(
+                    lambda x: pd.Series(x, dtype="float64").ffill().bfill()
+                )
+            data[_raw_choke_col] = pd.Series(_raw_vals, index=data.index, dtype="float64").mask(lambda x: x.eq(0))
 
     with st.sidebar:
         if not choke_plot_mode.startswith("Keep"):
@@ -2456,21 +2497,11 @@ if selected_features and not filtered.empty:
             for r in range(1, len(features) + 1):
                 try:
                     fig.add_vline(
-                        x=x_sep, line_width=1.8, line_dash="dot",
-                        line_color="#64748b", opacity=0.78, row=r, col=1,
+                        x=x_sep, line_width=2.4, line_dash="dash",
+                        line_color="#334155", opacity=0.88, row=r, col=1,
                     )
                 except Exception:
                     pass
-            try:
-                fig.add_annotation(
-                    x=x_sep, y=1.01, xref="x", yref="paper",
-                    text=f"<b>{item.get('label', 'New test')}</b>", showarrow=False,
-                    textangle=-90, xanchor="left", yanchor="bottom",
-                    font=dict(size=10, color="#475569"),
-                    bgcolor="rgba(255,255,255,0.88)",
-                )
-            except Exception:
-                pass
         return fig
 
     def add_operation_intervals_to_plotly(fig, features):
@@ -3522,7 +3553,7 @@ if selected_features and not filtered.empty:
     def _draw_all_test_separators_matplotlib(ax, df_for_sep):
         for _sep in chart_separator_positions(df_for_sep):
             try:
-                ax.axvline(_sep.get("x"), color="#64748b", linestyle=":", linewidth=1.4, alpha=0.72)
+                ax.axvline(_sep.get("x"), color="#334155", linestyle="--", linewidth=2.0, alpha=0.88, zorder=8)
             except Exception:
                 pass
 
@@ -3635,44 +3666,50 @@ if selected_features and not filtered.empty:
         group_col = "series_label" if "series_label" in df.columns else "well"
         for ax, feature in zip(axes, features):
             for wi, series_label in enumerate(series_values):
-                g = df[df[group_col].astype(str) == series_label].copy()
-                if g.empty or feature not in g.columns:
+                g_all = df[df[group_col].astype(str) == series_label].copy()
+                if g_all.empty or feature not in g_all.columns:
                     continue
-                sort_col = "plot_x" if "plot_x" in g.columns else ("datetime" if "datetime" in g.columns else None)
-                g = g.sort_values(sort_col).reset_index(drop=True) if sort_col else g.reset_index(drop=True)
-
-                y = pd.to_numeric(g[feature], errors="coerce")
-                if y.notna().sum() == 0:
-                    continue
-                x = _matplotlib_x_values(g)
 
                 color = well_color(wi) if len(series_values) > 1 else feature_color(feature, wi)
-                ax.plot(
-                    x,
-                    y,
-                    marker="o" if show_points else None,
-                    markersize=4.8,
-                    linewidth=2.4,
-                    color=color,
-                    drawstyle="steps-post" if feature in {"choke_unified", "choke_pct", "choke_size_64", "choke_ambiguous"} else "default",
-                    label=series_label if len(series_values) > 1 else None,
-                )
-
-                idxs = chart_label_indices_for_export(g, feature)
-                for i in sorted(idxs):
-                    if i >= len(g) or pd.isna(y.iloc[i]):
+                first_segment = True
+                for g in iter_plot_segments(g_all):
+                    if g.empty:
                         continue
-                    ax.annotate(
-                        format_plot_value(feature, y.iloc[i]),
-                        (x.iloc[i], y.iloc[i]),
-                        textcoords="offset points",
-                        xytext=(0, 11 if i % 2 == 0 else -16),
-                        ha="center",
-                        fontsize=10.5,
+                    y = pd.to_numeric(g[feature], errors="coerce")
+                    if y.notna().sum() == 0:
+                        continue
+                    x = _matplotlib_x_values(g)
+
+                    # Plot each detected test/data segment separately.  This is
+                    # essential for PDF/PNG exports: matplotlib otherwise joins
+                    # the last point of one test to the first point of the next.
+                    ax.plot(
+                        x,
+                        y,
+                        marker="o" if show_points else None,
+                        markersize=4.8,
+                        linewidth=2.4,
                         color=color,
-                        fontweight="bold",
-                        bbox=dict(boxstyle="round,pad=0.10", fc="white", ec="none", alpha=0.72),
+                        drawstyle="steps-post" if feature in {"choke_unified", "choke_pct", "choke_size_64", "choke_ambiguous"} else "default",
+                        label=series_label if (len(series_values) > 1 and first_segment) else None,
                     )
+
+                    idxs = chart_label_indices_for_export(g, feature)
+                    for i in sorted(idxs):
+                        if i >= len(g) or pd.isna(y.iloc[i]):
+                            continue
+                        ax.annotate(
+                            format_plot_value(feature, y.iloc[i]),
+                            (x.iloc[i], y.iloc[i]),
+                            textcoords="offset points",
+                            xytext=(0, 11 if i % 2 == 0 else -16),
+                            ha="center",
+                            fontsize=10.5,
+                            color=color,
+                            fontweight="bold",
+                            bbox=dict(boxstyle="round,pad=0.10", fc="white", ec="none", alpha=0.72),
+                        )
+                    first_segment = False
 
             if feature in custom_y_ranges:
                 ax.set_ylim(custom_y_ranges[feature][0], custom_y_ranges[feature][1])

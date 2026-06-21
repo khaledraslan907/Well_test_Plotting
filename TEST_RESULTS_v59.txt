@@ -1,0 +1,12 @@
+v59 validation - 2026-06-21
+
+- app.py py_compile: PASS
+- tmu_parser.py py_compile: PASS
+- B15-38 uploaded Excel files parsed: 17/17
+- Parsed source rows: 753
+- Unique rows after duplicate merge: 500
+- Unified choke opening with 100%=128/64: 500 non-missing rows
+- False zero unified choke values: 0
+- Detected plot segments using 2-hour continuity rule: 13
+- Export plotting loop uses iter_plot_segments: PASS
+- Test-number text labels removed: PASS

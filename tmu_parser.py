@@ -11,6 +11,7 @@ import pandas as pd
 
 
 PARSER_BUILD_ID_V55 = "v55-safe-datetime-pandas3"
+PARSER_BUILD_ID_V59 = "v59-choke-zero-test-breaks-20260621"
 PARSER_BUILD_ID_V58 = "v58-persistent-units-test-separation-20260621"
 PARSER_BUILD_ID_V57 = PARSER_BUILD_ID_V58
 PARSER_BUILD_ID_V56 = PARSER_BUILD_ID_V57
