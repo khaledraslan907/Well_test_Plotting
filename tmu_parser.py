@@ -1,5793 +1,1743 @@
+from __future__ import annotations
 
-import re
-import warnings
+"""Unified robust ingestion layer for the TMU dashboard.
+
+This module intentionally keeps the mature OCR/PDF/WhatsApp ZIP logic from the
+previous parser in ``tmu_parser_legacy.py`` and replaces the fragile tabular
+loading path with one deterministic pipeline for Excel, CSV and pasted reports.
+
+Design goals:
+- Never trust an Excel declared used range.
+- Never infer a date from ordinary process values.
+- Accept production-test and device-only time series.
+- Preserve unknown numeric channels instead of rejecting a file.
+- Normalize equivalent well names and merge repeated/incomplete reports safely.
+- Keep source values auditable while presenting stable canonical feature names.
+"""
+
+import csv
 import io
+import math
+import re
 import zipfile
+import warnings
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
+import xml.etree.ElementTree as ET
 
 import numpy as np
 import pandas as pd
 
+import tmu_parser_legacy as legacy
 
-PARSER_BUILD_ID_V55 = "v55-safe-datetime-pandas3"
-PARSER_BUILD_ID_V59 = "v59-choke-zero-test-breaks-20260621"
-PARSER_BUILD_ID_V58 = "v58-persistent-units-test-separation-20260621"
-PARSER_BUILD_ID_V57 = PARSER_BUILD_ID_V58
-PARSER_BUILD_ID_V56 = PARSER_BUILD_ID_V57
-KEYWORDS = [
-    "date", "time", "well", "choke", "whp", "w.h.p", "wellhead", "sep", "separator",
-    "gas", "formation", "gross", "oil", "water", "bsw", "bs&w", "wc", "salinity",
-    "h2s", "co2", "pump", "pumping", "pressure", "n2", "nitrogen", "ct", "rate",
-]
+warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning, module=r"tmu_parser_legacy")
 
-UNIT_KEYWORDS = [
-    "psi", "psig", "psia", "bbl", "bbl/d", "stb", "stb/d", "bpd", "mmscf",
-    "mmscf/d", "scf", "ppm", "nacl", "mole", "deg api", "api", "%",
-    "c", "f", "hh:mm", "d/mm", "gpm", "bpm",
-]
+PARSER_BUILD_ID_V66 = "v66-unified-robust-ingestion-20260622"
+PARSER_BUILD_ID = PARSER_BUILD_ID_V66
 
-PARENT_HEADERS = {
-    "gas", "oil", "water", "gross rate", "production", "liquid rate",
-    "liquid metering", "gas metering", "pressure and temperature measurements",
-    "mpfm parameters", "fluid properties", "esp parameters", "well head",
-    "separator", "oil or cond.", "water reading", "ratio", "tmu",
-}
+# ---------------------------------------------------------------------------
+# Stable schema and labels
+# ---------------------------------------------------------------------------
+
+COLUMN_LABELS: Dict[str, str] = dict(getattr(legacy, "COLUMN_LABELS", {}))
+COLUMN_LABELS.update(
+    {
+        "gas_rate_status": "Gas Rate Status",
+        "source_priority": "Source Priority",
+        "source_row": "Source Row",
+        "source_group": "Source Group",
+        "data_quality_note": "Data Quality Note",
+    }
+)
 
 BASE_NON_PLOT_COLS = {
-    "source", "sheet", "well", "date", "time", "time_text", "datetime", "note", "test_unit"
+    "source", "sheet", "well", "date", "time", "time_text", "datetime",
+    "note", "test_unit", "test_id", "test_sequence", "source_type",
+    "link_status", "review_required", "message_index", "source_priority",
+    "source_row", "source_group", "data_quality_note", "_well_key",
+    "_minute_key", "_source_order", "_row_completeness",
 }
 
-COLUMN_LABELS = {
-    "choke_pct": "Choke Opening (%)",
-    "whp_psi": "WHP (psi)",
-    "flp_psi": "FLP (psi)",
-    "flt_c": "FLT (°C)",
-    "sep_p_psi": "Separator Pressure (psi)",
-    "gas_temp_c": "Gas Temp (°C)",
-    "gas_temp_f": "Gas Temp (°F)",
-    "gas_sg": "Gas Specific Gravity",
-    "orifice_size_in": "Orifice Size (in)",
-    "gas_rate_mmscfd": "Total Gas Rate (MMSCF/D)",
-    "gas_formation_mmscfd": "Formation Gas Rate (MMSCF/D)",
-    "gor_scf_bbl": "GOR (scf/bbl)",
-    "h2s_ppm": "H2S (ppm)",
-    "co2_mole_pct": "CO2 (mole %)",
-    "oil_temp_c": "Oil Temp (°C)",
-    "oil_temp_f": "Oil Temp (°F)",
-    "oil_kf": "Oil K.F Factor",
-    "oil_api": "Oil Gravity (API)",
-    "oil_meter_increment_bbl": "Oil Meter Increment (bbl)",
-    "oil_cmf": "Oil CMF",
-    "oil_rate_stbd": "Oil Rate (STB/D)",
-    "water_rate_bpd": "Water Rate (BBL/D)",
-    "bsw_pct": "BS&W (%)",
-    "salinity_kppm": "Salinity (K ppm NaCl)",
-    "gross_rate_bpd": "Gross Rate (BBL/D)",
-    "water_cum_bbl": "Water Cum (bbl)",
-    "pumping_pressure_psi": "Pumping Pressure (psi)",
-    "n2_rate_scfm": "N2 Rate (scfm)",
-    "ct_pressure_psi": "CT Pressure (psi)",
-    "ct_depth_m": "CT Depth (m)",
-    "ct_running_speed_ftmin": "CT Running Speed (ft/min)",
-    "ct_pipe_weight_lbf": "CT Pipe Weight (lbf)",
-    "u2_pass_side_pump_pressure_psi": "U2 Pass-side Pump Pressure (psi)",
-    "choke_size_64": "Choke Size (/64 in)",
-    "choke_ambiguous": "Choke (unit not stated)",
-    "choke_unified": "Unified Choke",
-    "flow_press_psi": "Flow Pressure (psi)",
-    "flow_temp_c": "Flow Temp (°C)",
-    "wellhead_temp_c": "Wellhead Temp (°C)",
-    "wellhead_temp_f": "Wellhead Temp (°F)",
-    "sep_temp_c": "Separator Temp (°C)",
-    "sep_temp_f": "Separator Temp (°F)",
-    "mpfm_press_psig": "MPFM Pressure (psig)",
-    "mpfm_temp_f": "MPFM Temp (°F)",
-    "dp_mbar": "DP (mbar)",
-    "qoil_s_stbd": "QOil(S) (STB/D)",
-    "qwat_s_bpd": "QWat(S) (BBL/D)",
-    "qgas_s_mmscfd": "QGas(S) (MMSCF/D)",
-    "qoil_a_bpd": "QOil(A) (BBL/D)",
-    "qwat_a_bpd": "QWat(A) (BBL/D)",
-    "qgas_a_mmcfd": "QGas(A) (MMCF/D)",
-    "wlr_s_pct": "WLR(S) (%)",
-    "qgross_s_bpd": "QGross(S) (BBL/D)",
-    "gor_s_scf_stb": "GOR(S) (SCF/STB)",
-    "gvf_a_pct": "GVF(A) (%)",
-    "flt_f": "FLT (°F)",
-    "flow_temp_f": "Flow Temp (°F)",
-    "flow_temp_c": "Flow Temp (°C)",
-    "wellhead_temp_c": "Wellhead Temp (°C)",
-    "wellhead_temp_f": "Wellhead Temp (°F)",
-    "sep_temp_c": "Separator Temp (°C)",
-    "sep_temp_f": "Separator Temp (°F)",
-    "sep_dp_inh2o": "Separator DP (inH2O)",
-    "gas_dp_inh2o": "Gas DP (inH2O)",
-    "oil_cum_bbl": "Oil Cum (bbl)",
-    "wat_cum_bbl": "Water Cum (bbl)",
-    "gas_cum_mscf": "Gas Cum (MSCF)",
-    "cgr_bbl_mmscf": "CGR (BBL/MMSCF)",
-    "oil_sg": "Oil SG",
-    "water_sg": "Water SG",
-    "water_ph": "Water pH",
-    "pump_freq_hz": "Pump Frequency (Hz)",
-    "pump_intake_pressure_psi": "Pi / Intake Pressure (psi)",
-    "pump_discharge_pressure_psi": "Pd / Discharge Pressure (psi)",
-    "motor_current_amp": "Motor Current (A)",
-    "motor_ama_amp": "AMA / Motor Current (A)",
-    "intake_temp_c": "Intake Temperature (°C)",
-    "intake_temp_f": "Intake Temperature (°F)",
-    "motor_temp_c": "Motor Temperature (°C)",
-    "motor_temp_f": "Motor Temperature (°F)",
-    "motor_load_pct": "Motor Load (%)",
-    "vibration_x": "Vibration X",
-    "vibration_y": "Vibration Y",
-    "vibration_z": "Vibration Z",
-    "drive_freq_hz": "Drive Frequency (Hz)",
-    "us_press_psi": "Upstream Pressure (psi)",
-    "us_temp_c": "Upstream Temp (°C)",
-    "ds_press_psi": "Downstream Pressure (psi)",
-    "fw_pct": "FW (%)",
-    "twc_pct": "TWC (%)",
-    "liquid_volume_bbl": "Liquid Volume (bbl)",
-    "gor_mmscf_bbl": "GOR (MMSCF/BBL)",
+CANONICAL_NUMERIC_FIELDS = {
+    key for key in COLUMN_LABELS
+    if key not in BASE_NON_PLOT_COLS and key not in {"gas_rate_status"}
 }
 
-
-def normalize_text(x: object) -> str:
-    if pd.isna(x):
-        return ""
-    s = str(x).strip().lower()
-    s = s.replace("\n", " ").replace("\r", " ")
-    s = re.sub(r"[\t_]+", " ", s)
-    s = re.sub(r"\s+", " ", s)
-    return s.strip()
-
-
-def safe_text(x: object) -> str:
-    """Return a safe display/header string for any Excel/PDF cell value."""
-    try:
-        if pd.isna(x):
-            return ""
-    except Exception:
-        pass
-    try:
-        s = str(x).strip()
-    except Exception:
-        s = ""
-    if s.lower() in ["nan", "nat", "none"]:
-        return ""
-    return s
-
-
-def safe_join(items, sep: str = " ") -> str:
-    """Join mixed objects safely; prevents float-in-header join crashes."""
-    return sep.join(safe_text(i) for i in items if safe_text(i))
-
-
-def clean_header(s: object) -> str:
-    s = normalize_text(s)
-    s = s.replace("&", " and ")
-    s = re.sub(r"[^a-z0-9/%.\- =]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def canonical_key(s: object) -> str:
-    """Normalize a user/company header into a stable alias key.
-
-    This is used by the Streamlit column-mapping UI.  Example:
-    "W.H.P (psig)" and "WHP psig" become comparable keys.
-    """
-    c = clean_header(s)
-    c = c.replace(" and ", " ")
-    c = re.sub(r"[^a-z0-9]+", "_", c).strip("_")
-    return c
-
-
-def standard_column_options(include_meta: bool = False) -> Dict[str, str]:
-    """Return canonical parser fields for the user-facing mapping UI."""
-    labels = dict(COLUMN_LABELS)
-    if include_meta:
-        labels.update({
-            "well": "Well Name",
-            "date": "Date",
-            "time": "Time",
-            "datetime": "Date & Time",
-            "note": "Note / Event",
-        })
-    return dict(sorted(labels.items(), key=lambda kv: kv[1].lower()))
-
-
-def is_datetime_like(x: object) -> bool:
-    import datetime as _dt
-    return isinstance(x, (_dt.datetime, _dt.date, _dt.time, pd.Timestamp))
-
-
-def is_numeric_like(x: object) -> bool:
-    if pd.isna(x):
-        return False
-    if isinstance(x, (int, float, np.number)) and not isinstance(x, bool):
-        return True
-    s = str(x).strip().replace(",", "")
-    if not s:
-        return False
-    return bool(re.fullmatch(r"[-+]?\d+(\.\d+)?", s))
-
-
-def row_keywords_score(row: pd.Series) -> int:
-    txt = safe_join([normalize_text(v) for v in row.tolist()])
-    return sum(1 for kw in KEYWORDS if kw in txt)
-
-def row_looks_like_data(row: pd.Series) -> bool:
-    """Detect actual data/event rows so they are not swallowed as header rows."""
-    vals = [v for v in row.tolist() if normalize_text(v)]
-    if not vals:
-        return False
-
-    first = vals[0]
-    first_txt = normalize_text(first)
-
-    # Dates/timestamps in first column are almost always data rows, not header rows.
-    if is_datetime_like(first):
-        return True
-
-    if re.match(r"^\d{1,2}[:.]\d{2}(:\d{2})?$", first_txt):
-        # EXPRO/PDF rows that start with time.
-        return True
-
-    if re.match(r"^\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}(\s+\d{1,2}[:.]\d{2})?", first_txt):
-        return True
-
-    return False
-
-
-def row_looks_like_units(row: pd.Series) -> bool:
-    vals = [v for v in row.tolist() if normalize_text(v)]
-    if not vals:
-        return False
-    txt = safe_join([normalize_text(v) for v in vals])
-    unit_count = sum(1 for kw in UNIT_KEYWORDS if kw in txt)
-    text_count = sum(not is_numeric_like(v) for v in vals)
-    return unit_count >= 2 and text_count >= 2
-
-
-def header_score(row: pd.Series) -> float:
-    if row_looks_like_data(row):
-        return -100.0
-
-    kw = row_keywords_score(row)
-    non_empty = int(row.notna().sum())
-    textish = sum((not is_numeric_like(v)) and normalize_text(v) != "" for v in row.tolist())
-    units = 6 if row_looks_like_units(row) else 0
-
-    # Strongly favor rows that contain "date/time" plus operational keywords.
-    row_txt = safe_join(normalize_text(v) for v in row.tolist())
-    time_bonus = 12 if ("date" in row_txt and "time" in row_txt) or "hh:mm" in row_txt else 0
-
-    return kw * 4 + min(textish, 25) + min(non_empty, 25) * 0.25 + units + time_bonus
-
-
-def detect_header_row(raw_df: pd.DataFrame, max_scan_rows: int = 80) -> int:
-    """Find the first row of a multi-row header block.
-
-    Many well-test templates use broad parent rows above the actual column labels:
-    e.g. PRODUCTION / GAS RATE / RATIO, or TMU / LAB DATA / Gas Metering.
-    This scores candidate header blocks instead of a single row.
-    """
-    if raw_df.empty:
-        return 0
-
-    scan_rows = min(max_scan_rows, len(raw_df))
-    best_idx = 0
-    best_score = -1.0
-
-    for i in range(scan_rows):
-        if row_looks_like_data(raw_df.iloc[i]):
-            continue
-
-        # Do not start a header block from a single metadata/reference cell such as
-        # "14.73 Psi and 60 °F Gas line Meter Run Size...". Parent merged headers
-        # like "Gas" or "Oil" are still allowed if they match PARENT_HEADERS.
-        row_vals_norm = [normalize_text(v) for v in raw_df.iloc[i].tolist() if normalize_text(v)]
-        row_txt = safe_join(row_vals_norm)
-        has_parent_cell = any(v in PARENT_HEADERS for v in row_vals_norm)
-        has_date_time_marker = ("date" in row_txt and "time" in row_txt) or "hh:mm" in row_txt
-        if len(row_vals_norm) < 2 and not has_parent_cell and not has_date_time_marker:
-            continue
-
-        row_score = header_score(raw_df.iloc[i])
-        if row_score < 0:
-            continue
-
-        group_score = row_score
-        row_joined_for_group = safe_join([normalize_text(v) for v in raw_df.iloc[i].tolist()])
-        group_has_date_time = "date" in row_joined_for_group or "hh:mm" in row_joined_for_group
-        header_rows = 1
-
-        # Look ahead and include subheader/unit rows until a data row starts.
-        for r in range(i + 1, min(len(raw_df), i + 6)):
-            if row_looks_like_data(raw_df.iloc[r]):
-                break
-            if is_header_like_subrow(raw_df.iloc[r]) or row_looks_like_units(raw_df.iloc[r]) or header_score(raw_df.iloc[r]) > 8:
-                group_score += max(header_score(raw_df.iloc[r]), 0) * 0.95
-                header_rows += 1
-                row_txt = safe_join([normalize_text(v) for v in raw_df.iloc[r].tolist()])
-                if "date" in row_txt or "hh:mm" in row_txt:
-                    group_has_date_time = True
-            else:
-                # allow one blank row inside metadata, but not inside a header block
-                break
-
-        if group_has_date_time:
-            group_score += 15
-        if header_rows >= 2:
-            group_score += 8
-
-        if group_score > best_score:
-            best_score = group_score
-            best_idx = i
-
-    return best_idx if best_score >= 10 else 0
-
-
-def is_header_like_subrow(row: pd.Series) -> bool:
-    vals = [v for v in row.tolist() if normalize_text(v)]
-    if not vals:
-        return False
-
-    if row_looks_like_data(row):
-        return False
-
-    txt = safe_join([normalize_text(v) for v in vals])
-    kw_count = sum(1 for kw in KEYWORDS if kw in txt)
-    unit_count = sum(1 for kw in UNIT_KEYWORDS if kw in txt)
-    numeric_count = sum(is_numeric_like(v) and not is_datetime_like(v) for v in vals)
-    text_count = sum(not is_numeric_like(v) for v in vals)
-
-    return (kw_count + unit_count >= 2 and text_count >= 2 and numeric_count <= max(3, text_count + 1))
-
-
-def fill_parent_groups(row_values: Iterable[object]) -> List[str]:
-    """Forward-fill merged parent/group headers across blank cells.
-
-    This handles rows such as:
-      PRESSURE AND TEMPERATURE MEASUREMENTS | ... | PRODUCTION | GAS RATE
-    where Excel merged cells appear as a value followed by blanks.
-    """
-    vals = [str(v).strip() if normalize_text(v) else "" for v in row_values]
-    non_empty = sum(1 for v in vals if v)
-    total = len(vals)
-
-    normalized_vals = [normalize_text(v) for v in vals if normalize_text(v)]
-    has_parent_cell = any(v in PARENT_HEADERS for v in normalized_vals)
-    short_group_row = all(len(v) <= 60 for v in normalized_vals)
-
-    should_fill = non_empty > 0 and short_group_row and (
-        non_empty <= max(3, int(total * 0.55))
-        or has_parent_cell
-    )
-
-    if not should_fill:
-        return vals
-
-    out = []
-    current = ""
-    for v in vals:
-        if v:
-            current = v
-            out.append(v)
-        else:
-            out.append(current)
-    return out
-
-
-def build_combined_headers(raw_df: pd.DataFrame, header_row: int, max_header_rows: int = 6):
-    header_rows = [header_row]
-
-    for r in range(header_row + 1, min(len(raw_df), header_row + max_header_rows)):
-        if row_looks_like_data(raw_df.iloc[r]):
-            break
-        if is_header_like_subrow(raw_df.iloc[r]) or row_looks_like_units(raw_df.iloc[r]) or header_score(raw_df.iloc[r]) > 8:
-            header_rows.append(r)
-        else:
-            break
-
-    header_matrix = []
-    for r in header_rows:
-        vals = fill_parent_groups(raw_df.iloc[r].tolist())
-        header_matrix.append(vals)
-
-    headers = []
-    for c in range(raw_df.shape[1]):
-        parts = []
-        for row_vals in header_matrix:
-            raw = row_vals[c] if c < len(row_vals) else ""
-            val = normalize_text(raw)
-            if not val or val == "nan" or is_datetime_like(raw):
-                continue
-            part = str(raw).strip()
-            if part and part.lower() != "nan" and part not in parts:
-                parts.append(part)
-
-        # Safety: some Excel templates may pass numeric/float objects into
-        # the combined header parts through merged or unit rows. Convert again
-        # before joining to avoid: sequence item X: expected str instance, float found.
-        parts = [str(p).strip() for p in parts if str(p).strip() and str(p).strip().lower() != "nan"]
-        header = safe_join(parts).strip() or f"Column_{c + 1}"
-        # compact repeated whitespace and obvious duplicate fragments
-        header = re.sub(r"\s+", " ", str(header))
-        headers.append(str(header))
-
-    return make_unique(headers), header_rows
-
-
-
-
-def make_unique(names: Iterable[object]) -> List[str]:
-    seen: Dict[str, int] = {}
-    out: List[str] = []
-
-    for n in names:
-        # Safety against float/numeric headers from Excel merged/unit rows.
-        name = str(n).strip() if str(n).strip() else "unnamed"
-        name = re.sub(r"\s+", " ", name)
-        if name.lower() == "nan":
-            name = "unnamed"
-        if name in seen:
-            seen[name] += 1
-            name = f"{name}.{seen[name]}"
-        else:
-            seen[name] = 0
-        out.append(str(name))
-
-    return out
-
-
-
-
-def table_from_raw(raw_df: pd.DataFrame) -> pd.DataFrame:
-    raw_df = raw_df.dropna(how="all").dropna(axis=1, how="all")
-    if raw_df.empty:
-        return raw_df
-
-    hdr = detect_header_row(raw_df)
-    headers, header_rows = build_combined_headers(raw_df, hdr)
-    data_start = max(header_rows) + 1
-
-    df = raw_df.iloc[data_start:].copy()
-    df.columns = [str(h) for h in headers[: df.shape[1]]]
-    df = df.dropna(how="all")
-    return df
-
-
-
-def canonical_candidate_score(canon: str, column_name: str) -> int:
-    c = clean_header(column_name)
-    score = 0
-
-    # Prefer exact operational rate/pressure fields over broader parent labels.
-    if canon == "bsw_pct":
-        if "bsw" in c or "bs and w" in c:
-            score += 20
-        if "wh" in c:
-            score -= 8
-    if canon == "oil_rate_stbd" and ("oil rate" in c or "oil q" in c or "oil or cond" in c):
-        score += 20
-    if canon == "water_rate_bpd" and ("water rate" in c or "water q" in c or "water reading" in c):
-        score += 20
-    if canon == "gross_rate_bpd" and ("gross" in c or "liq q" in c or "liquid rate" in c):
-        score += 20
-    if canon == "gas_rate_mmscfd" and ("gas rate" in c or "mmscf/d" in c):
-        score += 20
-    if canon == "gas_formation_mmscfd" and ("formation gas" in c or "gas formation" in c):
-        score += 30
-    if canon == "pumping_pressure_psi" and ("pump p" in c or "pumping p" in c or "pumping.p" in c or "pump.p" in c or "pump pressure" in c or "pumping pressure" in c):
-        score += 25
-    if canon == "gas_formation_mmscfd" and ("formation gas" in c or "gas formation" in c):
-        score += 30
-    if canon == "pumping_pressure_psi" and ("pump p" in c or "pumping p" in c or "pumping.p" in c or "pump.p" in c or "pump pressure" in c or "pumping pressure" in c):
-        score += 25
-    if canon == "sep_p_psi" and ("sep" in c or "separator" in c):
-        score += 20
-    if canon == "whp_psi" and ("well head" in c or "fthp" in c or "whp" in c or "u/s" in c):
-        score += 20
-    if canon == "datetime" and ("date" in c and "time" in c):
-        score += 20
-
-    # Penalize total/cumulative/event columns when looking for rates.
-    if canon in {"oil_rate_stbd", "water_rate_bpd", "gross_rate_bpd", "gas_rate_mmscfd"}:
-        if "cum" in c or "volume" in c:
-            score -= 12
-
-    return score
-
-
-
-def canonical_candidate_score(canon: str, column_name: str) -> int:
-    c = clean_header(column_name)
-    score = 0
-
-    if canon == "bsw_pct":
-        if "bsw" in c or "bs and w" in c:
-            score += 25
-        if "wh" in c:
-            score -= 8
-    if canon == "oil_rate_stbd" and ("oil rate" in c or "oil q" in c or ("oil or condensate" in c and "rate" in c)):
-        score += 25
-    if canon == "water_rate_bpd" and ("water rate" in c or "water q" in c or ("water reading" in c and "rate" in c)):
-        score += 25
-    if canon == "gross_rate_bpd" and ("gross" in c or "liq q" in c or "liquid rate" in c):
-        score += 20
-    if canon == "gas_rate_mmscfd" and ("gas rate" in c or "mmscf/d" in c):
-        score += 20
-    if canon == "sep_p_psi" and ("sep" in c or "separator" in c or "gasp" in c):
-        score += 20
-    if canon == "whp_psi" and ("well head" in c or "fthp" in c or "whp" in c or "u/s" in c):
-        score += 20
-    if canon == "datetime" and ("date" in c and "time" in c):
-        score += 20
-    if canon == "pump_intake_pressure_psi" and re.search(r"\b(pi|intake)\b", c):
-        score += 30
-    if canon == "pump_discharge_pressure_psi" and re.search(r"\b(pd|discharge|disch)\b", c):
-        score += 30
-    if canon == "motor_current_amp" and ("amp" in c or "current" in c or re.fullmatch(r"cur\.?", c)):
-        score += 30
-    if canon == "pump_freq_hz" and ("freq" in c or "hz" in c):
-        score += 30
-    if canon == "salinity_kppm":
-        if "salinity" in c:
-            score += 35
-        if "nacl" in c:
-            score += 35
-        if re.search(r"\bppm\b", c):
-            score += 10
-        if "water" in c:
-            score += 5
-        if any(term in c for term in ["api", "kf", "factor", "psig", "psi", "bbl/d", "bpd", "stb/d", "mmscf", "scf/stb", "h2o", "rate"]):
-            score -= 40
-
-    if canon in {"oil_rate_stbd", "water_rate_bpd", "gross_rate_bpd", "gas_rate_mmscfd"}:
-        if "cum" in c or "volume" in c:
-            score -= 14
-
-    return score
-
-
-def best_canonical_name(column_name: str) -> Optional[str]:
-    c = clean_header(column_name)
-    original = normalize_text(column_name)
-    cpad = f" {c} "
-
-    if c.startswith("calcul") or c in {"factor", "fb", "ftf", "fg", "fpv", "y2"}:
-        return None
-
-    # Date/time. Avoid broad fragments like "d m" because they match "liquid metering".
-    if ("date" in c and "time" in c) or "hh:mm" in c or re.search(r"dd[/\-]?\s*mon[/\-]?\s*yy", c) or "[dd-mm-yy]" in original:
-        return "datetime"
-    if re.fullmatch(r"(date|test date|start date|dd/mm/yy|ddmmyy)", c) or (re.search(r"\bdate\b", c) and "time" not in c and "last update" not in c):
-        return "date"
-    if re.fullmatch(r"(time|test time|hour|hh:mm:ss?|hh mm)", c) or ("time" in c and ("hh:mm" in c or "hh mm" in c)):
-        return "time"
-    if c in {"hhmm", "hh mm", "time hh mm", "time hh:mm"}:
-        return "time"
-
-    if re.fullmatch(r"well( name| no\.?)?", c) or c in {"well_name", "wellname"}:
-        return "well"
-    if "event" in c or "remark" in c or "comment" in c or re.search(r"\bnote\b", c):
-        return "note"
-
-    # Choke.
-    if "choke" in c:
-        if "size" in c or "/64" in c or '64"' in c:
-            return "choke_size_64"
-        return "choke_pct"
-
-    # Temperatures before pressures, because parent headers often contain "well head" or "separator".
-    if re.search(r"\bflt\b", c) or "flow line temp" in c or "flowline temp" in c:
-        return "flt_f" if ("deg f" in c or "°f" in c or re.search(r"\bf\b", c)) else "flt_c"
-    has_temp_child = bool(re.search(r"\btemp\.?\b", c)) or "deg f" in c or "deg. f" in c or "deg c" in c or "deg. c" in c or "°f" in c or "°c" in c
-    if "flow temp" in c or "d/s temp" in c or "ds temp" in c or "downstream temp" in c:
-        return "flow_temp_f" if ("deg f" in c or "°f" in c) else "flow_temp_c"
-    if "u/s temp" in c or "upstream temp" in c:
-        return "us_temp_c"
-    if "gast" in c or re.search(r"\bgas\s+(gas\s+)?t\b", c) or ("gas" in c and ("gas temp" in c or "gas temperature" in c)):
-        if re.search(r"\bgas\s+(gas\s+)?t\s+c\b", c) or re.search(r"\bgas\s+temp\s+c\b", c):
-            return "gas_temp_c"
-        if re.search(r"\bgas\s+(gas\s+)?t\s+f\b", c) or re.search(r"\bgas\s+temp\s+f\b", c):
-            return "gas_temp_f"
-        return "gas_temp_f" if ("deg f" in c or "°f" in c or re.search(r"\bf\b", c)) else "gas_temp_c"
-    if "oilt" in c or re.search(r"\boil\s+(oil\s+)?t\b", c) or ("oil" in c and ("oil temp" in c or "oil temperature" in c)):
-        if re.search(r"\boil\s+(oil\s+)?t\s+c\b", c) or re.search(r"\boil\s+temp\s+c\b", c):
-            return "oil_temp_c"
-        if re.search(r"\boil\s+(oil\s+)?t\s+f\b", c) or re.search(r"\boil\s+temp\s+f\b", c):
-            return "oil_temp_f"
-        return "oil_temp_f" if ("deg f" in c or "°f" in c or re.search(r"\bf\b", c)) else "oil_temp_c"
-    if "oil or condensate" in c and ("deg f" in c or "deg. f" in c or "deg c" in c or "deg. c" in c):
-        return "oil_temp_f" if ("deg f" in c or "deg. f" in c) else "oil_temp_c"
-    if "well head" in c and has_temp_child and "psig" not in c and "psi-g" not in c and "psi" not in c:
-        return "wellhead_temp_f" if ("deg f" in c or "deg. f" in c or "°f" in c) else "wellhead_temp_c"
-    if ("separator" in c or "sep" in c) and has_temp_child and "psig" not in c and "psi-g" not in c and "psi" not in c and "inh2o" not in c:
-        return "sep_temp_f" if ("deg f" in c or "deg. f" in c or "°f" in c) else "sep_temp_c"
-
-    # Gross rate can be polluted by merged parent rows that contain "salinity".
-    if "gross rate" in c and ("bbl/d" in c or "bpd" in c):
-        return "gross_rate_bpd"
-
-    # Fluid properties before rates because parent words can include "oil".
-    if "bs and w" in c or "bs&w" in original or "bsw" in c or "water cut" in c or "watercut" in c or re.fullmatch(r"wc %?", c):
-        return "bsw_pct"
-    if "fw" == c or re.fullmatch(r"fw %?", c) or " lab data fw " in f" {c} ":
-        return "fw_pct"
-    if "twc" in c:
-        return "twc_pct"
-    if ("salinity" in c or "nacl" in c or "salt" in c) and "gross rate" not in c:
-        # Avoid false salinity mapping caused by merged-header forward-fill.
-        # Example bad headers from wide TMU sheets: "api Salinity BBL/D",
-        # "[psig] Salinity BBL/D", "Factor Salinity BBL/D". Those are
-        # helper/pressure/rate columns that inherited the word Salinity from a
-        # neighboring column; they must not be plotted as salinity.
-        salinity_conflicts = [
-            "api", "kf", "factor", "psig", "psi", "psia", "bbl/d", "bpd",
-            "stb/d", "mmscf", "scf/stb", "h2o", "gross rate", "oil t",
-            "air =1", "chart", "orifice", "gor", "rate",
-        ]
-        has_conflict = any(term in c for term in salinity_conflicts)
-        has_strong_salinity_unit = ("nacl" in c) or re.search(r"\bsalinity\b.*\bppm\b", c)
-        if has_conflict and not has_strong_salinity_unit:
-            return None
-        return "salinity_kppm"
-    if ("oil" in c and "sg" in c):
-        return "oil_sg"
-    if ("water" in c and "sg" in c):
-        return "water_sg"
-    if ("water" in c and "ph" in c) or re.fullmatch(r"ph", c):
-        return "water_ph"
-    if ("gravity" in c and "api" in c) or "oil api" in c or "grav. deg api" in c:
-        return "oil_api"
-    if ("gravity" in c and "air" in c) or "gas sg" in c or "gas gravity" in c or "air = 1" in c:
-        return "gas_sg"
-    if "sp.gr" in c or "sp gr" in c or "specific gravity" in c:
-        return "gas_sg"
-    if re.search(r"\bh2s\b", c):
-        return "h2s_ppm"
-    if re.search(r"\bco2\b|co₂", c):
-        return "co2_mole_pct"
-
-    # MPFM/EXPRO explicit columns.
-    if "qoil" in c and "(s" in c:
-        return "qoil_s_stbd"
-    if "qwat" in c and "(s" in c:
-        return "qwat_s_bpd"
-    if "qgas" in c and "(s" in c:
-        return "qgas_s_mmscfd"
-    if "qoil" in c and "(a" in c:
-        return "qoil_a_bpd"
-    if "qwat" in c and "(a" in c:
-        return "qwat_a_bpd"
-    if "qgas" in c and "(a" in c:
-        return "qgas_a_mmcfd"
-    if "qgross" in c:
-        return "qgross_s_bpd"
-    if re.search(r"\bwlr\b", c):
-        return "wlr_s_pct"
-    if "gvf" in c:
-        return "gvf_a_pct"
-
-    # Rates / cumulative volumes. Order matters.
-    if "oil cum" in c or ("oil" in c and "cum" in c) or re.search(r"\bcum\.?\s*stb\b", c):
-        return "oil_cum_bbl"
-    if "wat cum" in c or "water cum" in c or "water cumulative" in c:
-        return "wat_cum_bbl"
-    if "gas cum" in c:
-        return "gas_cum_mscf"
-    if "liquid volume" in c or "lquid volume" in c:
-        return "liquid_volume_bbl"
-
-    # Formation gas must be checked before total gas because headers can contain
-    # "formation gas rate", which also includes the phrase "gas rate".
-    if "gas formation" in c or "formation gas" in c:
-        return "gas_formation_mmscfd"
-
-    # Gas rate first because some templates have polluted headers such as
-    # "GAS WATER READING RATE MMSCF/D" after merged-cell extraction.
-    if ("total gas rate" in c) or ("gas rate" in c) or ("mmscf/d" in c and "gas" in c) or re.search(r"\brate mmscf/d\b", c):
-        return "gas_rate_mmscfd"
-
-    if "oil rate" in c or "oil q" in c or ("oil or condensate" in c and "rate" in c) or (re.search(r"\brate\b", c) and "stb/d" in c and "water" not in c and "gas" not in c and "gross" not in c):
-        return "oil_rate_stbd"
-    if "water rate" in c or "water q" in c or "bwpd" in c or ("water reading" in c and "rate" in c and "mmscf" not in c):
-        return "water_rate_bpd"
-    if "gross rate" in c or ("gross" in c and ("bbl" in c or "bpd" in c)):
-        return "gross_rate_bpd"
-    if "liq q" in c:
-        return "gross_rate_bpd"
-    if "liquid rate" in c:
-        if "oil" in c:
-            return "oil_rate_stbd"
-        if "water" in c:
-            return "water_rate_bpd"
-        return "gross_rate_bpd"
-    if re.search(r"\brate\b", c) and "bbl/d" in c and "oil" not in c and "gas" not in c and "gross" not in c:
-        return "water_rate_bpd"
-
-    # ESP / artificial-lift short aliases.  These are intentionally handled
-    # before generic pressure/temperature rules because headers like Pi/Pd/Amp/Freq
-    # are short and may otherwise remain raw fallback columns.  The strict fullmatch
-    # rules avoid misclassifying broad text.
-    if re.fullmatch(r"(pi|p/i|p int|pint|pump intake p|pump intake pressure|intake pressure|intake p|pin|pi psi|pi psig)", c):
-        return "pump_intake_pressure_psi"
-    if re.fullmatch(r"(pd|p/d|p dis|pdis|pump discharge p|pump discharge pressure|discharge pressure|disch pressure|discharge p|pd psi|pd psig)", c):
-        return "pump_discharge_pressure_psi"
-    if re.fullmatch(r"(amp|amps|ampere|amperage|current|motor current|pump current|run current|cur|cur\.?|i)", c) or ("amp" in c and "temp" not in c):
-        return "motor_current_amp"
-    if re.fullmatch(r"(ama|a m a)", c):
-        return "motor_ama_amp"
-    if re.fullmatch(r"(freq|frequency|hz|run freq|run frequency|operating freq|operating frequency|pump freq|pump frequency)", c):
-        return "pump_freq_hz"
-    if re.fullmatch(r"(drive freq|drive frequency|vsd freq|vfd freq|vfd frequency|speed hz)", c):
-        return "drive_freq_hz"
-    if re.fullmatch(r"(ti|t/i|intake temp|intake temperature|pump intake temp|pump intake temperature|ti c|ti deg c)", c):
-        return "intake_temp_c"
-    if re.fullmatch(r"(ti f|ti deg f|intake temp f|intake temperature f)", c):
-        return "intake_temp_f"
-    if re.fullmatch(r"(tm|t/m|motor temp|motor temperature|motor winding temp|tm c|tm deg c)", c):
-        return "motor_temp_c"
-    if re.fullmatch(r"(tm f|tm deg f|motor temp f|motor temperature f)", c):
-        return "motor_temp_f"
-    if re.fullmatch(r"(motor load|load pct|load %|motor load %)", c):
-        return "motor_load_pct"
-    if re.fullmatch(r"(vx|vib x|vibration x|x vibration)", c):
-        return "vibration_x"
-    if re.fullmatch(r"(vy|vib y|vibration y|y vibration)", c):
-        return "vibration_y"
-    if re.fullmatch(r"(vz|vib z|vibration z|z vibration)", c):
-        return "vibration_z"
-
-    # Pressures / DP.
-    if re.search(r"\bflp\b|flow line pressure|flowline pressure", c):
-        return "flp_psi"
-    if "flow press" in c or "d/s press" in c or "ds press" in c or "downstream" in c:
-        return "flow_press_psi"
-    if re.search(r"\bfthp\b|\bwhp\b|w\.?h\.?p|wellhead pressure|well head pressure", c):
-        return "whp_psi"
-    if ("well head" in c or "upstream" in c or "u/s" in c) and ("press" in c or "psi" in c):
-        return "whp_psi"
-    if ("sep" in c or "separator" in c or "gasp" in c or "gas p" in c) and ("dp" in c or "diff" in c or "inh2o" in c):
-        return "sep_dp_inh2o"
-    if "gasdp" in c:
-        return "gas_dp_inh2o"
-    if ("sep" in c or "separator" in c or "gasp" in c or "gas p" in c) and ("p" in c or "pressure" in c or "psig" in c or "psi" in c):
-        return "sep_p_psi"
-    if " dp " in f" {c} " or (re.search(r"\bdiff\b", c) and ("h2o" in c or "mbar" in c)):
-        return "dp_mbar" if "mbar" in c else "sep_dp_inh2o"
-    if re.search(r"\bpump\s*[.\-/ ]?\s*p\b|\bpumping\s*[.\-/ ]?\s*p\b|pumping[. ]*pressure|pump[. ]*pressure|circulation pressure", c):
-        return "pumping_pressure_psi"
-    if re.search(r"\bct pressure\b|ct press", c):
-        return "ct_pressure_psi"
-
-    # Ratios.
-    if "cgr" in c:
-        return "cgr_bbl_mmscf"
-    if re.search(r"\bgor\b", c):
-        if "mmscf/bbl" in c:
-            return "gor_mmscf_bbl"
-        return "gor_scf_bbl"
-
-    # Other operational parameters.
-    if "orifice" in c and "size" in c:
-        return "orifice_size_in"
-    if "mtr inc" in c or "meter inc" in c or "meter increment" in c:
-        return "oil_meter_increment_bbl"
-    if "cmf" in c and "oil" in c:
-        return "oil_cmf"
-    if "k .f" in c or c == "kf":
-        return "oil_kf"
-    if "n2" in c or "nitrogen" in c:
-        return "n2_rate_scfm"
-    if "ct depth" in c or ("depth" in c and "ct" in c):
-        return "ct_depth_m"
-    if "running speed" in c:
-        return "ct_running_speed_ftmin"
-    if "pipe weight" in c:
-        return "ct_pipe_weight_lbf"
-    if "u2 pass" in c and "pressure" in c:
-        return "u2_pass_side_pump_pressure_psi"
-    if "pump freq" in c or ("freq" in c and ("hz" in c or "pump" in c)):
-        return "pump_freq_hz"
-
-    return None
-
-def extract_number(value: object) -> float:
-    """Strict numeric extraction.
-
-    This intentionally reads only numbers at the start of the value.
-    It avoids pulling 0.750 from long event text such as
-    "Installed orifice plate size 0.750".
-    """
-    import datetime as _dt
-
-    if value is None or (isinstance(value, float) and np.isnan(value)):
-        return np.nan
-    if isinstance(value, _dt.time):
-        return np.nan
-    if isinstance(value, (_dt.datetime, _dt.date, pd.Timestamp)):
-        return np.nan
-    if isinstance(value, (int, float, np.number)) and not isinstance(value, bool):
-        return float(value)
-
-    s = str(value).strip().replace(",", "")
-    if not s or re.fullmatch(r"n/?a|nan|null|-", s, flags=re.I):
-        return np.nan
-
-    m = re.match(r"^\s*[-+]?\d*\.?\d+", s)
-    if not m:
-        return np.nan
-
-    try:
-        return float(m.group(0))
-    except ValueError:
-        return np.nan
-
-
-def clean_numeric_series(series: pd.Series, canonical_name: str) -> pd.Series:
-    s = series.map(extract_number).astype(float)
-
-    # Excel often stores choke opening as a fraction (0.32 = 32%).
-    if canonical_name == "choke_pct":
-        valid = s.dropna()
-        if not valid.empty and valid.median() <= 1.5:
-            s = s.where(s > 1.5, s * 100.0)
-        s = s.where((s >= 0) & (s <= 100))
-
-    # Many field templates label the column as in/64 but store 30/64 as
-    # Excel 30% (raw XML value 0.30). Restore the displayed numerator.
-    if canonical_name == "choke_size_64":
-        valid = s.dropna()
-        if not valid.empty and valid.max() < 1.0:
-            s = s * 100.0
-        s = s.where((s >= 0) & (s <= 256))
-
-    # BS&W can be stored either as percent (1 = 1%) or fraction (0.006 = 0.6%).
-    # Convert only clear fraction-style values, but do not turn 1% into 100%.
-    if canonical_name == "bsw_pct":
-        valid = s.dropna()
-        if not valid.empty and valid.max() <= 1.0 and valid.median() < 0.25:
-            s = s * 100.0
-
-    # Store salinity as K ppm because most plots/report templates use K ppm NaCl.
-    if canonical_name == "salinity_kppm":
-        med = s.dropna().median() if s.notna().any() else np.nan
-        if pd.notna(med) and med > 1000:
-            s = s / 1000.0
-
-    return s
-
-
-def _datetime_year_is_safe_v55(value, min_year: int = 1900, max_year: int = 2100) -> bool:
-    try:
-        if pd.isna(value):
-            return False
-    except Exception:
-        pass
-    try:
-        year = int(pd.Timestamp(value).year)
-        return min_year <= year <= max_year
-    except Exception:
-        return False
-
-
-def _safe_datetime_scalar_v55(value, *, dayfirst: bool = True, allow_excel_serial: bool = False):
-    """Parse one date/datetime without allowing numeric measurements to become years.
-
-    Pandas 3 on Python 3.14 may parse a plain value such as 1423 or 2613 as a
-    real year using second-resolution timestamps. Assigning that result into a
-    nanosecond datetime Series then raises OutOfBoundsDatetime or an internal
-    AssertionError. TMU files also contain many four-digit pressures/rates, so
-    plain numeric values must not be treated as calendar years.
-    """
-    import datetime as _dt
-
-    try:
-        if value is None or pd.isna(value):
-            return pd.NaT
-    except Exception:
-        if value is None:
-            return pd.NaT
-
-    if isinstance(value, pd.Timestamp):
-        return value if _datetime_year_is_safe_v55(value) else pd.NaT
-    if isinstance(value, _dt.datetime):
-        ts = pd.Timestamp(value)
-        return ts if _datetime_year_is_safe_v55(ts) else pd.NaT
-    if isinstance(value, _dt.date):
-        ts = pd.Timestamp(value)
-        return ts if _datetime_year_is_safe_v55(ts) else pd.NaT
-
-    if isinstance(value, (int, float, np.number)) and not isinstance(value, bool):
-        try:
-            number = float(value)
-        except Exception:
-            return pd.NaT
-        # Normal Excel serial dates for the supported 1900-2100 window are
-        # approximately 1..73415. Restrict further to modern field data to avoid
-        # interpreting pressures/rates such as 1423 or 2613 as dates.
-        if allow_excel_serial and 20000.0 <= number <= 80000.0:
-            try:
-                ts = pd.Timestamp("1899-12-30") + pd.to_timedelta(number, unit="D")
-                return ts if _datetime_year_is_safe_v55(ts) else pd.NaT
-            except Exception:
-                return pd.NaT
-        return pd.NaT
-
-    text = str(value).strip()
-    if not text or text.lower() in {"nan", "nat", "none", "null", "-"}:
-        return pd.NaT
-
-    # Reject plain numeric strings. In these workbooks they are overwhelmingly
-    # rates, pressures, depths, or counts—not dates. Permit YYYYMMDD explicitly.
-    compact = text.replace(",", "")
-    if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", compact):
-        if re.fullmatch(r"\d{8}", compact):
-            try:
-                ts = pd.to_datetime(compact, format="%Y%m%d", errors="coerce")
-                return ts if _datetime_year_is_safe_v55(ts) else pd.NaT
-            except Exception:
-                return pd.NaT
-        if allow_excel_serial:
-            try:
-                number = float(compact)
-                if 20000.0 <= number <= 80000.0:
-                    ts = pd.Timestamp("1899-12-30") + pd.to_timedelta(number, unit="D")
-                    return ts if _datetime_year_is_safe_v55(ts) else pd.NaT
-            except Exception:
-                pass
-        return pd.NaT
-
-    # Require a recognisable date marker before calling pandas/dateutil. This
-    # prevents arbitrary operational text or isolated values from becoming dates.
-    date_like = bool(
-        re.search(r"\d{1,4}[/-]\d{1,2}[/-]\d{1,4}", text)
-        or re.search(r"\d{1,2}[ -](?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[ -]\d{2,4}", text, re.I)
-        or re.search(r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[ -]\d{1,2}[, -]+\d{2,4}", text, re.I)
-        or re.match(r"^\d{4}-\d{1,2}-\d{1,2}[T ]", text)
-    )
-    if not date_like:
-        return pd.NaT
-
-    iso = bool(re.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}", text))
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            ts = pd.to_datetime(text, errors="coerce", dayfirst=False if iso else dayfirst)
-    except Exception:
-        return pd.NaT
-    return ts if _datetime_year_is_safe_v55(ts) else pd.NaT
-
-
-def _safe_datetime_series_v55(series: pd.Series, *, dayfirst: bool = True,
-                              allow_excel_serial: bool = False,
-                              normalize_date: bool = False) -> pd.Series:
-    """Return a nanosecond-safe Series without assigning mixed datetime units."""
-    values = []
-    for value in series.tolist():
-        ts = _safe_datetime_scalar_v55(
-            value, dayfirst=dayfirst, allow_excel_serial=allow_excel_serial
-        )
-        if normalize_date and pd.notna(ts):
-            try:
-                ts = pd.Timestamp(ts).normalize()
-            except Exception:
-                ts = pd.NaT
-        values.append(ts)
-
-    # All out-of-range values have already been removed, so this construction is
-    # safe on pandas 2.x and 3.x and avoids .loc assignment between datetime units.
-    try:
-        arr = pd.to_datetime(values, errors="coerce")
-        return pd.Series(arr, index=series.index, dtype="datetime64[ns]")
-    except Exception:
-        clean = []
-        for value in values:
-            clean.append(value if _datetime_year_is_safe_v55(value) else pd.NaT)
-        return pd.Series(clean, index=series.index, dtype="datetime64[ns]")
-
-
-def parse_date_series(series: pd.Series) -> pd.Series:
-    # Date columns may contain genuine Excel serial dates, but only within the
-    # modern safe range. Four-digit measurements are rejected.
-    return _safe_datetime_series_v55(
-        series, dayfirst=True, allow_excel_serial=True, normalize_date=True
-    )
-
-
-def parse_time_series(series: pd.Series) -> pd.Series:
-    import datetime as _dt
-
-    def one(x):
-        try:
-            if x is None or pd.isna(x):
-                return pd.NaT
-        except Exception:
-            if x is None:
-                return pd.NaT
-
-        if isinstance(x, pd.Timestamp):
-            return pd.Timestamp("1900-01-01") + pd.Timedelta(hours=x.hour, minutes=x.minute, seconds=x.second)
-        if isinstance(x, _dt.datetime):
-            return pd.Timestamp("1900-01-01") + pd.Timedelta(hours=x.hour, minutes=x.minute, seconds=x.second)
-        if isinstance(x, _dt.time):
-            return pd.Timestamp("1900-01-01") + pd.Timedelta(hours=x.hour, minutes=x.minute, seconds=x.second)
-        if isinstance(x, (_dt.timedelta, pd.Timedelta)):
-            try:
-                seconds = int(round(pd.Timedelta(x).total_seconds())) % 86400
-                return pd.Timestamp("1900-01-01") + pd.Timedelta(seconds=seconds)
-            except Exception:
-                return pd.NaT
-
-        if isinstance(x, (int, float, np.number)) and not isinstance(x, bool):
-            try:
-                xf = float(x)
-                # Some TMU templates keep cumulative Excel time values above 1
-                # (for example 2.0833 = 02:00 on a later copied date row). Use
-                # only the fractional day, while rejecting large measurements.
-                if 0 <= xf < 10:
-                    seconds = int(round((xf % 1.0) * 24 * 3600)) % 86400
-                    return pd.Timestamp("1900-01-01") + pd.Timedelta(seconds=seconds)
-            except Exception:
-                return pd.NaT
-
-        text = str(x).strip()
-        if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", text):
-            try:
-                xf = float(text)
-                if 0 <= xf < 10:
-                    seconds = int(round((xf % 1.0) * 24 * 3600)) % 86400
-                    return pd.Timestamp("1900-01-01") + pd.Timedelta(seconds=seconds)
-            except Exception:
-                return pd.NaT
-        m = re.fullmatch(r"\s*(\d{1,2})[:.](\d{2})(?:[:.](\d{2}))?\s*(am|pm)?\s*", text, re.I)
-        if m:
-            hh = int(m.group(1))
-            mm = int(m.group(2))
-            ss = int(m.group(3) or 0)
-            ampm = (m.group(4) or "").lower()
-            if ampm == "pm" and hh < 12:
-                hh += 12
-            if ampm == "am" and hh == 12:
-                hh = 0
-            if 0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 59:
-                return pd.Timestamp("1900-01-01") + pd.Timedelta(hours=hh, minutes=mm, seconds=ss)
-        return pd.NaT
-
-    values = [one(x) for x in series.tolist()]
-    return pd.Series(values, index=series.index, dtype="datetime64[ns]")
-
-
-def parse_datetime_series(series: pd.Series) -> pd.Series:
-    """Parse mixed datetimes while rejecting numeric measurements as years.
-
-    This implementation deliberately avoids assigning pandas 3 second-resolution
-    timestamps into a nanosecond Series, which caused the internal pandas error
-    reported on Python 3.14.
-    """
-    header = clean_header(getattr(series, "name", ""))
-    allow_serial = bool(re.search(r"date|datetime|timestamp", header))
-    return _safe_datetime_series_v55(
-        series, dayfirst=True, allow_excel_serial=allow_serial, normalize_date=False
-    )
-
-def combine_date_time(
-    date_series: Optional[pd.Series] = None,
-    time_series: Optional[pd.Series] = None,
-    datetime_series: Optional[pd.Series] = None,
-) -> pd.Series:
-    """Build a real datetime column from any available date/time inputs.
-
-    Important fix: Excel files often contain monthly/daily production history with a
-    Date column only and no separate Time column. Older versions returned all NaT
-    when time_series was missing, causing duplicate-removal to collapse the whole
-    sheet into one row and the workbook was rejected as "no usable time-series".
-    Date-only rows are now valid readings at midnight (00:00).
-    """
-    idx = None
-    for s in [date_series, time_series, datetime_series]:
-        if s is not None:
-            idx = s.index
-            break
-
-    if idx is None:
-        return pd.Series(dtype="datetime64[ns]")
-
-    if datetime_series is not None:
-        dt = parse_datetime_series(datetime_series)
-    else:
-        dt = pd.Series(pd.NaT, index=idx, dtype="datetime64[ns]")
-
-    dates = parse_date_series(date_series) if date_series is not None else pd.Series(pd.NaT, index=idx, dtype="datetime64[ns]")
-    times = parse_time_series(time_series) if time_series is not None else pd.Series(pd.NaT, index=idx, dtype="datetime64[ns]")
-
-    out = []
-    for d, t, existing in zip(dates, times, dt):
-        if pd.notna(existing):
-            out.append(pd.Timestamp(existing))
-        elif pd.notna(d) and pd.notna(t):
-            out.append(pd.Timestamp(d.date()) + pd.Timedelta(hours=t.hour, minutes=t.minute, seconds=t.second))
-        elif pd.notna(d):
-            # Date-only production-history sheets are valid time series.
-            out.append(pd.Timestamp(d.date()))
-        elif pd.notna(t):
-            out.append(pd.Timestamp("1900-01-01") + pd.Timedelta(hours=t.hour, minutes=t.minute, seconds=t.second))
-        else:
-            out.append(pd.NaT)
-
-    return pd.Series(out, index=idx, dtype="datetime64[ns]")
-
-
-
-
-
-def adjust_datetime_rollover(out: pd.DataFrame, parsed_time: Optional[pd.Series]) -> pd.DataFrame:
-    """Fix midnight rollover in templates where DATE is copied down but TIME resets from 23:30 to 00:00.
-
-    Example: date column remains 2026-06-05, rows are 23:30 then 00:00.
-    The 00:00 row is really 2026-06-06 00:00. We adjust in original row order before sorting.
-    """
-    if out is None or out.empty or parsed_time is None:
-        return out
-    if "date" not in out.columns or "datetime" not in out.columns:
-        return out
-    if parsed_time.notna().sum() < 2:
-        return out
-
-    dates = pd.to_datetime(out["date"], errors="coerce")
-    times = parsed_time
-    adjusted = out["datetime"].copy()
-
-    day_offset = 0
-    prev_valid_time = None
-    prev_base_date = None
-
-    for idx in out.index:
-        d = dates.loc[idx]
-        t = times.loc[idx]
-        if pd.isna(d) or pd.isna(t):
-            continue
-
-        base_date = pd.Timestamp(d.date())
-
-        # If the sheet explicitly advances the DATE column, reset offset.
-        if prev_base_date is not None and base_date > prev_base_date:
-            day_offset = 0
-
-        # If DATE did not advance but TIME moved backwards, assume midnight rollover.
-        if (
-            prev_valid_time is not None
-            and prev_base_date is not None
-            and base_date == prev_base_date
-            and (t.hour, t.minute, t.second) < (prev_valid_time.hour, prev_valid_time.minute, prev_valid_time.second)
-        ):
-            day_offset += 1
-
-        adjusted.loc[idx] = base_date + pd.Timedelta(days=day_offset) + pd.Timedelta(
-            hours=t.hour, minutes=t.minute, seconds=t.second
-        )
-
-        prev_valid_time = t
-        prev_base_date = base_date
-
-    out = out.copy()
-    out["datetime"] = adjusted
-    out["date"] = pd.to_datetime(out["datetime"], errors="coerce").dt.floor("D")
-    out["time_text"] = pd.to_datetime(out["datetime"], errors="coerce").dt.strftime("%H:%M")
-    return out
-
-
-def normalize_well_name(value: object) -> Optional[str]:
-    if value is None or pd.isna(value):
-        return None
-
-    s = str(value).strip()
-    if not s:
-        return None
-
-    # Remove obvious label prefixes.
-    s = re.sub(r"(?i)\bwell\s*(name|no\.?)?\s*[:=#-]*", "", s).strip()
-    s = s.replace("#", "-")
-    s = re.sub(r"\s*-\s*", "-", s)
-    s = re.sub(r"\s+", " ", s).strip(" :-_")
-    if not s:
-        return None
-
-    # Reject plain dates/numbers.
-    if re.fullmatch(r"\d{1,2}[-/]\d{1,2}[-/]\d{2,4}", s):
-        return None
-    if re.fullmatch(r"\d+(\.\d+)?", s):
-        return None
-
-    # Normalize common forms.
-    up = s.upper()
-
-    # BAHGA 11 -> BAHGA-11
-    up = re.sub(r"\b(BAHGA|ASSIL|KARAM|MAGD|ELMAGD|BED|SITRA|BAPETCO)\s+(\d)", r"\1-\2", up)
-
-    # MAGD C 86-4 / ELMAGD 86-4 kept readable.
-    up = re.sub(r"\bMAGD-C-", "MAGD C-", up)
-    up = re.sub(r"\bELMAGD-", "ELMAGD-", up)
-
-    # Remove duplicate spaces and spaces around hyphens.
-    up = re.sub(r"\s*-\s*", "-", up)
-    up = re.sub(r"\s+", " ", up).strip()
-
-    # Keep not-too-long candidates only.
-    if len(up) > 30:
-        return None
-
-    return up
-
-
-def guess_well_from_name(name: str) -> Optional[str]:
-    s = str(name)
-
-    # Remove date-like parenthetical blocks to avoid returning 03-07 or 8-12 as a well.
-    s_clean = re.sub(r"\([^)]*\d{1,2}[-/]\d{1,2}[-/]\d{2,4}[^)]*\)", " ", s)
-    s_clean = re.sub(r"\b\d{4}[-_]\d{2}[-_]\d{2}\b", " ", s_clean)
-
-    patterns = [
-        r"\b(BAHGA\s*#?\s*\d+[A-Z]?)\b",
-        r"\b(MAGD\s*C\s*\d+\s*[-_]\s*\d+[A-Z]?)\b",
-        r"\b(ELMAGD\s*\d+\s*[-_]\s*\d+[A-Z]?)\b",
-        r"\b(BED\s*\d+[A-Z]?\s*[-_]\s*\d+[A-Z]?)\b",
-        r"\b(B\d+[A-Z]*\d*\s*[-_]\s*\d+[A-Z]?)\b",
-        r"\b([A-Z][A-Z0-9]*\s*C?\s*\d+\s*[-_]\s*\d+[A-Z]?)\b",
-    ]
-
-    for pat in patterns:
-        m = re.search(pat, s_clean, flags=re.I)
-        if m:
-            well = normalize_well_name(m.group(1))
-            # Avoid false matches created by spreadsheet column labels plus dates, e.g. "Y2 06-06".
-            if well and re.fullmatch(r"[XYZ]\d+[- ]\d{1,2}[-_/]\d{1,2}", well):
-                continue
-            if well:
-                return well
-
-    return None
-
-
-def extract_well_from_raw(raw_df: pd.DataFrame, source_name: str = "", sheet_name: str = "") -> Optional[str]:
-    """Extract well name from workbook metadata rows before falling back to filename."""
-    try:
-        max_r = min(len(raw_df), 40)
-        max_c = min(raw_df.shape[1], 30)
-
-        for r in range(max_r):
-            row_vals = [raw_df.iloc[r, c] for c in range(max_c)]
-            for c, val in enumerate(row_vals):
-                txt = str(val).strip() if not pd.isna(val) else ""
-                if not txt:
-                    continue
-
-                # Cell contains the whole value: "WELL: Bahga#9"
-                m = re.search(r"(?i)\bwell\s*(?:name|no\.?)?\s*[:=#-]+\s*([A-Za-z0-9# \-_]+)", txt)
-                if m:
-                    well = normalize_well_name(m.group(1))
-                    if well:
-                        return well
-
-                # Label in this cell, value in nearby cells to the right.
-                if re.search(r"(?i)^\s*well\s*(name|no\.?)?\s*:?\s*$", txt):
-                    for k in range(c + 1, min(c + 5, max_c)):
-                        cand = normalize_well_name(raw_df.iloc[r, k])
-                        if cand:
-                            return cand
-
-                # Some templates use "Well  :" in one cell and the next cell has value.
-                if re.search(r"(?i)\bwell\b", txt) and len(txt) <= 20:
-                    for k in range(c + 1, min(c + 5, max_c)):
-                        cand = normalize_well_name(raw_df.iloc[r, k])
-                        if cand and not cand.startswith("TEST"):
-                            return cand
-
-        # As a last metadata attempt, look for known well patterns in all early text.
-        text_blob = safe_join(
-            [raw_df.iloc[r, c] for r in range(max_r) for c in range(max_c)]
-        )
-        guessed = guess_well_from_name(text_blob)
-        if guessed:
-            return guessed
-
-    except Exception:
-        pass
-
-    return guess_well_from_name(f"{source_name} {sheet_name}")
-
-
-
-def raw_output_column_name(column_name: object, existing_columns: Iterable[str]) -> str:
-    """Create a stable fallback name for numeric columns that do not match aliases yet."""
-    label = str(column_name).strip() if str(column_name).strip() else "Column"
-    safe = clean_header(label)
-    safe = re.sub(r"[^a-z0-9]+", "_", safe).strip("_")
-    if not safe:
-        safe = "column"
-    safe = safe[:80]
-    base = f"raw__{safe}"
-    name = base
-    i = 2
-    existing = set(existing_columns)
-    while name in existing:
-        name = f"{base}_{i}"
-        i += 1
-    return name
-
-
-def is_useful_raw_numeric_column(column_name: object, series: pd.Series) -> bool:
-    """Decide whether an unmapped column should still appear as a user-selectable raw column."""
-    header = clean_header(column_name)
-    if not header or header.startswith("unnamed") or header.startswith("column_"):
-        return False
-    if header in {"date", "time", "datetime", "well", "note", "event", "comments", "remarks"}:
-        return False
-    if "event" in header or "remark" in header or "comment" in header:
-        return False
-
-    # Avoid hidden calculation/helper columns that may be present far to the right
-    # of operational Excel templates.
-    helper_terms = [
-        "calcul", "calc", "factor", "ftf", "fg", "fb", "fpv", "y2",
-        "h2o", "psia", "base condition", "intermediate", "correction",
-    ]
-    if any(term in header for term in helper_terms):
-        return False
-
-    nums = series.map(extract_number).astype(float)
-    return nums.notna().any()
-
-
-
-def _choke_header_kind_v56(header: object) -> str:
-    """Return pct, size64, or ambiguous without mixing the two units."""
-    raw = str(header or "").lower()
-    h = clean_header(header)
-    if re.search(r"/\s*64|64\s*(?:th|ths)|in\s*/\s*64|size", raw + " " + h, flags=re.I):
-        return "size64"
-    if "%" in raw or re.search(r"\bpercent(?:age)?\b|\bopening\b", h):
-        return "pct"
-    return "ambiguous"
-
-
-def _split_choke_series_v56(series: pd.Series, header: object):
-    """Split one source choke column without guessing missing units.
-
-    Returns percentage, /64-size, ambiguous-raw, and a confidence score.
-    Explicit text/header units are authoritative. Bare values under a plain
-    "Choke" header are preserved in ``choke_ambiguous`` so the user can choose
-    percentage or /64 interpretation in the dashboard.
-    """
-    idx = series.index
-    pct = pd.Series(np.nan, index=idx, dtype=float)
-    size = pd.Series(np.nan, index=idx, dtype=float)
-    ambiguous = pd.Series(np.nan, index=idx, dtype=float)
-    kind = _choke_header_kind_v56(header)
-    text = series.astype(str).str.strip()
-    explicit_fraction = text.str.contains(r"[-+]?\d+(?:\.\d+)?\s*/\s*64\b", regex=True, case=False, na=False)
-    explicit_pct = text.str.contains(r"%|\bpercent(?:age)?\b", regex=True, case=False, na=False)
-    nums = series.map(extract_number).astype(float)
-    column_has_fraction = bool(explicit_fraction.any())
-
-    if explicit_fraction.any():
-        size.loc[explicit_fraction] = nums.loc[explicit_fraction]
-    if explicit_pct.any():
-        vals = nums.loc[explicit_pct]
-        pct.loc[explicit_pct] = vals.where(vals > 1.0, vals * 100.0)
-
-    remaining = ~(explicit_fraction | explicit_pct) & nums.notna()
-    vals = nums.loc[remaining]
-    if kind == "size64":
-        # Several TMU templates store displayed 30/64 as raw XML 0.30.
-        size.loc[remaining] = vals.where(vals >= 1.0, vals * 100.0)
-    elif kind == "pct":
-        pct.loc[remaining] = vals.where(vals > 1.0, vals * 100.0)
-    elif column_has_fraction:
-        # Once the same column explicitly contains /64 entries, other bare
-        # values above 1 are most consistently interpreted as /64 numerators.
-        # Values <=1 are typical fractional percentage entries.
-        frac_open = vals <= 1.0
-        pct.loc[vals.index[frac_open]] = vals.loc[frac_open] * 100.0
-        as_size = (vals > 1.0) & (vals <= 256.0)
-        size.loc[vals.index[as_size]] = vals.loc[as_size]
-    else:
-        # No unit evidence: preserve the raw number and let the user decide.
-        ambiguous.loc[remaining] = vals
-
-    pct = pct.where((pct >= 0) & (pct <= 100)).round(3)
-    size = size.where((size >= 0) & (size <= 256)).round(3)
-    ambiguous = ambiguous.where((ambiguous >= 0) & (ambiguous <= 256)).round(3)
-    explicit_score = 120 if kind in {"pct", "size64"} else 70
-    return pct, size, ambiguous, explicit_score
-
-
-def _collect_choke_columns_v56(df: pd.DataFrame):
-    pct_candidates = []
-    size_candidates = []
-    ambiguous_candidates = []
-    for col in df.columns:
-        header = str(col)
-        if "choke" not in clean_header(header):
-            continue
-        pct, size, ambiguous, score = _split_choke_series_v56(df[col], header)
-        kind = _choke_header_kind_v56(header)
-        if pct.notna().any():
-            pct_candidates.append((score + (20 if kind == "pct" else 0), pct))
-        if size.notna().any():
-            size_candidates.append((score + (20 if kind == "size64" else 0), size))
-        if ambiguous.notna().any():
-            ambiguous_candidates.append((score, ambiguous))
-
-    def combine(candidates):
-        if not candidates:
-            return None
-        result = pd.Series(np.nan, index=df.index, dtype=float)
-        for _, candidate in sorted(candidates, key=lambda x: x[0], reverse=True):
-            result = result.combine_first(candidate)
-        return result
-
-    return combine(pct_candidates), combine(size_candidates), combine(ambiguous_candidates)
-
-
-def standardize_dataframe(
-    df: pd.DataFrame,
-    source_name: str = "",
-    sheet_name: str = "",
-    default_well: Optional[str] = None,
-) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    # Drop fully empty rows, but do NOT blindly drop fully empty columns here.
-    # Some templates have a real field column whose values are all N/A, such as
-    # Salinity = N/A. If we drop that exact Salinity column first, a later
-    # helper/calculation column with a polluted merged header like
-    # "api Salinity BBL/D" can be selected by mistake and plotted as salinity.
-    df = df.copy().dropna(how="all")
-    if df.empty:
-        return pd.DataFrame()
-
-    keep_cols = []
-    for col in df.columns:
-        if not df[col].isna().all() or best_canonical_name(str(col)) is not None:
-            keep_cols.append(col)
-    df = df.loc[:, keep_cols]
-    if df.empty:
-        return pd.DataFrame()
-
-    # Choose the best source column for each canonical field.
-    best_map: Dict[str, tuple] = {}
-    for col in df.columns:
-        canon = best_canonical_name(str(col))
-        if not canon:
-            continue
-        score = canonical_candidate_score(canon, str(col))
-        if canon not in best_map or score > best_map[canon][1]:
-            best_map[canon] = (col, score)
-
-    mapping = [(canon, col_score[0]) for canon, col_score in best_map.items()]
-
-    out = pd.DataFrame(index=df.index)
-    out["source"] = source_name
-    out["sheet"] = sheet_name
-
-    mapped_source_cols = set()
-    for canon, col in mapping:
-        mapped_source_cols.add(col)
-        if canon in ["well", "date", "time", "datetime", "note"]:
-            out[canon] = df[col]
-        else:
-            out[canon] = clean_numeric_series(df[col], canon)
-
-    # Choke needs content-aware unit handling. A single workbook family may use
-    # percentage, /64-inch size, or even both in separate columns. Rebuild the
-    # two canonical series from the original source columns and never combine
-    # unlike units into one plotted curve.
-    choke_pct_v56, choke_size_v56, choke_ambiguous_v57 = _collect_choke_columns_v56(df)
-    mapped_choke_header = str(best_map.get("choke_pct", ("", 0))[0]) if "choke_pct" in best_map else ""
-    mapped_choke_kind = _choke_header_kind_v56(mapped_choke_header) if mapped_choke_header else "ambiguous"
-    if choke_pct_v56 is not None and choke_pct_v56.notna().any():
-        out["choke_pct"] = choke_pct_v56
-    elif "choke_pct" in out.columns and mapped_choke_kind == "pct":
-        out["choke_pct"] = pd.to_numeric(out["choke_pct"], errors="coerce").where(lambda x: (x >= 0) & (x <= 100))
-    else:
-        out.drop(columns=["choke_pct"], inplace=True, errors="ignore")
-    if choke_size_v56 is not None and choke_size_v56.notna().any():
-        out["choke_size_64"] = choke_size_v56
-    elif "choke_size_64" in out.columns:
-        out["choke_size_64"] = pd.to_numeric(out["choke_size_64"], errors="coerce").where(lambda x: (x >= 0) & (x <= 256))
-    if choke_ambiguous_v57 is not None and choke_ambiguous_v57.notna().any():
-        out["choke_ambiguous"] = choke_ambiguous_v57
-
-    # Fallback: keep numeric columns not yet recognized by aliases only when the
-    # table is mostly unknown. If a TMU template already produced many canonical
-    # fields (WHP, FLP, Sep P, Gas rate, Oil rate, etc.), keeping every extra
-    # helper/calculation/unit column creates confusing labels such as
-    # "Raw: Column" or "Raw: Psig" and can even cause the Excel loader to choose
-    # a lower-quality unit-row parse. Unknown templates still get raw columns.
-    mapped_numeric_count = sum(
-        1 for canon, _ in mapping
-        if canon not in {"well", "date", "time", "datetime", "note"}
-    )
-    keep_raw_fallback = mapped_numeric_count < 6
-
-    for col in df.columns:
-        if col in mapped_source_cols:
-            continue
-        if not keep_raw_fallback:
-            continue
-        if not is_useful_raw_numeric_column(col, df[col]):
-            continue
-        raw_name = raw_output_column_name(col, out.columns)
-        out[raw_name] = df[col].map(extract_number).astype(float)
-
-    # Parse date/time/datetime robustly.
-    if "datetime" in out.columns:
-        out["datetime"] = parse_datetime_series(out["datetime"])
-
-    if "date" in out.columns:
-        out["date"] = parse_date_series(out["date"])
-        out["date"] = out["date"].ffill().bfill()
-
-    parsed_time = None
-    if "time" in out.columns:
-        parsed_time = parse_time_series(out["time"])
-        out["time_text"] = parsed_time.dt.strftime("%H:%M")
-        out.loc[parsed_time.isna(), "time_text"] = ""
-
-    if ("datetime" not in out.columns or out["datetime"].isna().all()) and ("date" in out.columns or "time" in out.columns):
-        out["datetime"] = combine_date_time(out.get("date"), out.get("time"), out.get("datetime"))
-
-    # Derive date/time_text from datetime when a combined Date & Time column exists.
-    if "datetime" in out.columns and out["datetime"].notna().any():
-        if "date" not in out.columns:
-            out["date"] = out["datetime"].dt.floor("D")
-        if "time_text" not in out.columns:
-            out["time_text"] = out["datetime"].dt.strftime("%H:%M")
-
-    # Correct midnight rollover before sorting.
-    if parsed_time is not None:
-        out = adjust_datetime_rollover(out, parsed_time)
-
-    # Well name: source metadata > sheet/filename fallback.
-    if "well" in out.columns:
-        out["well"] = out["well"].map(lambda x: normalize_well_name(x) or "")
-    else:
-        out["well"] = ""
-
-    if out["well"].astype(str).str.strip().eq("").all():
-        well = default_well or guess_well_from_name(f"{source_name} {sheet_name}") or "Unknown"
-        out["well"] = well
-    else:
-        fallback = default_well or guess_well_from_name(f"{source_name} {sheet_name}") or "Unknown"
-        out["well"] = out["well"].replace("", np.nan).ffill().bfill().fillna(fallback)
-
-    numeric_cols = [c for c in out.columns if c not in BASE_NON_PLOT_COLS]
-    canonical_numeric_cols = [c for c in numeric_cols if not str(c).startswith("raw__")]
-    row_filter_cols = canonical_numeric_cols if canonical_numeric_cols else numeric_cols
-
-    if row_filter_cols:
-        useful = out[row_filter_cols].notna().any(axis=1)
-
-        # For tables with a separate TIME column, require a valid time.
-        # This removes event rows and rows such as Final Average that contain numbers but are not readings.
-        if parsed_time is not None and parsed_time.notna().sum() >= 2:
-            useful = useful & parsed_time.notna()
-        elif "datetime" in out.columns and out["datetime"].notna().sum() >= 2:
-            useful = useful & out["datetime"].notna()
-
-        # Drop pure average/summary/total rows even if the date column was forward-filled.
-        raw_text_for_row = df.apply(lambda r: safe_join(list(r.values), " | "), axis=1).str.lower()
-        useful = useful & ~raw_text_for_row.str.contains(
-            r"final\s+average|average|avg|summary|grand\s+total|^total",
-            regex=True,
-            na=False,
-        )
-
-        out = out.loc[useful].copy()
-
-    if out.empty:
-        return pd.DataFrame()
-
-    # Remove duplicate readings at the same well/datetime. This also cleans old dashboard-exported CSVs
-    # that may contain a duplicated Final Average row with a copied timestamp.
-    if "datetime" in out.columns and "well" in out.columns and out["datetime"].notna().any():
-        # Do not let all-NaT datetimes collapse a valid table to one row.
-        out = out.drop_duplicates(subset=["well", "datetime"], keep="first")
-
-    out["well"] = out["well"].astype(str).str.strip().replace("", "Unknown")
-    sort_cols = ["well"] + (["datetime"] if "datetime" in out.columns else [])
-    out = out.sort_values(sort_cols, na_position="last").reset_index(drop=True)
-
-    return out
-
-
-def dataframe_quality_score(df: pd.DataFrame) -> int:
-    """Score parsed tables so the Excel loader keeps the real operational table.
-
-    The old scoring over-valued the number of numeric columns. In wide TMU
-    spreadsheets, a bad unit-row parse can create dozens of raw columns such as
-    raw__psig/raw__column and beat the proper multi-row header parse. This scorer
-    now strongly prefers:
-      - recognized canonical TMU columns,
-      - real calendar datetimes (not 1900 time-only placeholders),
-      - date + time together,
-      - fewer raw fallback columns.
-    """
-    if df is None or df.empty:
-        return -10_000
-
-    numeric_cols = available_numeric_columns(df)
-    if not numeric_cols:
-        return -10_000
-
-    canonical_cols = [c for c in numeric_cols if not str(c).startswith("raw__")]
-    raw_cols = [c for c in numeric_cols if str(c).startswith("raw__")]
-
-    score = 0
-    score += min(len(df), 500) * 4
-    score += len(canonical_cols) * 300
-    score += len(raw_cols) * 5
-
-    # Penalize raw-only parses. They are useful as a fallback, but should not win
-    # over a table where columns have been identified as WHP, FLP, gas rate, etc.
-    if not canonical_cols:
-        score -= 700
-    if raw_cols and len(raw_cols) > max(5, len(canonical_cols) * 2):
-        score -= (len(raw_cols) - max(5, len(canonical_cols) * 2)) * 20
-
-    if "datetime" in df.columns:
-        dt = pd.to_datetime(df["datetime"], errors="coerce")
-        valid_dt = dt.dropna()
-        score += int(valid_dt.size) * 12
-        real_dt_count = int((valid_dt.dt.year > 1970).sum()) if not valid_dt.empty else 0
-        score += real_dt_count * 45
-        # Time-only fallback creates dates around 1900. It can be plotted, but it
-        # must never beat a parse with real file dates.
-        if valid_dt.size and real_dt_count == 0:
-            score -= 900
-
-    if "date" in df.columns:
-        dates = pd.to_datetime(df["date"], errors="coerce").dropna()
-        real_date_count = int((dates.dt.year > 1970).sum()) if not dates.empty else 0
-        score += real_date_count * 25
-
-    if "time_text" in df.columns:
-        score += int(df["time_text"].astype(str).str.strip().ne("").sum()) * 5
-
-    # Prefer the common field-test columns that users expect to see by name.
-    priority_cols = {
-        "choke_pct", "choke_ambiguous", "whp_psi", "flp_psi", "flt_c", "sep_p_psi",
-        "gas_rate_mmscfd", "oil_rate_stbd", "water_rate_bpd", "gross_rate_bpd",
-        "bsw_pct", "salinity_kppm",
-    }
-    score += sum(1 for c in priority_cols if c in df.columns) * 150
-
-    return int(score)
-
-def dataframe_key(df: pd.DataFrame) -> tuple:
-    """Return a loose de-duplication key for repeated parsing attempts."""
-    if df is None or df.empty:
-        return (0, "", "")
-    sheet = str(df["sheet"].iloc[0]) if "sheet" in df.columns and len(df) else ""
-    well = str(df["well"].iloc[0]) if "well" in df.columns and len(df) else ""
-    dt_min = ""
-    dt_max = ""
-    if "datetime" in df.columns:
-        dt = pd.to_datetime(df["datetime"], errors="coerce").dropna()
-        if not dt.empty:
-            dt_min = str(dt.min())
-            dt_max = str(dt.max())
-    return (len(df), sheet, well, dt_min, dt_max)
-
-
-def parse_datetime_value_count(series: pd.Series) -> int:
-    """Count values that contain both date and time information."""
-    parsed = parse_datetime_series(series)
-    raw = series.astype(str).str.strip()
-    raw_has_date_and_time = raw.str.contains(r"\d{1,4}[-/]\d{1,2}[-/]\d{1,4}.*\d{1,2}[:.]\d{2}|\d{1,2}[:.]\d{2}.*\d{1,4}[-/]\d{1,2}[-/]\d{1,4}", regex=True, na=False)
-
-    import datetime as _dt
-    object_has_time = series.map(
-        lambda x: isinstance(x, (pd.Timestamp, _dt.datetime)) and (x.hour != 0 or x.minute != 0 or x.second != 0)
-        if not pd.isna(x) else False
-    )
-    return int((parsed.notna() & (raw_has_date_and_time | object_has_time)).sum())
-
-
-def parse_date_value_count(series: pd.Series) -> int:
-    return int(parse_date_series(series).notna().sum())
-
-
-def parse_time_value_count(series: pd.Series) -> int:
-    parsed = parse_time_series(series)
-    # Treat pure dates parsed as midnight as weak time evidence unless the raw value had ':' or was an Excel time fraction.
-    raw = series.astype(str).str.strip()
-    raw_time_like = raw.str.contains(r"\d{1,2}[:.]\d{2}", regex=True, na=False)
-    excel_fraction_time = series.map(lambda x: isinstance(x, (int, float, np.number)) and not isinstance(x, bool) and 0 <= float(x) < 1 if not pd.isna(x) else False)
-    return int((parsed.notna() & (raw_time_like | excel_fraction_time)).sum())
-
-
-def best_value_column(raw_df: pd.DataFrame, kind: str, exclude: Optional[set] = None) -> Optional[object]:
-    """Detect date/time/datetime columns from cell values, not only from headers."""
-    exclude = exclude or set()
-    best_col = None
-    best_score = 0
-    for col in raw_df.columns:
-        if col in exclude:
-            continue
-        s = raw_df[col].dropna()
-        if s.empty:
-            continue
-        sample = s.head(80)
-        if kind == "datetime":
-            score = parse_datetime_value_count(sample)
-        elif kind == "date":
-            score = parse_date_value_count(sample)
-        else:
-            score = parse_time_value_count(sample)
-        # Require at least two useful values so metadata cells are not mistaken for a series.
-        if score >= 2 and score > best_score:
-            best_score = score
-            best_col = col
-    return best_col
-
-
-def standardize_loose_timeseries(
-    raw_df: pd.DataFrame,
-    source_name: str = "",
-    sheet_name: str = "",
-    default_well: Optional[str] = None,
-) -> pd.DataFrame:
-    """Last-resort Excel parser for sheets whose headers are blank/merged/not recognized.
-
-    It detects date/time columns from the actual values and keeps every numeric column as
-    a raw plotting series. This prevents valid field Excel sheets from being rejected just
-    because their header text does not match the alias list yet.
-    """
-    if raw_df is None or raw_df.empty:
-        return pd.DataFrame()
-
-    df = raw_df.copy().dropna(how="all").dropna(axis=1, how="all")
-    if df.empty:
-        return pd.DataFrame()
-
-    # If the first non-empty row is mostly text, use it as labels for nicer raw column names.
-    first_row = df.iloc[0]
-    text_cells = sum((not is_numeric_like(v)) and bool(normalize_text(v)) for v in first_row.tolist())
-    non_empty = sum(bool(normalize_text(v)) for v in first_row.tolist())
-    first_row_is_data = row_looks_like_data(first_row) or (
-        parse_date_value_count(pd.Series(first_row.tolist())) >= 1
-        and parse_time_value_count(pd.Series(first_row.tolist())) >= 1
-        and sum(is_numeric_like(v) for v in first_row.tolist()) >= 1
-    )
-    if not first_row_is_data and non_empty >= 2 and text_cells >= max(2, non_empty // 2):
-        labels = make_unique([safe_text(v) or f"Column_{i + 1}" for i, v in enumerate(first_row.tolist())])
-        df = df.iloc[1:].copy()
-        df.columns = labels[: df.shape[1]]
-    else:
-        df.columns = [f"Column_{i + 1}" for i in range(df.shape[1])]
-
-    df = df.dropna(how="all")
-    if df.empty:
-        return pd.DataFrame()
-
-    datetime_col = best_value_column(df, "datetime")
-    used = set([datetime_col]) if datetime_col is not None else set()
-    date_col = None if datetime_col is not None else best_value_column(df, "date", used)
-    if date_col is not None:
-        used.add(date_col)
-    time_col = best_value_column(df, "time", used)
-    if time_col is not None:
-        used.add(time_col)
-
-    out = pd.DataFrame(index=df.index)
-    out["source"] = source_name
-    out["sheet"] = sheet_name
-    out["well"] = default_well or guess_well_from_name(f"{source_name} {sheet_name}") or "Unknown"
-
-    if datetime_col is not None:
-        out["datetime"] = parse_datetime_series(df[datetime_col])
-    if date_col is not None:
-        out["date"] = parse_date_series(df[date_col]).ffill().bfill()
-    if time_col is not None:
-        parsed_time = parse_time_series(df[time_col])
-        out["time_text"] = parsed_time.dt.strftime("%H:%M")
-        out.loc[parsed_time.isna(), "time_text"] = ""
-    else:
-        parsed_time = None
-
-    if ("datetime" not in out.columns or out["datetime"].isna().all()) and (date_col is not None or time_col is not None):
-        out["datetime"] = combine_date_time(out.get("date"), df[time_col] if time_col is not None else None, out.get("datetime"))
-
-    if "datetime" in out.columns and out["datetime"].notna().any():
-        if "date" not in out.columns:
-            out["date"] = out["datetime"].dt.floor("D")
-        if "time_text" not in out.columns:
-            out["time_text"] = out["datetime"].dt.strftime("%H:%M")
-
-    # Keep all numeric columns except detected date/time columns. Use header labels when possible.
-    for col in df.columns:
-        if col in used:
-            continue
-        nums = df[col].map(extract_number).astype(float)
-        if nums.notna().sum() < 2:
-            continue
-        raw_name = raw_output_column_name(col, out.columns)
-        out[raw_name] = nums
-
-    numeric_cols = [c for c in out.columns if c not in BASE_NON_PLOT_COLS]
-    if not numeric_cols:
-        return pd.DataFrame()
-
-    useful = out[numeric_cols].notna().any(axis=1)
-    if "datetime" in out.columns and out["datetime"].notna().sum() >= 2:
-        useful &= out["datetime"].notna()
-    elif "time_text" in out.columns and out["time_text"].astype(str).str.strip().ne("").sum() >= 2:
-        useful &= out["time_text"].astype(str).str.strip().ne("")
-
-    out = out.loc[useful].copy()
-    if out.empty:
-        return pd.DataFrame()
-
-    if "datetime" in out.columns and "well" in out.columns and out["datetime"].notna().any():
-        # Do not let all-NaT datetimes collapse a valid table to one row.
-        out = out.drop_duplicates(subset=["well", "datetime"], keep="first")
-
-    sort_cols = ["well"] + (["datetime"] if "datetime" in out.columns else [])
-    return out.sort_values(sort_cols, na_position="last").reset_index(drop=True)
-
-
-def parse_excel_sheet_attempts(raw: pd.DataFrame, source_name: str, sheet_name: str, default_well: Optional[str]) -> List[pd.DataFrame]:
-    """Try several Excel interpretations and return valid time-series candidates."""
-    attempts: List[pd.DataFrame] = []
-
-    def add_candidate(candidate: pd.DataFrame):
-        if candidate is not None and not candidate.empty and is_valid_timeseries(candidate):
-            attempts.append(candidate)
-
-    # Existing smart multi-row header parser.
-    table = table_from_raw(raw)
-    add_candidate(standardize_dataframe(table, source_name=source_name, sheet_name=sheet_name, default_well=default_well))
-
-    # Common case: Excel already has a simple first-row header. Try it explicitly.
-    df0 = raw.copy().dropna(how="all").dropna(axis=1, how="all")
-    if not df0.empty and len(df0) >= 2:
-        headers = make_unique([safe_text(v) or f"Column_{i + 1}" for i, v in enumerate(df0.iloc[0].tolist())])
-        direct = df0.iloc[1:].copy()
-        direct.columns = headers[: direct.shape[1]]
-        add_candidate(standardize_dataframe(direct, source_name=source_name, sheet_name=sheet_name, default_well=default_well))
-
-    # Scan possible header rows. This helps when title/metadata rows are above the actual table.
-    max_scan = min(60, len(raw))
-    for header_row in range(max_scan):
-        row = raw.iloc[header_row]
-        if row_looks_like_data(row):
-            continue
-        score = header_score(row)
-        if score < 4:
-            continue
-        candidate_raw = raw.iloc[header_row:].dropna(how="all").dropna(axis=1, how="all")
-        if candidate_raw.empty or len(candidate_raw) < 3:
-            continue
-        headers = make_unique([safe_text(v) or f"Column_{i + 1}" for i, v in enumerate(candidate_raw.iloc[0].tolist())])
-        candidate = candidate_raw.iloc[1:].copy()
-        candidate.columns = headers[: candidate.shape[1]]
-        add_candidate(standardize_dataframe(candidate, source_name=source_name, sheet_name=sheet_name, default_well=default_well))
-
-    # Last-resort value-based parser. This catches headerless or unrecognized templates.
-    add_candidate(standardize_loose_timeseries(raw, source_name=source_name, sheet_name=sheet_name, default_well=default_well))
-
-    # De-duplicate and keep the strongest parse for this sheet.
-    unique: Dict[tuple, pd.DataFrame] = {}
-    for cand in attempts:
-        key = dataframe_key(cand)
-        if key not in unique or dataframe_quality_score(cand) > dataframe_quality_score(unique[key]):
-            unique[key] = cand
-
-    return sorted(unique.values(), key=dataframe_quality_score, reverse=True)
-
-
-def is_valid_timeseries(df: pd.DataFrame) -> bool:
-    """Return True only for real plottable time-series tables.
-
-    A table must have at least one numeric reading column and repeated date/time
-    evidence.  This prevents non-data text/PDF files from being accepted just
-    because a few numbers were found somewhere in the document.
-    """
-    if df is None or df.empty:
-        return False
-    numeric_cols = available_numeric_columns(df)
-    if len(numeric_cols) == 0:
-        return False
-    if "datetime" in df.columns and pd.to_datetime(df["datetime"], errors="coerce").notna().sum() >= 2:
-        return True
-    if "time_text" in df.columns and df["time_text"].astype(str).str.strip().ne("").sum() >= 2:
-        return True
-    if "date" in df.columns and pd.to_datetime(df["date"], errors="coerce").notna().sum() >= 2:
-        return True
-    return False
-
-
-def is_usable_single_message_table(df: pd.DataFrame) -> bool:
-    """Allow one-row WhatsApp/TMU messages while rejecting random text/PDF pages.
-
-    WhatsApp reports are often one reading only, so they cannot pass the stricter
-    repeated-time-series test.  They still must contain at least one numeric
-    operational field and at least one usable date/time marker.
-    """
-    if df is None or df.empty:
-        return False
-    if not available_numeric_columns(df):
-        return False
-    has_dt = "datetime" in df.columns and pd.to_datetime(df["datetime"], errors="coerce").notna().any()
-    has_date = "date" in df.columns and pd.to_datetime(df["date"], errors="coerce").notna().any()
-    has_time = "time_text" in df.columns and df["time_text"].astype(str).str.strip().ne("").any()
-    return bool(has_dt or has_date or has_time)
-
-
-def filter_usable_tables(tables: List[pd.DataFrame]) -> List[pd.DataFrame]:
-    """Final safety filter for all upload types."""
-    return [t for t in tables if is_valid_timeseries(t) or is_usable_single_message_table(t)]
-
-
-
-def parse_expro_mpfm_text(text: str, source_name: str = "EXPRO_MPFM_PDF") -> pd.DataFrame:
-    """Parse EXPRO MPFM PDF Data & Events text rows.
-
-    Keeps only rows where the time is followed by the full numeric MPFM reading set.
-    Skips event/comment rows such as 'BS&W is ...', 'bypassed the meter', etc.
-    """
-    if not text or "Data & Events" not in text or "QOil" not in text or "QWat" not in text:
-        return pd.DataFrame()
-
-    m = re.search(r"Well\s+(?:No\s+)?([A-Z0-9]+\s*-\s*\d+)", text, flags=re.I)
-    if m:
-        well = re.sub(r"\s*-\s*", "-", m.group(1).strip().upper())
-    else:
-        well = guess_well_from_name(source_name) or "Unknown"
-
-    current_date = pd.NaT
-    rows = []
-    expro_cols = [
-        "choke_size_64", "choke_ambiguous", "whp_psi", "flow_press_psi", "flow_temp_c",
-        "mpfm_press_psig", "mpfm_temp_f", "dp_mbar",
-        "qoil_s_stbd", "qwat_s_bpd", "qgas_s_mmscfd",
-        "qoil_a_bpd", "qwat_a_bpd", "qgas_a_mmcfd",
-        "wlr_s_pct", "qgross_s_bpd",
-        "oil_sg", "water_sg", "water_ph", "salinity_kppm",
-        "gas_sg", "co2_mole_pct", "h2s_ppm", "gor_s_scf_stb", "gvf_a_pct", "pump_freq_hz",
-    ]
-
-    date_pat = re.compile(r"^\s*(\d{1,2}/\d{1,2}/\d{2,4})\s*$")
-    time_pat = re.compile(r"^\s*(\d{1,2}:\d{2}:\d{2})\s+(.*)$")
-
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-
-        dm = date_pat.match(line)
-        if dm:
-            current_date = pd.to_datetime(dm.group(1), errors="coerce", dayfirst=True)
-            continue
-
-        tm = time_pat.match(line)
-        if not tm:
-            continue
-
-        time_txt, rest = tm.group(1), tm.group(2).strip()
-        if not re.match(r"^[+-]?\d", rest):
-            continue
-
-        nums = re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", rest.replace(",", ""))
-        if len(nums) < 25:
-            continue
-
-        vals = [float(x) for x in nums[:25]]
-        row = dict(zip(expro_cols, vals))
-        row["source"] = source_name
-        row["sheet"] = "EXPRO_MPFM_Data_Events"
-        row["well"] = well
-        row["date"] = current_date
-        row["time"] = time_txt
-        row["time_text"] = time_txt[:5]
-
-        t = parse_time_series(pd.Series([time_txt])).iloc[0]
-        if pd.notna(current_date) and pd.notna(t):
-            row["datetime"] = pd.Timestamp(current_date.date()) + pd.Timedelta(hours=t.hour, minutes=t.minute, seconds=t.second)
-        else:
-            row["datetime"] = pd.NaT
-
-        row["oil_rate_stbd"] = row["qoil_s_stbd"]
-        row["water_rate_bpd"] = row["qwat_s_bpd"]
-        row["gas_rate_mmscfd"] = row["qgas_s_mmscfd"]
-        row["gross_rate_bpd"] = row["qgross_s_bpd"]
-        row["bsw_pct"] = row["wlr_s_pct"]
-        row["gor_scf_bbl"] = row["gor_s_scf_stb"]
-
-        if pd.notna(row["salinity_kppm"]) and row["salinity_kppm"] > 1000:
-            row["salinity_kppm"] = row["salinity_kppm"] / 1000.0
-
-        rows.append(row)
-
-    if not rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows)
-    df = df.drop_duplicates(subset=["well", "datetime", "source"], keep="first")
-    df = df.sort_values(["well", "datetime"], na_position="last").reset_index(drop=True)
-    return df
-
-
-
-def filter_preferred_tables(tables: List[pd.DataFrame]) -> List[pd.DataFrame]:
-    """When a workbook has both summary/form sheets and detailed time-series sheets,
-    keep the detailed time-series tables by default.
-    """
-    if len(tables) <= 1:
-        return tables
-
-    detailed = []
-    for df in tables:
-        if df is None or df.empty or len(df) < 3:
-            continue
-        dt_unique = df["datetime"].nunique(dropna=True) if "datetime" in df.columns else 0
-        time_unique = df["time_text"].nunique(dropna=True) if "time_text" in df.columns else 0
-        sheet_name = str(df["sheet"].iloc[0]).lower() if "sheet" in df.columns and len(df) else ""
-        if max(dt_unique, time_unique) >= 3 and sheet_name not in {"form", "summary", "test summary"}:
-            detailed.append(df)
-
-    return detailed if detailed else tables
-
-def load_tabular_file_base(uploaded_file) -> List[pd.DataFrame]:
-    name = uploaded_file.name
-    suffix = name.split(".")[-1].lower()
-    tables: List[pd.DataFrame] = []
-
-    if suffix in ["xlsx", "xls"]:
-        xls = pd.ExcelFile(uploaded_file)
-        for sheet in xls.sheet_names:
-            raw = pd.read_excel(xls, sheet_name=sheet, header=None)
-            default_well = extract_well_from_raw(raw, source_name=name, sheet_name=sheet)
-            sheet_candidates = parse_excel_sheet_attempts(
-                raw,
-                source_name=name,
-                sheet_name=sheet,
-                default_well=default_well,
-            )
-            if sheet_candidates:
-                # Keep only the best interpretation for each sheet to avoid duplicate plots.
-                tables.append(sheet_candidates[0])
-
-        tables = filter_preferred_tables(tables)
-
-    elif suffix == "csv":
-        # First try normal CSV headers. This is important for CSVs exported from this dashboard.
-        uploaded_file.seek(0)
-        try:
-            header_df = pd.read_csv(uploaded_file)
-            header_df = header_df.loc[:, ~header_df.columns.astype(str).str.match(r"^Unnamed")]
-            known_header_hits = sum(1 for c in header_df.columns if best_canonical_name(str(c)) is not None)
-            if known_header_hits >= 3:
-                default_well = extract_well_from_raw(header_df, source_name=name, sheet_name="CSV")
-                std = standardize_dataframe(header_df, source_name=name, sheet_name="CSV", default_well=default_well)
-                if is_valid_timeseries(std):
-                    tables.append(std)
-        except Exception:
-            pass
-
-        if not tables:
-            uploaded_file.seek(0)
-            raw = pd.read_csv(uploaded_file, header=None)
-            default_well = extract_well_from_raw(raw, source_name=name, sheet_name="CSV")
-            table = table_from_raw(raw)
-            std = standardize_dataframe(table, source_name=name, sheet_name="CSV", default_well=default_well)
-            if is_valid_timeseries(std):
-                tables.append(std)
-
-    elif suffix == "txt":
-        text = uploaded_file.getvalue().decode("utf-8", errors="ignore")
-        msg_rows = parse_many_tmu_messages(text, source_name=name)
-        if is_usable_single_message_table(msg_rows):
-            tables.append(msg_rows)
-
-    elif suffix == "docx":
-        try:
-            from docx import Document
-
-            doc = Document(uploaded_file)
-            text = "\n".join(safe_text(p.text) for p in doc.paragraphs)
-            msg_rows = parse_many_tmu_messages(text, source_name=name)
-            if is_usable_single_message_table(msg_rows):
-                tables.append(msg_rows)
-
-            for i, t in enumerate(doc.tables):
-                rows = [[cell.text for cell in row.cells] for row in t.rows]
-                raw = pd.DataFrame(rows)
-                default_well = extract_well_from_raw(raw, source_name=name, sheet_name=f"DOCX_Table_{i + 1}")
-                table = table_from_raw(raw)
-                std = standardize_dataframe(table, source_name=name, sheet_name=f"DOCX_Table_{i + 1}", default_well=default_well)
-                if is_valid_timeseries(std):
-                    tables.append(std)
-        except Exception as e:
-            raise RuntimeError(f"Could not read DOCX file {name}: {e}")
-
-    elif suffix == "pdf":
-        try:
-            import pdfplumber
-
-            with pdfplumber.open(uploaded_file) as pdf:
-                full_text = []
-                for pi, page in enumerate(pdf.pages):
-                    text = page.extract_text() or ""
-                    full_text.append(text)
-
-                    for ti, table in enumerate(page.extract_tables() or []):
-                        raw = pd.DataFrame(table)
-                        default_well = extract_well_from_raw(raw, source_name=name, sheet_name=f"PDF_Page_{pi + 1}_Table_{ti + 1}")
-                        table_df = table_from_raw(raw)
-                        std = standardize_dataframe(table_df, source_name=name, sheet_name=f"PDF_Page_{pi + 1}_Table_{ti + 1}", default_well=default_well)
-                        if is_valid_timeseries(std):
-                            tables.append(std)
-
-                all_text = "\n".join(safe_text(x) for x in full_text)
-
-                # Special support for EXPRO MPFM PDF reports where the Data & Events
-                # table is embedded as text rather than a clean extractable table.
-                # If this detailed parser succeeds, keep it and discard summary/event-only tables.
-                expro_rows = parse_expro_mpfm_text(all_text, source_name=name)
-                if not expro_rows.empty:
-                    tables = [expro_rows]
-                else:
-                    msg_rows = parse_many_tmu_messages(all_text, source_name=name)
-                    if is_usable_single_message_table(msg_rows):
-                        tables.append(msg_rows)
-                    tables = filter_preferred_tables(tables)
-        except Exception as e:
-            raise RuntimeError(f"Could not read PDF file {name}: {e}")
-
-    return filter_usable_tables(tables)
-
-
-def value_by_patterns(text: str, patterns: List[str]) -> Optional[str]:
-    for p in patterns:
-        pattern = rf"{p}\s*[:=@-]?\s*([^\n\r]+)"
-        m = re.search(pattern, text, flags=re.I)
-        if m:
-            value = m.group(1).strip()
-            value = re.split(
-                r"\s{2,}(?=(choke|w\.?h\.?p|sep|gas|gross|oil|water|bs|salinity|h2s|co2|note|pumping)\b)",
-                value,
-                flags=re.I,
-            )[0].strip()
-            return value
-    return None
-
-
-def parse_salinity_to_kppm(value: object) -> float:
-    if value is None:
-        return np.nan
-
-    s = str(value).replace(",", "")
-    num = extract_number(s)
-    if pd.isna(num):
-        return np.nan
-    if re.search(r"\bk\b|kppm|k ppm", s, flags=re.I):
-        return num
-    if num > 1000:
-        return num / 1000.0
-    return num
-
-
-def parse_tmu_message(message: str, source_name: str = "WhatsApp_Text") -> Dict[str, object]:
-    text = message.replace("\u00a0", " ")
-    text = re.sub(r"[ \t]+", " ", text)
-
-    row: Dict[str, object] = {"source": source_name, "sheet": "WhatsApp_Text"}
-
-    tmu = re.search(r"\b(PICO\s*T\s*MU[-\s]*\d+|PICO\s*TMU[-\s]*\d+|TMU[-\s]*\d+)\b", text, flags=re.I)
-    if tmu:
-        row["test_unit"] = re.sub(r"\s+", " ", tmu.group(1).upper()).replace("T MU", "TMU")
-
-    date_v = value_by_patterns(text, [r"\bdate\b"])
-    time_v = value_by_patterns(text, [r"\btime\s*@?", r"\btime\b"])
-    well_v = value_by_patterns(text, [r"\bwell\s*name\b", r"\bwell\b"])
-
-    if well_v:
-        row["well"] = well_v.split()[0].strip()
-    else:
-        row["well"] = guess_well_from_name(text) or "Unknown"
-
-    if date_v:
-        row["date"] = pd.to_datetime(date_v, errors="coerce", dayfirst=True)
-    if time_v:
-        row["time"] = time_v
-
-    fields = {
-        "whp_psi": [r"\bw\.?\s*h\.?\s*p\.?\b", r"\bwellhead pressure\b"],
-        "sep_p_psi": [r"\bsep\.?\s*p\.?\b", r"\bseparator pressure\b"],
-        "gas_rate_mmscfd": [r"\bgas rate\b"],
-        "gas_formation_mmscfd": [r"\bgas formation\b", r"\bformation gas\b"],
-        "gross_rate_bpd": [r"\bgross rate\b", r"\bgross\b"],
-        "oil_rate_stbd": [r"\boil rate\b"],
-        "water_rate_bpd": [r"\bwater rate\b"],
-        "bsw_pct": [r"\bbs\s*&\s*w\b", r"\bbsw\b", r"\bwc\b", r"\bwater cut\b"],
-        "salinity_kppm": [r"\bsalinity\b"],
-        "h2s_ppm": [r"\bh2s\b"],
-        "co2_mole_pct": [r"\bco2\b", r"\bco₂\b"],
-        "water_cum_bbl": [r"\bwater cum\b", r"\bwater cumulative\b"],
-        "pumping_pressure_psi": [r"\bpumping\s*[.\-/ ]?\s*p\b", r"\bpumping pressure\b", r"\bpump pressure\b"],
-        "n2_rate_scfm": [r"\bn2 standard rate\b", r"\bn2 rate\b", r"\bnitrogen rate\b"],
-        "note": [r"\bnote\b"],
-    }
-
-    for canon, pats in fields.items():
-        raw_val = value_by_patterns(text, pats)
-        if raw_val is None:
-            continue
-        if canon == "note":
-            row[canon] = raw_val.strip()
-        elif canon == "salinity_kppm":
-            row[canon] = parse_salinity_to_kppm(raw_val)
-        else:
-            row[canon] = extract_number(raw_val)
-
-    # Parse choke separately so 24/64 is never plotted as 24%.
-    choke_raw = value_by_patterns(text, [r"\bchoke\b"])
-    if choke_raw is not None:
-        choke_series = pd.Series([choke_raw])
-        pct_s, size_s, ambiguous_s, _ = _split_choke_series_v56(choke_series, "Choke " + choke_raw)
-        if pct_s.notna().any():
-            row["choke_pct"] = float(pct_s.dropna().iloc[0])
-        if size_s.notna().any():
-            row["choke_size_64"] = float(size_s.dropna().iloc[0])
-        if ambiguous_s.notna().any():
-            row["choke_ambiguous"] = float(ambiguous_s.dropna().iloc[0])
-
-    if "date" in row and "time" in row:
-        d = pd.to_datetime(row["date"], errors="coerce", dayfirst=True)
-        tser = parse_time_series(pd.Series([row["time"]]))
-        if pd.notna(d) and pd.notna(tser.iloc[0]):
-            t = tser.iloc[0]
-            row["datetime"] = pd.Timestamp(d.date()) + pd.Timedelta(hours=t.hour, minutes=t.minute, seconds=t.second)
-            row["time_text"] = f"{t.hour:02d}:{t.minute:02d}"
-
-    return row
-
-
-def split_messages(text: str) -> List[str]:
-    markers = list(re.finditer(r"(?=PICO\s*T?\s*MU|TMU[-\s]*\d+|Date\s*:)", text, flags=re.I))
-    if len(markers) <= 1:
-        return [text]
-
-    chunks = []
-    for i, m in enumerate(markers):
-        start = m.start()
-        end = markers[i + 1].start() if i + 1 < len(markers) else len(text)
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-
-    return chunks
-
-
-def parse_many_tmu_messages(text: str, source_name: str = "WhatsApp_Text") -> pd.DataFrame:
-    rows = []
-    for chunk in split_messages(text):
-        row = parse_tmu_message(chunk, source_name=source_name)
-        has_rate = any(
-            k in row
-            for k in [
-                "gross_rate_bpd", "oil_rate_stbd", "water_rate_bpd", "whp_psi",
-                "pumping_pressure_psi", "gas_rate_mmscfd", "bsw_pct",
-            ]
-        )
-        if has_rate:
-            rows.append(row)
-
-    if not rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows)
-    for col in ["source", "sheet", "well", "datetime", "date", "time_text"]:
-        if col not in df.columns:
-            df[col] = np.nan
-
-    return df
-
-
-def apply_fill_method(df: pd.DataFrame, numeric_cols: List[str], method: str) -> pd.DataFrame:
-    if df.empty or not numeric_cols or method == "No fill":
-        return df
-
-    out = df.sort_values(["well", "datetime"], na_position="last").copy()
-
-    if method == "Forward fill":
-        out[numeric_cols] = out.groupby("well", dropna=False)[numeric_cols].ffill()
-
-    elif method == "Forward + backward fill":
-        out[numeric_cols] = out.groupby("well", dropna=False)[numeric_cols].ffill().bfill()
-
-    elif method == "Linear interpolation by row":
-        out[numeric_cols] = out.groupby("well", dropna=False)[numeric_cols].transform(
-            lambda x: x.interpolate(limit_direction="both")
-        )
-
-    elif method == "Time interpolation":
-        pieces = []
-        for _, g in out.groupby("well", dropna=False):
-            g = g.copy()
-            if "datetime" in g.columns and g["datetime"].notna().sum() >= 2:
-                g = g.set_index("datetime")
-                g[numeric_cols] = g[numeric_cols].interpolate(method="time", limit_direction="both")
-                g = g.reset_index()
-            else:
-                g[numeric_cols] = g[numeric_cols].interpolate(limit_direction="both")
-            pieces.append(g)
-        out = pd.concat(pieces, ignore_index=True)
-
-    return out
-
-
-def apply_user_column_mappings(df: pd.DataFrame, mapping: Optional[Dict[str, str]] = None) -> pd.DataFrame:
-    """Apply user-confirmed column mappings after auto parsing.
-
-    mapping keys may be actual DataFrame column names (for example raw__amp) or
-    normalized alias keys from canonical_key(). Values are canonical parser names
-    such as motor_current_amp, pump_intake_pressure_psi, or the special value
-    __drop__ to hide a column.
-
-    If target already exists, non-null values from the source fill gaps only; this
-    prevents a manual alias from overwriting a stronger auto-detected column.
-    """
-    if df is None or df.empty or not mapping:
-        return df
-
-    out = df.copy()
-    options = standard_column_options(include_meta=False)
-    drop_cols = []
-
-    for col in list(out.columns):
-        key_candidates = [str(col), canonical_key(col)]
-        target = None
-        for key in key_candidates:
-            if key in mapping:
-                target = mapping.get(key)
-                break
-        if not target or target in {"__keep__", "Keep as-is"}:
-            continue
-        if target == "__drop__":
-            drop_cols.append(col)
-            continue
-        if target not in options:
-            continue
-        if col in BASE_NON_PLOT_COLS:
-            continue
-
-        vals = clean_numeric_series(out[col], target)
-        if target in out.columns:
-            out[target] = pd.to_numeric(out[target], errors="coerce").combine_first(vals)
-        else:
-            out[target] = vals
-        if col != target:
-            drop_cols.append(col)
-
-    if drop_cols:
-        out = out.drop(columns=[c for c in drop_cols if c in out.columns], errors="ignore")
-    return out
-
-
-def available_numeric_columns(df: pd.DataFrame) -> List[str]:
-    return [
-        c
-        for c in df.columns
-        if c not in BASE_NON_PLOT_COLS
-        and pd.api.types.is_numeric_dtype(df[c])
-        and df[c].notna().any()
-    ]
-
-
-def column_label(column_name: str) -> str:
-    if str(column_name).startswith("raw__"):
-        label = str(column_name)[5:].replace("_", " ").strip()
-        return f"Raw: {label.title()}"
-    return COLUMN_LABELS.get(column_name, column_name)
-
-# -----------------------------------------------------------------------------
-# v43 additions: WhatsApp export ZIP + CTU image OCR + safe test segmentation
-# -----------------------------------------------------------------------------
-
-# Keep CTU / OCR metadata out of normal numeric detection and plotting unless the
-# value columns themselves are selected.
-BASE_NON_PLOT_COLS.update({
-    "source_type", "ocr_template", "ocr_fields_found", "ocr_status", "ocr_confidence",
-    "image_file", "attachment_name", "chat_sender", "chat_datetime", "message_index",
-    "test_id", "test_start", "test_end", "test_sequence", "link_status",
-    "suggested_well", "suggested_test_id", "suggested_link_reason", "suggested_link_gap_hours",
-    "review_required", "caption_text", "whatsapp_message_body", "source_member",
-})
-
-COLUMN_LABELS.update({
-    "ctu_weight_lbf": "CTU Weight (LBF)",
-    "ctu_lt_weight_lbf": "CTU Lt Weight (LBF)",
-    "ctu_wellhead_pressure_psi": "CTU Wellhead Pressure (psi)",
-    "ctu_circulation_pressure_psi": "CTU Circulation Pressure (psi)",
-    "ctu_reel_depth_ft": "CTU Reel Depth (ft)",
-    "ctu_reel_speed_ftmin": "CTU Reel Speed (ft/min)",
-    "ctu_fluid_rate_bpm": "CTU Fluid Rate (bpm)",
-    "ctu_n2_rate_scfm": "CTU N2 Flow (scf/min)",
-    "ctu_fluid_total_bbl": "CTU Fluid Total (bbl)",
-    "ctu_n2_total_scf": "CTU N2 Total (scf)",
-})
-
-for _kw in [
-    "circulation", "reel", "lt weight", "fluid total", "n2 total", "flare test",
-    "wellhead pressure", "all data", "ctu", "coil tubing", "coiled tubing",
-]:
-    if _kw not in KEYWORDS:
-        KEYWORDS.append(_kw)
-
-IMAGE_SUFFIXES = {"jpg", "jpeg", "png"}
-DATA_SUFFIXES = {"xlsx", "xls", "csv", "docx", "pdf", "txt"}
-
+# ---------------------------------------------------------------------------
+# Generic helpers
+# ---------------------------------------------------------------------------
 
 class UploadedBytes(io.BytesIO):
-    """BytesIO object that behaves like a Streamlit UploadedFile for recursive parsers."""
-
     def __init__(self, data: bytes, name: str):
         super().__init__(data)
         self.name = name
 
 
-def append_note(old_note, new_note):
-    old = "" if old_note is None or pd.isna(old_note) else str(old_note).strip()
-    new = str(new_note or "").strip()
-    if not new:
-        return old
-    if not old:
-        return new
-    if new.lower() in old.lower():
-        return old
-    return f"{old}; {new}"
+def _uploaded_bytes(uploaded_file) -> tuple[bytes, str]:
+    name = str(getattr(uploaded_file, "name", "uploaded_file"))
+    if hasattr(uploaded_file, "getvalue"):
+        data = uploaded_file.getvalue()
+    elif hasattr(uploaded_file, "read"):
+        data = uploaded_file.read()
+    else:
+        data = bytes(uploaded_file)
+    if not isinstance(data, (bytes, bytearray)):
+        data = bytes(data)
+    return bytes(data), name
 
 
-def parse_datetime_from_filename(name: str):
-    """Parse WhatsApp media filenames such as PHOTO-2026-06-12-20-35-05.jpg."""
-    name = str(name or "")
-    patterns = [
-        r"(20\d{2})[-_](\d{2})[-_](\d{2})[-_](\d{2})[-_](\d{2})[-_](\d{2})",
-        r"(20\d{2})[-_](\d{2})[-_](\d{2})[-_](\d{2})[-_](\d{2})",
-        r"(\d{2})[-_](\d{2})[-_](20\d{2})[-_](\d{2})[-_](\d{2})[-_](\d{2})",
-    ]
-    for p in patterns:
-        m = re.search(p, name)
-        if not m:
+def safe_text(value: object) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    text = str(value).strip()
+    return "" if text.lower() in {"nan", "nat", "none"} else text
+
+
+def normalize_text(value: object) -> str:
+    text = safe_text(value).lower()
+    text = text.replace("\u200e", "").replace("\u200f", "").replace("\ufeff", "")
+    text = text.replace("&", " and ").replace("°", " deg ")
+    text = re.sub(r"[*_`~]+", "", text)
+    text = re.sub(r"[\r\n\t]+", " ", text)
+    text = re.sub(r"[^a-z0-9%/+.-]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def slugify(value: object) -> str:
+    text = normalize_text(value)
+    text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+    return text[:80] or "column"
+
+
+def append_note(existing: object, addition: object) -> str:
+    parts: List[str] = []
+    for raw in (existing, addition):
+        text = safe_text(raw)
+        if not text:
             continue
-        nums = list(map(int, m.groups()))
-        try:
-            if len(nums) == 6 and str(nums[0]).startswith("20"):
-                y, mo, d, hh, mm, ss = nums
-            elif len(nums) == 5:
-                y, mo, d, hh, mm = nums
-                ss = 0
-            else:
-                d, mo, y, hh, mm, ss = nums
-            return pd.Timestamp(year=y, month=mo, day=d, hour=hh, minute=mm, second=ss)
-        except Exception:
-            pass
-    return pd.NaT
+        for item in re.split(r"\s*;\s*", text):
+            item = item.strip()
+            if item and item not in parts:
+                parts.append(item)
+    return "; ".join(parts)
 
 
-def parse_attachment_reference(body: str) -> str:
-    """Return attached filename mentioned in exported WhatsApp text, if any."""
-    text = str(body or "")
-    patterns = [
-        r"<attached:\s*([^>]+)>",
-        r"([^\s<>]+\.(?:jpg|jpeg|png|xlsx|xls|csv|pdf|docx))",
-    ]
-    for p in patterns:
-        m = re.search(p, text, flags=re.I)
-        if m:
-            return Path(m.group(1).strip()).name
-    return ""
-
-
-def _try_import_ocr_libs():
-    try:
-        from PIL import Image, ImageOps, ImageEnhance
-        import pytesseract
-        return Image, ImageOps, ImageEnhance, pytesseract
-    except Exception:
-        return None, None, None, None
-
-
-def _numbers_from_ocr_text(txt: str) -> List[str]:
-    return re.findall(r"-?\d+(?:\.\d+)?", str(txt or "").replace(" ", ""))
-
-
-def _best_number_from_ocr_text(txt: str):
-    nums = _numbers_from_ocr_text(txt)
-    if not nums:
-        return np.nan
-    # Prefer the longest candidate; this avoids choosing a stray unit digit.
-    nums = sorted(nums, key=lambda x: len(x.replace(".", "").replace("-", "")), reverse=True)
-    return extract_number(nums[0])
-
-
-def _ocr_numeric_region_pil(crop_img):
-    """OCR a numeric value from a CTU/PICO HMI ROI using multiple simple preprocesses."""
-    Image, ImageOps, ImageEnhance, pytesseract = _try_import_ocr_libs()
-    if Image is None:
-        return np.nan, 0.0, "ocr_dependency_missing"
-
-    best_val = np.nan
-    best_score = -1
-    best_text = ""
-
-    try:
-        gray = crop_img.convert("L")
-        gray = ImageOps.autocontrast(gray)
-    except Exception:
-        return np.nan, 0.0, "ocr_image_error"
-
-    variants = []
-    for invert in [False, True]:
-        g0 = ImageOps.invert(gray) if invert else gray
-        for contrast in [2.0, 3.0, 5.0]:
-            g = ImageEnhance.Contrast(g0).enhance(contrast)
-            g = ImageEnhance.Sharpness(g).enhance(2.0)
-            g = g.resize((max(90, g.width * 4), max(40, g.height * 4)))
-            variants.append(g)
-            for thr in [110, 140, 170, 200]:
-                variants.append(g.point(lambda p, t=thr: 255 if p > t else 0))
-
-    for img_try in variants:
-        try:
-            txt = pytesseract.image_to_string(
-                img_try,
-                config="--oem 3 --psm 7 -c tessedit_char_whitelist=-0123456789.",
-            )
-        except Exception:
-            continue
-
-        nums = _numbers_from_ocr_text(txt)
-        if not nums:
-            continue
-        val = _best_number_from_ocr_text(txt)
-        digit_count = max(len(n.replace(".", "").replace("-", "")) for n in nums)
-        score = digit_count + (2 if any("." in n for n in nums) else 0)
-        if pd.notna(val) and score > best_score:
-            best_score = score
-            best_val = val
-            best_text = str(txt).strip()
-
-    confidence = min(1.0, max(0.0, best_score / 8.0)) if best_score >= 0 else 0.0
-    return best_val, confidence, best_text
-
-
-# ROIs are value boxes only, relative to the full image. They fit the CTU "ALL DATA"
-# screen style in the user's sample; all rows remain review_required unless safely linked.
-
-
-def _ocr_numeric_region_cv2(crop_img):
-    """Optional OpenCV OCR path that improves low-contrast colored HMI digits."""
-    try:
-        import cv2
-        import numpy as _np
-        import pytesseract
-    except Exception:
-        return np.nan, 0.0, "cv2_or_tesseract_missing"
-
-    try:
-        arr = _np.array(crop_img.convert("RGB"))
-        bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-        bgr = cv2.resize(bgr, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
-        lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
-        l, a, b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        gray = clahe.apply(l)
-        variants = [gray, 255 - gray]
-        for block in [31, 51, 71]:
-            variants.append(cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, block, 3))
-            variants.append(cv2.adaptiveThreshold(255 - gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, block, 3))
-
-        best_val = np.nan
-        best_score = -1
-        best_text = ""
-        for v in variants:
-            try:
-                txt = pytesseract.image_to_string(
-                    v,
-                    config="--oem 3 --psm 7 -c tessedit_char_whitelist=-0123456789.",
-                )
-            except Exception:
-                continue
-            nums = _numbers_from_ocr_text(txt)
-            if not nums:
-                continue
-            val = _best_number_from_ocr_text(txt)
-            digit_count = max(len(n.replace(".", "").replace("-", "")) for n in nums)
-            score = digit_count + (2 if any("." in n for n in nums) else 0)
-            if pd.notna(val) and score > best_score:
-                best_score = score
-                best_val = val
-                best_text = str(txt).strip()
-        confidence = min(1.0, max(0.0, best_score / 8.0)) if best_score >= 0 else 0.0
-        return best_val, confidence, best_text
-    except Exception:
-        return np.nan, 0.0, "cv2_ocr_error"
-
-
-def _ocr_numeric_region(crop_img):
-    """Use PIL and OpenCV OCR paths, then choose the higher-confidence numeric value."""
-    pil_val, pil_conf, pil_text = _ocr_numeric_region_pil(crop_img)
-    cv_val, cv_conf, cv_text = _ocr_numeric_region_cv2(crop_img)
-    if pd.notna(cv_val) and (pd.isna(pil_val) or cv_conf >= pil_conf):
-        return cv_val, cv_conf, cv_text
-    return pil_val, pil_conf, pil_text
-
-CTU_ALL_DATA_ROIS = {
-    "ctu_weight_lbf": (0.26, 0.13, 0.55, 0.30),
-    "ctu_lt_weight_lbf": (0.66, 0.13, 0.92, 0.30),
-    "ctu_wellhead_pressure_psi": (0.31, 0.31, 0.55, 0.47),
-    "ctu_circulation_pressure_psi": (0.64, 0.31, 0.92, 0.47),
-    "ctu_reel_depth_ft": (0.31, 0.49, 0.55, 0.66),
-    "ctu_reel_speed_ftmin": (0.62, 0.49, 0.92, 0.66),
-    "ctu_fluid_rate_bpm": (0.31, 0.66, 0.55, 0.80),
-    "ctu_n2_rate_scfm": (0.64, 0.66, 0.92, 0.80),
-    "ctu_fluid_total_bbl": (0.31, 0.81, 0.55, 0.95),
-    "ctu_n2_total_scf": (0.64, 0.81, 0.92, 0.95),
-}
-
-
-def parse_ctu_all_data_screen_image(uploaded_file, source_name="Image_OCR") -> pd.DataFrame:
-    """Parse CTU/PICO ALL DATA screen photos as auxiliary OCR rows.
-
-    Safety rule: OCR rows are never treated as confirmed well-test readings by
-    themselves. If the image does not explicitly carry a well/date, the row is
-    marked review_required and remains Well=Unknown until the app/user approves
-    linking. This avoids silently assigning CTU data to the wrong test.
-    """
-    Image, _, _, _ = _try_import_ocr_libs()
-    if Image is None:
-        return pd.DataFrame()
-
-    try:
-        if hasattr(uploaded_file, "seek"):
-            uploaded_file.seek(0)
-        img = Image.open(uploaded_file).convert("RGB")
-        w, h = img.size
-        file_name = getattr(uploaded_file, "name", source_name)
-        dt_from_name = parse_datetime_from_filename(file_name)
-
-        row = {
-            "source": source_name,
-            "sheet": "CTU_Image_OCR",
-            "source_type": "ctu_image_ocr",
-            "ocr_template": "ctu_all_data",
-            "image_file": file_name,
-            "well": "Unknown",
-            "link_status": "unlinked_needs_review",
-            "review_required": True,
+def _is_missing(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return normalize_text(value) in {
+            "", "n/a", "na", "nil", "none", "not available", "#n/a", "#ref!",
+            "#div/0!", "#value!", "-", "--",
         }
-        if pd.notna(dt_from_name):
-            row["datetime"] = dt_from_name
-            row["date"] = pd.Timestamp(dt_from_name.date())
-            row["time_text"] = pd.Timestamp(dt_from_name).strftime("%H:%M")
-
-        fields_found = 0
-        confidences = []
-        for field, (x1, y1, x2, y2) in CTU_ALL_DATA_ROIS.items():
-            crop = img.crop((int(x1 * w), int(y1 * h), int(x2 * w), int(y2 * h)))
-            val, conf, _raw = _ocr_numeric_region(crop)
-            if pd.notna(val):
-                row[field] = float(val)
-                fields_found += 1
-                confidences.append(float(conf))
-
-        row["ocr_fields_found"] = fields_found
-        row["ocr_confidence"] = float(np.mean(confidences)) if confidences else 0.0
-        row["ocr_status"] = "parsed_review_required" if fields_found >= 2 else "low_confidence_or_not_ctu_screen"
-
-        if fields_found < 1:
-            return pd.DataFrame()
-        return pd.DataFrame([row])
+    try:
+        return bool(pd.isna(value))
     except Exception:
-        return pd.DataFrame()
+        return False
 
 
-WHATSAPP_SYSTEM_PATTERNS = [
-    r"messages and calls are end-to-end encrypted",
-    r"joined using this group",
-    r"changed the subject",
-    r"changed the group description",
-    r"changed this group's icon",
-    r"this message was deleted",
-    r"missed voice call",
-    r"missed video call",
-    r"created group",
-]
+_NUMBER_RE = re.compile(
+    r"(?<![A-Za-z0-9])[-+]?(?:\d+(?:[,.]\d+)*|\.\d+)(?:[eE][-+]?\d+)?"
+)
 
 
-def is_system_or_noise_message(body: str) -> bool:
-    b = normalize_text(body)
-    if not b:
-        return True
-    for p in WHATSAPP_SYSTEM_PATTERNS:
-        if re.search(p, b, flags=re.I):
-            return True
-    # Very short acknowledgement messages are not useful data.
-    if b in {"ok", "okay", "thanks", "thank you", "done", "تمام", "اوكي"}:
-        return True
-    return False
+def extract_number(value: object) -> float:
+    """Parse normal, comma-formatted and scientific-notation values safely."""
+    if value is None or isinstance(value, bool):
+        return np.nan
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        number = float(value)
+        return number if math.isfinite(number) else np.nan
+    text = safe_text(value)
+    if not text or normalize_text(text) in {
+        "n/a", "na", "nil", "none", "not available", "low gas", "trace gas",
+    }:
+        return np.nan
+    match = _NUMBER_RE.search(text.replace("−", "-").replace("–", "-"))
+    if not match:
+        return np.nan
+    token = match.group(0).replace(",", "")
+    try:
+        number = float(token)
+    except ValueError:
+        return np.nan
+    return number if math.isfinite(number) else np.nan
 
 
-def score_tmu_body(body: str) -> int:
-    b = normalize_text(body)
-    if is_system_or_noise_message(b):
-        return 0
+
+def extract_tabular_number(value: object) -> float:
+    """Strict numeric parser for spreadsheet cells.
+
+    Accepts numeric values and strings such as ``200 PSI`` or ``9.8E-2`` but
+    rejects operational notes like ``Pressure test 3000 psi``.
+    """
+    if value is None or isinstance(value, bool):
+        return np.nan
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        number = float(value)
+        return number if math.isfinite(number) else np.nan
+    text = safe_text(value)
+    if not text or normalize_text(text) in {"n/a", "na", "nil", "none", "not available"}:
+        return np.nan
+    match = _NUMBER_RE.search(text.replace("−", "-").replace("–", "-"))
+    if not match:
+        return np.nan
+    remainder = (text[:match.start()] + " " + text[match.end():]).lower()
+    remainder = remainder.replace("°", " ")
+    remainder = re.sub(r"[()\[\]{}\'\".,;:+*/_-]+", " ", remainder)
+    words = [w for w in re.findall(r"[a-z]+", remainder) if w]
+    allowed = {
+        "psi", "psig", "psia", "bar", "kpa", "mpa", "bbl", "bpd", "stb",
+        "d", "day", "mmscf", "mmscfd", "mscf", "scf", "ppm", "kppm",
+        "nacl", "mole", "mol", "hz", "amp", "amps", "a", "c", "f",
+        "deg", "in", "inch", "inches", "api", "percent", "pct", "mm",
+        "cm", "m", "ft", "min", "hr", "hours", "factor", "air",
+    }
+    if any(word not in allowed for word in words):
+        return np.nan
+    try:
+        number = float(match.group(0).replace(",", ""))
+    except ValueError:
+        return np.nan
+    return number if math.isfinite(number) else np.nan
+
+
+def clean_tabular_numeric_series(series: pd.Series) -> pd.Series:
+    return series.map(extract_tabular_number).astype("float64")
+
+def clean_numeric_series(series: pd.Series) -> pd.Series:
+    if series is None:
+        return pd.Series(dtype="float64")
+    return series.map(extract_number).astype("float64")
+
+
+def _safe_datetime_scalar(value: object, *, dayfirst: bool = True) -> pd.Timestamp:
+    if value is None or _is_missing(value):
+        return pd.NaT
+    if isinstance(value, pd.Timestamp):
+        ts = value
+    elif isinstance(value, datetime):
+        ts = pd.Timestamp(value)
+    elif isinstance(value, date):
+        ts = pd.Timestamp(datetime.combine(value, time.min))
+    elif isinstance(value, (int, float, np.integer, np.floating)):
+        number = float(value)
+        # Excel serial dates only. Ordinary process readings are excluded.
+        if not math.isfinite(number) or not (20000 <= number <= 80000):
+            return pd.NaT
+        ts = pd.Timestamp("1899-12-30") + pd.to_timedelta(number, unit="D")
+    else:
+        text = safe_text(value)
+        if not text:
+            return pd.NaT
+        # Reject bare numeric strings as dates unless they look like Excel serials.
+        if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", text):
+            try:
+                number = float(text)
+            except ValueError:
+                return pd.NaT
+            if not 20000 <= number <= 80000:
+                return pd.NaT
+            ts = pd.Timestamp("1899-12-30") + pd.to_timedelta(number, unit="D")
+        else:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                ts = pd.to_datetime(text, errors="coerce", dayfirst=dayfirst)
+    if pd.isna(ts):
+        return pd.NaT
+    ts = pd.Timestamp(ts)
+    if ts.year < 1900 or ts.year > 2100:
+        return pd.NaT
+    return ts
+
+
+def _time_fraction(value: object) -> float:
+    if value is None or _is_missing(value):
+        return np.nan
+    if isinstance(value, pd.Timestamp):
+        value = value.to_pydatetime()
+    if isinstance(value, datetime):
+        value = value.time()
+    if isinstance(value, time):
+        return (value.hour * 3600 + value.minute * 60 + value.second + value.microsecond / 1e6) / 86400.0
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        number = float(value)
+        if not math.isfinite(number):
+            return np.nan
+        return number % 1.0
+    text = safe_text(value)
+    if not text:
+        return np.nan
+    # Excel sometimes exports 1900-01-01 00:30 as the time cell.
+    parsed = pd.to_datetime(text, errors="coerce", dayfirst=True)
+    if pd.notna(parsed):
+        parsed = pd.Timestamp(parsed)
+        return (parsed.hour * 3600 + parsed.minute * 60 + parsed.second) / 86400.0
+    match = re.search(r"\b(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(am|pm)?\b", text, flags=re.I)
+    if not match:
+        return np.nan
+    hour, minute = int(match.group(1)), int(match.group(2))
+    second = int(match.group(3) or 0)
+    ampm = (match.group(4) or "").lower()
+    if ampm == "pm" and hour < 12:
+        hour += 12
+    if ampm == "am" and hour == 12:
+        hour = 0
+    if hour > 23 or minute > 59 or second > 59:
+        return np.nan
+    return (hour * 3600 + minute * 60 + second) / 86400.0
+
+
+def _date_only(value: object) -> Optional[date]:
+    ts = _safe_datetime_scalar(value)
+    return ts.date() if pd.notna(ts) else None
+
+
+def _repair_date_time_sequence(date_values: Sequence[object], time_values: Sequence[object]) -> pd.Series:
+    """Combine Excel date/time columns and repair common isolated date errors.
+
+    Rules are intentionally conservative:
+    - An isolated date different from equal previous/next dates is treated as a typo.
+    - A midnight rollover increments the day when time drops by more than six hours
+      and the date cell did not advance.
+    - Duplicate timestamps remain valid; process readings are never parsed as dates.
+    """
+    dates: List[Optional[date]] = [_date_only(v) for v in date_values]
+    fractions: List[float] = [_time_fraction(v) for v in time_values]
+
+    # Correct isolated date typos such as 22-Jun 18:30 surrounded by 21-Jun rows.
+    for i in range(1, len(dates) - 1):
+        if dates[i - 1] is not None and dates[i + 1] is not None and dates[i - 1] == dates[i + 1]:
+            if dates[i] is not None and dates[i] != dates[i - 1]:
+                dates[i] = dates[i - 1]
+
+    result: List[pd.Timestamp] = []
+    previous: Optional[pd.Timestamp] = None
+    for d, frac in zip(dates, fractions):
+        if d is None or not math.isfinite(frac):
+            result.append(pd.NaT)
+            continue
+        seconds = int(round(frac * 86400)) % 86400
+        current = pd.Timestamp(datetime.combine(d, time.min) + timedelta(seconds=seconds))
+        if previous is not None:
+            previous_tod = (previous.hour * 3600 + previous.minute * 60 + previous.second) / 86400.0
+            current_tod = seconds / 86400.0
+            if current.date() <= previous.date() and previous_tod - current_tod > 0.25:
+                while current <= previous:
+                    current += pd.Timedelta(days=1)
+            elif current < previous - pd.Timedelta(hours=18):
+                while current < previous - pd.Timedelta(hours=18):
+                    current += pd.Timedelta(days=1)
+        result.append(current)
+        if pd.notna(current):
+            previous = current
+    return pd.Series(result, dtype="datetime64[ns]")
+
+
+def parse_datetime_series(series: pd.Series) -> pd.Series:
+    values = [_safe_datetime_scalar(v) for v in series]
+    return pd.Series(values, index=series.index, dtype="datetime64[ns]")
+
+
+def combine_date_time(date_series: pd.Series, time_series: pd.Series) -> pd.Series:
+    combined = _repair_date_time_sequence(date_series.tolist(), time_series.tolist())
+    combined.index = date_series.index
+    return combined
+
+
+
+def _date_from_name(value: object) -> Optional[date]:
+    text = safe_text(value)
+    patterns = [
+        r"(?<!\d)(20\d{2})[-_](\d{1,2})[-_](\d{1,2})(?!\d)",
+        r"(?<!\d)(\d{1,2})[-_/](\d{1,2})[-_/](20\d{2})(?!\d)",
+    ]
+    match = re.search(patterns[0], text)
+    if match:
+        try:
+            return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        except ValueError:
+            pass
+    match = re.search(patterns[1], text)
+    if match:
+        try:
+            return date(int(match.group(3)), int(match.group(2)), int(match.group(1)))
+        except ValueError:
+            pass
+    return None
+
+
+def _repair_datetime_ordered(values: Sequence[object]) -> pd.Series:
+    parsed = [_safe_datetime_scalar(value) for value in values]
+    # Isolated wrong date surrounded by a consistent sequence.
+    for i in range(1, len(parsed) - 1):
+        prev, cur, nxt = parsed[i - 1], parsed[i], parsed[i + 1]
+        if pd.isna(prev) or pd.isna(cur) or pd.isna(nxt):
+            continue
+        prev, cur, nxt = pd.Timestamp(prev), pd.Timestamp(cur), pd.Timestamp(nxt)
+        expected_step = nxt - prev
+        # Typical device/test cadence: next is 30-120 minutes after previous,
+        # while the current row has the correct clock time but wrong day.
+        if pd.Timedelta(0) < expected_step <= pd.Timedelta(hours=4):
+            midpoint = (prev + expected_step / 2).round("s")
+            if abs(cur - midpoint) > pd.Timedelta(hours=12):
+                parsed[i] = midpoint.normalize() + pd.Timedelta(
+                    hours=cur.hour, minutes=cur.minute, seconds=cur.second
+                )
+    return pd.Series(parsed, dtype="datetime64[ns]")
+
+
+def _align_dates_to_source_name(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty or "datetime" not in df.columns:
+        return df
+    out = df.copy()
+    group_cols = [c for c in ["source", "sheet"] if c in out.columns]
+    groups = out.groupby(group_cols, dropna=False, sort=False) if group_cols else [(None, out)]
+    for _, group in groups:
+        source_text = " ".join(safe_text(group[c].iloc[0]) for c in group_cols)
+        normalized_source = normalize_text(source_text)
+        expected = _date_from_name(source_text)
+        if expected is None:
+            continue
+        valid = pd.to_datetime(group["datetime"], errors="coerce")
+        valid_nonnull = valid.dropna()
+        if valid_nonnull.empty:
+            continue
+
+        unique_dates = sorted(set(valid_nonnull.dt.date))
+        hours = valid_nonnull.dt.hour + valid_nonnull.dt.minute / 60.0
+        has_evening = bool((hours >= 12).any())
+        has_morning = bool((hours < 12).any())
+        date_span = (max(unique_dates) - min(unique_dates)).days if unique_dates else 0
+
+        # Repair old dashboard exports where an overnight test was shifted into
+        # dates such as 22/23 although the source report name says 21-Jun. When
+        # a short group contains both evening and after-midnight readings, the
+        # clock time establishes the intended two-day sequence reliably.
+        if has_evening and has_morning and len(unique_dates) <= 3 and date_span <= 3:
+            repaired = []
+            for ts in valid:
+                if pd.isna(ts):
+                    repaired.append(pd.NaT)
+                    continue
+                ts = pd.Timestamp(ts).round("s")
+                target_date = expected if ts.hour >= 12 else expected + timedelta(days=1)
+                repaired.append(pd.Timestamp(datetime.combine(target_date, ts.time())))
+            out.loc[group.index, "datetime"] = repaired
+            continue
+
+        actual_start = valid_nonnull.min().date()
+        difference = (expected - actual_start).days
+        if difference and abs(difference) <= 7 and "export" not in normalized_source:
+            out.loc[group.index, "datetime"] = valid + pd.Timedelta(days=difference)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Well normalization and source priority
+# ---------------------------------------------------------------------------
+
+WELL_TOKEN_RE = re.compile(
+    r"\b(?:BED[_ -]?)?(?:[A-Z]\d{0,2}|S\d+|C\d+|B\d+)(?:[ _-]*[A-Z]?\d+){1,3}\b",
+    flags=re.I,
+)
+
+
+def _normalize_bed_device_alias(value: object) -> str:
+    """Normalize device-export aliases such as BED_16 C6-9 -> B16C6-9.
+
+    The rule is deliberately limited to BED + number + an alphabetic well tail
+    so a genuine name such as BED-15-33 is not silently changed.
+    """
+    text = safe_text(value).upper().replace("*", "").strip()
+    match = re.fullmatch(r"BED[ _-]?(\d{1,2})[ _-]*([A-Z]\d+(?:[ _-]*\d+)*)", text)
+    if match:
+        tail = re.sub(r"[ _-]+", "-", match.group(2)).strip("-")
+        return f"B{match.group(1)}{tail}"
+    return text
+
+
+def _well_key(value: object) -> str:
+    text = _normalize_bed_device_alias(value)
+    return re.sub(r"[^A-Z0-9]", "", text)
+
+
+def clean_well_name_value(value: object) -> str:
+    text = safe_text(value).upper().replace("*", "")
+    text = re.sub(r"\bWELL(?:\s+NAME)?\b\s*[:=-]?", "", text, flags=re.I).strip()
+    text = _normalize_bed_device_alias(text)
+    text = re.sub(r"\s+", "", text)
+    text = text.replace("_", "-")
+    text = re.sub(r"-{2,}", "-", text).strip("-")
+    # Canonicalize compound well names while preserving ordinary B15-40/S8-58.
+    compound = re.fullmatch(r"([A-Z]\d{1,2})-([A-Z]\d+)-(\d+)", text)
+    if compound:
+        text = f"{compound.group(1)}{compound.group(2)}-{compound.group(3)}"
+    return text if _well_key(text) else "Unknown"
+
+
+def normalize_well_name(value: object) -> str:
+    return clean_well_name_value(value)
+
+
+def guess_well_from_name(value: object) -> str:
+    text = safe_text(value).upper()
+    # Device exports often use field-style names such as "BED_16 C6-9" for
+    # well B16C6-9. Preserve the B prefix so device and TMU files merge.
+    bed_match = re.search(r"\bBED[ _-]?(\d{1,2})[ _-]*([A-Z]\d+(?:[ _-]*\d+)?)", text)
+    if bed_match:
+        tail = re.sub(r"[ _-]+", "-", bed_match.group(2)).strip("-")
+        return clean_well_name_value(f"B{bed_match.group(1)}{tail}")
+    # Prefer explicit WELL label.
+    match = re.search(r"WELL(?:\s+NAME)?\s*[:=-]?\s*([A-Z0-9 _-]{3,30})", text, flags=re.I)
+    if match:
+        candidate = re.split(r"\b(?:DATE|TIME|FIELD|TEST|REPORT)\b", match.group(1), maxsplit=1)[0]
+        candidate = clean_well_name_value(candidate)
+        if candidate != "Unknown":
+            return candidate
+    # File/sheet names: B15-40, B16C6-9, S8-58, B3C18-7, etc.
+    candidates = re.findall(r"\b[A-Z]\d{0,2}(?:[ _-]*[A-Z]?\d+){1,3}\b", text)
+    candidates = [clean_well_name_value(c) for c in candidates]
+    candidates = [c for c in candidates if c != "Unknown" and not re.fullmatch(r"TMU-?\d+", c)]
+    if candidates:
+        # Prefer candidates containing a separator or more than one letter-number group.
+        return max(candidates, key=lambda c: (len(_well_key(c)), len(c)))
+    return "Unknown"
+
+
+def _source_priority(name: str) -> int:
+    norm = normalize_text(name)
     score = 0
-    for kw in [
-        "tmu", "well", "date", "time", "choke", "w.h.p", "whp", "sep",
-        "gas rate", "gross rate", "oil rate", "water rate", "bsw", "bs&w",
-        "salinity", "h2s", "co2", "pumping", "n2", "flare test", "all data",
-        "circulation pressure", "reel depth", "wellhead pressure",
-    ]:
-        if kw in b:
-            score += 1
-    score += min(5, len(re.findall(r"[-+]?\d+(?:\.\d+)?", body)))
+    if re.search(r"\b(final|complete|completed|final report)\b", norm):
+        score += 40
+    if re.search(r"\b(clean|corrected|updated|latest)\b", norm):
+        score += 20
+    if re.search(r"\b(copy|old|draft|partial|incomplete)\b", norm):
+        score -= 10
     return score
 
 
-def parse_whatsapp_export_messages(text: str) -> List[Dict[str, object]]:
-    """Parse WhatsApp exported _chat.txt into message dicts.
+# ---------------------------------------------------------------------------
+# Header mapping
+# ---------------------------------------------------------------------------
 
-    Handles common Android/iOS formats:
-      12/06/2026, 00:30 - Sender: body
-      [12/06/2026, 00:30:05] Sender: body
-    Multi-line messages are preserved.
-    """
-    lines = str(text or "").replace("\ufeff", "").splitlines()
-    messages = []
-    current = None
-
-    patterns = [
-        r"^(?P<date>\d{1,2}[/-]\d{1,2}[/-]\d{2,4}),\s*(?P<time>\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM|am|pm)?)\s*-\s*(?P<sender>[^:]+):\s*(?P<body>.*)$",
-        r"^\[(?P<date>\d{1,2}[/-]\d{1,2}[/-]\d{2,4}),\s*(?P<time>\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM|am|pm)?)\]\s*(?P<sender>[^:]+):\s*(?P<body>.*)$",
-        r"^(?P<date>\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s+(?P<time>\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM|am|pm)?)\s*-\s*(?P<sender>[^:]+):\s*(?P<body>.*)$",
-    ]
-
-    for line in lines:
-        line = line.rstrip()
-        if not line.strip():
-            continue
-
-        matched = False
-        for p in patterns:
-            m = re.match(p, line)
-            if m:
-                if current:
-                    messages.append(current)
-                current = m.groupdict()
-                current["sender"] = str(current.get("sender", "")).strip()
-                current["body"] = str(current.get("body", "")).strip()
-                matched = True
-                break
-
-        if not matched and current:
-            current["body"] = str(current.get("body", "")) + "\n" + line.strip()
-
-    if current:
-        messages.append(current)
-
-    for i, m in enumerate(messages):
-        m["message_index"] = i
-        m["datetime"] = pd.to_datetime(
-            f"{m.get('date', '')} {m.get('time', '')}",
-            errors="coerce",
-            dayfirst=True,
-        )
-        m["attachment_name"] = parse_attachment_reference(m.get("body", ""))
-
-    return messages
+@dataclass(frozen=True)
+class HeaderInfo:
+    canonical: Optional[str]
+    unit: str = ""
+    raw_label: str = ""
 
 
-def parse_whatsapp_export_text(text: str, source_name="WhatsApp_Export") -> pd.DataFrame:
-    """Parse exported WhatsApp chat text into TMU production rows.
-
-    Important: this parser uses well name and explicit TMU keywords. It does not
-    assume one chat equals one test.
-    """
-    messages = parse_whatsapp_export_messages(text)
-    if not messages:
-        return pd.DataFrame()
-
-    rows = []
-    for m in messages:
-        body = str(m.get("body", ""))
-        if score_tmu_body(body) < 4:
-            continue
-
-        row = parse_tmu_message(body, source_name=source_name)
-        # If a message is only a continuation line, parse_tmu_message may not get
-        # its own date/time. Use WhatsApp timestamp as fallback only.
-        msg_dt = m.get("datetime", pd.NaT)
-        if ("datetime" not in row or pd.isna(row.get("datetime", pd.NaT))) and pd.notna(msg_dt):
-            row["datetime"] = msg_dt
-            row["date"] = pd.Timestamp(msg_dt).floor("D")
-            row["time_text"] = pd.Timestamp(msg_dt).strftime("%H:%M")
-
-        row["source_type"] = "whatsapp_export_text"
-        row["chat_sender"] = m.get("sender", "")
-        row["chat_datetime"] = msg_dt
-        row["message_index"] = m.get("message_index", np.nan)
-        row["attachment_name"] = m.get("attachment_name", "")
-        row["whatsapp_message_body"] = body[:500]
-        row["link_status"] = "text_confirmed_by_well" if row.get("well") and str(row.get("well")).lower() != "unknown" else "text_needs_well_review"
-
-        has_useful = any(
-            k in row for k in [
-                "gross_rate_bpd", "oil_rate_stbd", "water_rate_bpd", "whp_psi",
-                "sep_p_psi", "pumping_pressure_psi", "gas_rate_mmscfd", "bsw_pct",
-            ]
-        )
-        if has_useful:
-            rows.append(row)
-
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows)
+def _header_contains(header: str, *patterns: str) -> bool:
+    return any(re.search(pattern, header, flags=re.I) for pattern in patterns)
 
 
-def parse_whatsapp_plain_or_export_text(text: str, source_name="WhatsApp_Text") -> pd.DataFrame:
-    """Try exported-chat parsing first; fallback to pasted/block TMU parser."""
-    export_df = parse_whatsapp_export_text(text, source_name=source_name)
-    if not export_df.empty:
-        return export_df
-    df = parse_many_tmu_messages(text, source_name=source_name)
-    if not df.empty:
-        df["source_type"] = "pasted_whatsapp_text"
-        df["link_status"] = "text_confirmed_by_well"
-    return df
+def canonical_header(header: object) -> HeaderInfo:
+    raw = safe_text(header)
+    h = normalize_text(raw)
+    h = re.sub(r"^raw\s*[: -]\s*", "", h)
+    if not h:
+        return HeaderInfo(None, raw_label=raw)
+
+    # Metadata and date/time.
+    if re.fullmatch(r"datetime|date time|timestamp", h):
+        return HeaderInfo("datetime", raw_label=raw)
+    if _header_contains(h, r"^date(?:\s|$)", r"test date", r"current test date", r"d/mm", r"dd/mm") and "time" not in h:
+        return HeaderInfo("date", raw_label=raw)
+    if _header_contains(h, r"^time(?:\s|$)", r"hh:mm", r"clock time") and "date" not in h:
+        return HeaderInfo("time", raw_label=raw)
+    if _header_contains(h, r"^well$", r"well name"):
+        return HeaderInfo("well", raw_label=raw)
+    if h == "source":
+        return HeaderInfo("source_meta", raw_label=raw)
+    if h == "sheet":
+        return HeaderInfo("sheet_meta", raw_label=raw)
+    if h in {"source type", "source_type"}:
+        return HeaderInfo("source_type_meta", raw_label=raw)
+    if h in {"note", "notes"}:
+        return HeaderInfo("note_meta", raw_label=raw)
+    if h in {"gas status", "gas rate status"}:
+        return HeaderInfo("gas_rate_status_meta", raw_label=raw)
+
+    # Choke. Explicit unit wins.
+    if "choke" in h:
+        if "%" in h or "percent" in h or "opening" in h:
+            return HeaderInfo("choke_pct", "%", raw)
+        if re.search(r"(?:/\s*64|64th|in\s*/\s*64)", h):
+            return HeaderInfo("choke_size_64", "/64", raw)
+        return HeaderInfo("choke_ambiguous", "", raw)
+
+    # Device channels before generic pressure/temperature rules.
+    if re.fullmatch(r"ama(?: amp)?", h) or _header_contains(h, r"motor current", r"current amp"):
+        return HeaderInfo("motor_ama_amp", "A", raw)
+    if re.fullmatch(r"pi(?: psi)?", h) or _header_contains(h, r"pump intake", r"intake pressure"):
+        return HeaderInfo("pump_intake_pressure_psi", _pressure_unit(h), raw)
+    if re.fullmatch(r"pd(?: psi)?", h) or _header_contains(h, r"pump discharge", r"discharge pressure"):
+        return HeaderInfo("pump_discharge_pressure_psi", _pressure_unit(h), raw)
+    if _header_contains(h, r"run freq", r"pump freq", r"pump frequency", r"drive freq"):
+        return HeaderInfo("pump_freq_hz", "Hz", raw)
+    if re.fullmatch(r"tm(?: f| c)?", h) or _header_contains(h, r"motor temp"):
+        if _is_fahrenheit_header(h):
+            return HeaderInfo("motor_temp_f", "F", raw)
+        if _is_celsius_header(h):
+            return HeaderInfo("motor_temp_c", "C", raw)
+        return HeaderInfo("motor_temp_f", "infer", raw)
+
+    # Pressures.
+    if _header_contains(h, r"pumping[ ._-]*p", r"pump[ ._-]*p(?:ressure)?", r"pumping pressure", r"circulation pressure"):
+        return HeaderInfo("pumping_pressure_psi", _pressure_unit(h), raw)
+    if _header_contains(h, r"\bwhp\b", r"w h p", r"wellhead pressure"):
+        return HeaderInfo("whp_psi", _pressure_unit(h), raw)
+    if _header_contains(h, r"\bflp\b", r"flowing line pressure", r"flow line pressure"):
+        return HeaderInfo("flp_psi", _pressure_unit(h), raw)
+    if _header_contains(h, r"sep(?:arator)?\s*[ ._-]*p", r"separator pressure"):
+        return HeaderInfo("sep_p_psi", _pressure_unit(h), raw)
+    if _header_contains(h, r"upstream pressure", r"\bus press"):
+        return HeaderInfo("us_press_psi", _pressure_unit(h), raw)
+    if _header_contains(h, r"downstream pressure", r"\bds press"):
+        return HeaderInfo("ds_press_psi", _pressure_unit(h), raw)
+    if _header_contains(h, r"ct pressure", r"coiled tubing pressure"):
+        return HeaderInfo("ct_pressure_psi", _pressure_unit(h), raw)
+
+    # Rates and production measurements.
+    if _header_contains(h, r"formation gas"):
+        return HeaderInfo("gas_formation_mmscfd", _gas_rate_unit(h), raw)
+    if _header_contains(h, r"total gas rate", r"qgas", r"gas rate") and "status" not in h:
+        return HeaderInfo("gas_rate_mmscfd", _gas_rate_unit(h), raw)
+    if _header_contains(h, r"gross rate", r"gross liquid", r"qgross"):
+        return HeaderInfo("gross_rate_bpd", _liquid_rate_unit(h), raw)
+    if _header_contains(h, r"oil rate", r"cond rate", r"condensate rate", r"qoil"):
+        return HeaderInfo("oil_rate_stbd", _liquid_rate_unit(h), raw)
+    if _header_contains(h, r"water rate", r"qwat"):
+        return HeaderInfo("water_rate_bpd", _liquid_rate_unit(h), raw)
+    if _header_contains(h, r"n2 rate", r"nitrogen rate"):
+        return HeaderInfo("n2_rate_scfm", "scfm", raw)
+    if _header_contains(h, r"bsw", r"bs and w", r"water cut", r"watercut", r"\bwc\b"):
+        return HeaderInfo("bsw_pct", "%", raw)
+    if "salinity" in h:
+        return HeaderInfo("salinity_kppm", "ppm" if "kppm" not in h and "k ppm" not in h else "kppm", raw)
+
+    # Gas/oil properties.
+    if _header_contains(h, r"gas specific gravity", r"gas sp gr", r"sp gr", r"air =1"):
+        return HeaderInfo("gas_sg", "", raw)
+    if _header_contains(h, r"orifice"):
+        return HeaderInfo("orifice_size_in", "in", raw)
+    if _header_contains(h, r"\bgor\b"):
+        return HeaderInfo("gor_scf_bbl", "scf/bbl", raw)
+    if _header_contains(h, r"\bh2s\b"):
+        return HeaderInfo("h2s_ppm", "ppm", raw)
+    if _header_contains(h, r"\bco2\b"):
+        return HeaderInfo("co2_mole_pct", "%", raw)
+    if _header_contains(h, r"oil gravity", r"api gravity", r"deg api"):
+        return HeaderInfo("oil_api", "API", raw)
+    if _header_contains(h, r"oil k f", r"oil kf"):
+        return HeaderInfo("oil_kf", "", raw)
+    if _header_contains(h, r"oil meter increment", r"meter increment"):
+        return HeaderInfo("oil_meter_increment_bbl", "bbl", raw)
+    if _header_contains(h, r"oil cmf", r"\bcmf\b"):
+        return HeaderInfo("oil_cmf", "", raw)
+    if _header_contains(h, r"oil cum"):
+        return HeaderInfo("oil_cum_bbl", "bbl", raw)
+    if _header_contains(h, r"water cum", r"wat cum"):
+        return HeaderInfo("water_cum_bbl", "bbl", raw)
+
+    # Temperature rules with context.
+    if _header_contains(h, r"\bflt\b", r"flow line temp"):
+        return HeaderInfo("flt_f" if _is_fahrenheit_header(h) else "flt_c", "F" if _is_fahrenheit_header(h) else "C", raw)
+    if _header_contains(h, r"gas temp", r"gas t"):
+        return HeaderInfo("gas_temp_f" if _is_fahrenheit_header(h) else "gas_temp_c", "F" if _is_fahrenheit_header(h) else "C", raw)
+    if _header_contains(h, r"oil temp"):
+        return HeaderInfo("oil_temp_f" if _is_fahrenheit_header(h) else "oil_temp_c", "F" if _is_fahrenheit_header(h) else "C", raw)
+    if _header_contains(h, r"separator temp", r"sep temp"):
+        return HeaderInfo("sep_temp_f" if _is_fahrenheit_header(h) else "sep_temp_c", "F" if _is_fahrenheit_header(h) else "C", raw)
+    if _header_contains(h, r"wellhead temp"):
+        return HeaderInfo("wellhead_temp_f" if _is_fahrenheit_header(h) else "wellhead_temp_c", "F" if _is_fahrenheit_header(h) else "C", raw)
+
+    # CTU fields.
+    if _header_contains(h, r"ct depth", r"coiled tubing depth"):
+        return HeaderInfo("ct_depth_m", "m", raw)
+    if _header_contains(h, r"ct running speed", r"running speed"):
+        return HeaderInfo("ct_running_speed_ftmin", "ft/min", raw)
+    if _header_contains(h, r"ct pipe weight", r"pipe weight"):
+        return HeaderInfo("ct_pipe_weight_lbf", "lbf", raw)
+
+    return HeaderInfo(None, raw_label=raw)
 
 
-def assign_test_ids(df: pd.DataFrame, gap_hours: float = 12.0) -> pd.DataFrame:
-    """Assign stable test_id by well name + time gap.
+def _pressure_unit(h: str) -> str:
+    if "bar" in h:
+        return "bar"
+    if "mpa" in h:
+        return "mpa"
+    if "kpa" in h:
+        return "kpa"
+    return "psi"
 
-    Rule requested by user:
-      - Same well continues the same test until the time gap exceeds gap_hours.
-      - A different well is always a different test stream.
-      - Unknown/unlinked OCR rows are NOT silently assigned to a well/test.
-    """
-    if df is None or df.empty:
-        return df
 
-    out = df.copy()
-    if "well" not in out.columns:
-        out["well"] = "Unknown"
-    if "datetime" not in out.columns:
-        out["datetime"] = pd.NaT
+def _gas_rate_unit(h: str) -> str:
+    if re.search(r"\bscf\s*/?\s*d", h) and "mmscf" not in h and "mscf" not in h:
+        return "scfd"
+    if re.search(r"\bmscf\s*/?\s*d", h) and "mmscf" not in h:
+        return "mscfd"
+    return "mmscfd"
 
-    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
-    out["well"] = out["well"].fillna("Unknown").astype(str).str.strip().replace("", "Unknown")
-    out["test_id"] = out.get("test_id", pd.Series([np.nan] * len(out), index=out.index))
-    out["test_sequence"] = out.get("test_sequence", pd.Series([np.nan] * len(out), index=out.index))
 
-    sortable = out.sort_values(["well", "datetime", "source"], na_position="last").copy()
-    assigned = {}
+def _liquid_rate_unit(h: str) -> str:
+    if "m3" in h or "m 3" in h:
+        return "m3d"
+    return "bpd"
 
-    for well, g in sortable.groupby("well", dropna=False):
-        well_txt = str(well or "Unknown").strip() or "Unknown"
-        if well_txt.lower() == "unknown":
-            # Keep unknown rows separate/unlinked. They may be reviewed in the app.
-            for i in g.index:
-                assigned[i] = ("Unlinked_OCR_or_Unknown_Well", np.nan)
-            continue
 
-        seq = 0
-        last_dt = pd.NaT
-        current_id = None
-        current_start = pd.NaT
-        for i, row in g.iterrows():
-            dt = row.get("datetime", pd.NaT)
-            if pd.isna(dt):
-                # Same well but no time: keep as separate manual-review row.
-                seq += 1
-                current_id = f"{well_txt}_T{seq:02d}_NoTime"
-                assigned[i] = (current_id, seq)
-                continue
+def _is_fahrenheit_header(h: str) -> bool:
+    return bool(re.search(r"(?:deg\s*f|\(f\)|\bf\b|fahrenheit)", h))
 
-            new_test = (
-                current_id is None
-                or pd.isna(last_dt)
-                or (pd.Timestamp(dt) - pd.Timestamp(last_dt) > pd.Timedelta(hours=float(gap_hours)))
-            )
-            if new_test:
-                seq += 1
-                current_start = pd.Timestamp(dt)
-                current_id = f"{well_txt}_{current_start.strftime('%Y%m%d_%H%M')}"
 
-            assigned[i] = (current_id, seq)
-            last_dt = pd.Timestamp(dt)
+def _is_celsius_header(h: str) -> bool:
+    return bool(re.search(r"(?:deg\s*c|\(c\)|\bc\b|celsius)", h))
 
-    for i, (tid, seq) in assigned.items():
-        out.at[i, "test_id"] = tid
-        out.at[i, "test_sequence"] = seq
 
-    # Add test start/end for confirmed test rows.
-    if "test_id" in out.columns and "datetime" in out.columns:
-        valid = out[~out["test_id"].astype(str).str.startswith("Unlinked") & out["datetime"].notna()].copy()
-        if not valid.empty:
-            starts = valid.groupby("test_id")["datetime"].min()
-            ends = valid.groupby("test_id")["datetime"].max()
-            out["test_start"] = out["test_id"].map(starts)
-            out["test_end"] = out["test_id"].map(ends)
-
+def _convert_numeric(values: pd.Series, info: HeaderInfo) -> pd.Series:
+    out = clean_tabular_numeric_series(values)
+    key, unit = info.canonical, info.unit
+    if key is None:
+        return out
+    if key.endswith("_psi"):
+        if unit == "bar":
+            out *= 14.5037738
+        elif unit == "kpa":
+            out *= 0.145037738
+        elif unit == "mpa":
+            out *= 145.037738
+    elif key in {"gas_rate_mmscfd", "gas_formation_mmscfd"}:
+        if unit == "scfd":
+            out /= 1_000_000.0
+        elif unit == "mscfd":
+            out /= 1_000.0
+    elif key in {"gross_rate_bpd", "oil_rate_stbd", "water_rate_bpd"} and unit == "m3d":
+        out *= 6.28981077
+    elif key == "salinity_kppm":
+        if unit == "ppm":
+            out /= 1000.0
+        else:
+            # Some files say K ppm but store 225000 ppm.
+            out = out.where(out.abs() <= 1000, out / 1000.0)
+    elif key == "choke_pct":
+        out = out.where((out <= 1.0) | (out > 1.0), out)
+        out = out.where(~((out > 0) & (out <= 1.0)), out * 100.0)
+    elif key == "choke_size_64":
+        # Some reports mix inch notation (1 = one inch = 64/64) with explicit
+        # /64 values (34, 38, 42) in the same column. Convert row-by-row.
+        inch_mask = out.notna() & (out.abs() > 0) & (out.abs() <= 2.0)
+        out = out.where(~inch_mask, out * 64.0)
     return out
 
 
-def suggest_links_for_ocr_rows(df: pd.DataFrame, max_gap_hours: float = 3.0) -> pd.DataFrame:
-    """Suggest, but do not apply, well/test links for CTU image rows.
+# ---------------------------------------------------------------------------
+# XLSX direct bounded reader
+# ---------------------------------------------------------------------------
 
-    A suggestion is created only when there is one nearest confirmed non-OCR row
-    within max_gap_hours. The row remains review_required; app/user must approve
-    before it becomes part of the test plot.
-    """
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-    for c in ["source_type", "well", "datetime", "test_id", "suggested_well", "suggested_test_id", "suggested_link_reason", "suggested_link_gap_hours"]:
-        if c not in out.columns:
-            out[c] = np.nan
-    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+_XLSX_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 
-    anchor_mask = (
-        out["datetime"].notna()
-        & out["well"].notna()
-        & (out["well"].astype(str).str.strip().str.lower() != "unknown")
-        & (~out["source_type"].astype(str).str.contains("ocr", case=False, na=False))
-    )
-    anchors = out[anchor_mask].copy()
-    if anchors.empty:
-        return out
 
-    ocr_mask = out["source_type"].astype(str).str.contains("ocr", case=False, na=False)
-    for i, row in out[ocr_mask].iterrows():
-        dt = row.get("datetime", pd.NaT)
+def _xlsx_col_number(ref: str) -> int:
+    letters = re.match(r"([A-Z]+)", ref.upper())
+    if not letters:
+        return 0
+    number = 0
+    for char in letters.group(1):
+        number = number * 26 + ord(char) - 64
+    return number
+
+
+def _read_shared_strings(zf: zipfile.ZipFile) -> List[str]:
+    path = "xl/sharedStrings.xml"
+    if path not in zf.namelist():
+        return []
+    strings: List[str] = []
+    root = ET.fromstring(zf.read(path))
+    for si in root.findall(f"{{{_XLSX_NS}}}si"):
+        strings.append("".join(node.text or "" for node in si.iter() if node.tag.endswith("}t")))
+    return strings
+
+
+def _workbook_sheet_paths(zf: zipfile.ZipFile) -> List[Tuple[str, str]]:
+    workbook = ET.fromstring(zf.read("xl/workbook.xml"))
+    rels = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+    targets = {
+        rel.attrib.get("Id"): rel.attrib.get("Target", "")
+        for rel in rels.findall(f"{{{_PKG_REL_NS}}}Relationship")
+    }
+    output: List[Tuple[str, str]] = []
+    for sheet in workbook.findall(f".//{{{_XLSX_NS}}}sheet"):
+        name = sheet.attrib.get("name", "Sheet")
+        rid = sheet.attrib.get(f"{{{_REL_NS}}}id")
+        target = targets.get(rid, "")
+        if not target:
+            continue
+        if target.startswith("/"):
+            target = target.lstrip("/")
+        elif not target.startswith("xl/"):
+            target = "xl/" + target.lstrip("/")
+        target = re.sub(r"(?:^|/)\.\./", "", target)
+        output.append((name, target))
+    return output
+
+
+def _cell_value(cell: ET.Element, shared: Sequence[str]) -> object:
+    cell_type = cell.attrib.get("t")
+    if cell_type == "inlineStr":
+        return "".join(node.text or "" for node in cell.iter() if node.tag.endswith("}t"))
+    value_node = cell.find(f"{{{_XLSX_NS}}}v")
+    if value_node is None:
+        return None
+    raw = value_node.text or ""
+    if cell_type == "s":
+        try:
+            return shared[int(raw)]
+        except Exception:
+            return raw
+    if cell_type in {"str", "e"}:
+        return raw
+    if cell_type == "b":
+        return raw == "1"
+    try:
+        return float(raw)
+    except ValueError:
+        return raw
+
+
+def _peek_sheet_sparse(
+    zf: zipfile.ZipFile,
+    sheet_path: str,
+    shared: Sequence[str],
+    *,
+    max_row: int = 20,
+    max_cols: int = 80,
+) -> pd.DataFrame:
+    rows: Dict[int, Dict[int, object]] = {}
+    with zf.open(sheet_path) as handle:
+        for _, elem in ET.iterparse(handle, events=("end",)):
+            if not elem.tag.endswith("}c"):
+                continue
+            ref = elem.attrib.get("r", "")
+            match = re.match(r"[A-Z]+(\d+)", ref.upper())
+            if not match:
+                elem.clear(); continue
+            row_num = int(match.group(1))
+            if row_num > max_row:
+                elem.clear()
+                break
+            col_num = _xlsx_col_number(ref)
+            if 0 < col_num <= max_cols:
+                value = _cell_value(elem, shared)
+                if not _is_missing(value):
+                    rows.setdefault(row_num, {})[col_num] = value
+            elem.clear()
+    if not rows:
+        return pd.DataFrame(dtype=object)
+    row_numbers = sorted(rows)
+    width = max(max(row) for row in rows.values())
+    return pd.DataFrame([[rows[r].get(c) for c in range(1, width + 1)] for r in row_numbers], index=row_numbers, dtype=object)
+
+
+def _xlsx_simple_table_signature(zf: zipfile.ZipFile, sheets: Sequence[Tuple[str, str]], shared: Sequence[str]) -> bool:
+    if len(sheets) != 1:
+        return False
+    _, path = sheets[0]
+    peek = _peek_sheet_sparse(zf, path, shared)
+    if peek.empty:
+        return False
+    for row_position, row in enumerate(peek.itertuples(index=False, name=None)):
+        # A genuinely simple export starts with its table header. Standard TMU
+        # reports have title/client rows first and must stay on the mature path.
+        if row_position >= 3:
+            break
+        labels = [normalize_text(v) for v in row if safe_text(v)]
+        joined = " | ".join(labels)
+        has_dt = any(label in {"datetime", "date time", "timestamp"} for label in labels)
+        has_date_time = any(label == "date" for label in labels) and any(label == "time" for label in labels)
+        recognized = sum(canonical_header(label).canonical not in {None, "date", "time", "datetime", "well"} for label in labels)
+        if (has_dt or has_date_time) and recognized >= 1:
+            return True
+        # Device abbreviations in a one-row header.
+        if (has_dt or has_date_time) and re.search(r"\b(?:ama|pi|pd|run freq|tm)\b", joined):
+            return True
+    return False
+
+
+def _read_sheet_sparse(
+    zf: zipfile.ZipFile,
+    sheet_path: str,
+    shared: Sequence[str],
+    *,
+    max_rows: int = 20000,
+    max_cols: int = 512,
+    max_nonempty_cells: int = 500000,
+) -> pd.DataFrame:
+    rows: Dict[int, Dict[int, object]] = {}
+    nonempty = 0
+    with zf.open(sheet_path) as handle:
+        for event, elem in ET.iterparse(handle, events=("end",)):
+            if not elem.tag.endswith("}c"):
+                continue
+            ref = elem.attrib.get("r", "")
+            match = re.match(r"[A-Z]+(\d+)", ref.upper())
+            if not match:
+                elem.clear()
+                continue
+            row_num = int(match.group(1))
+            col_num = _xlsx_col_number(ref)
+            if row_num > max_rows or col_num <= 0 or col_num > max_cols:
+                elem.clear()
+                continue
+            value = _cell_value(elem, shared)
+            if not _is_missing(value):
+                rows.setdefault(row_num, {})[col_num] = value
+                nonempty += 1
+                if nonempty >= max_nonempty_cells:
+                    elem.clear()
+                    break
+            elem.clear()
+    if not rows:
+        return pd.DataFrame(dtype=object)
+    row_numbers = sorted(rows)
+    max_col = max(max(values) for values in rows.values())
+    matrix = [[rows[r].get(c) for c in range(1, max_col + 1)] for r in row_numbers]
+    frame = pd.DataFrame(matrix, index=row_numbers, dtype=object)
+    frame.attrs["source_row_numbers"] = row_numbers
+    return frame
+
+
+# ---------------------------------------------------------------------------
+# Table detection and standardization
+# ---------------------------------------------------------------------------
+
+@dataclass
+class HeaderCandidate:
+    start_pos: int
+    height: int
+    headers: List[str]
+    infos: List[HeaderInfo]
+    score: float
+
+
+def _combined_headers(raw: pd.DataFrame, start: int, height: int) -> List[str]:
+    rows = [raw.iloc[start + offset].tolist() for offset in range(height)]
+    width = raw.shape[1]
+    parent_values: List[str] = [""] * width
+    current_parent = ""
+    for col in range(width):
+        top = safe_text(rows[0][col])
+        if top:
+            current_parent = top
+        parent_values[col] = current_parent
+
+    headers: List[str] = []
+    for col in range(width):
+        pieces: List[str] = []
+        normalized_seen: set[str] = set()
+        for row_index, row in enumerate(rows):
+            text = safe_text(row[col])
+            if row_index == 0 and not text:
+                text = parent_values[col]
+            norm = normalize_text(text)
+            if text and norm not in normalized_seen:
+                normalized_seen.add(norm)
+                pieces.append(text)
+        headers.append(" | ".join(pieces))
+    return headers
+
+
+def _combine_scalar_date_time(date_value: object, time_value: object) -> pd.Timestamp:
+    d = _date_only(date_value)
+    fraction = _time_fraction(time_value)
+    if d is None or not math.isfinite(fraction):
+        return pd.NaT
+    seconds = int(round(fraction * 86400)) % 86400
+    return pd.Timestamp(datetime.combine(d, time.min) + timedelta(seconds=seconds))
+
+
+def _header_candidate_score(raw: pd.DataFrame, start: int, height: int) -> HeaderCandidate:
+    headers = _combined_headers(raw, start, height)
+    infos = [canonical_header(header) for header in headers]
+    canonical = [info.canonical for info in infos]
+    has_datetime = "datetime" in canonical or ("date" in canonical and "time" in canonical)
+    recognized_indices = [
+        idx for idx, key in enumerate(canonical)
+        if key and key not in {"date", "time", "datetime", "well", "source_meta", "sheet_meta", "source_type_meta", "note_meta", "gas_rate_status_meta"}
+    ]
+    unique_recognized = len({canonical[idx] for idx in recognized_indices})
+    # Reject obvious non-headers before examining data rows.
+    if not has_datetime or unique_recognized == 0:
+        return HeaderCandidate(start, height, headers, infos, -100.0)
+
+    sample = raw.iloc[start + height : min(len(raw), start + height + 50)]
+    datetime_count = 0
+    numeric_count = 0
+    date_idx = canonical.index("date") if "date" in canonical else None
+    time_idx = canonical.index("time") if "time" in canonical else None
+    dt_idx = canonical.index("datetime") if "datetime" in canonical else None
+    for row_tuple in sample.itertuples(index=False, name=None):
+        if dt_idx is not None:
+            dt = _safe_datetime_scalar(row_tuple[dt_idx])
+        else:
+            dt = _combine_scalar_date_time(row_tuple[date_idx], row_tuple[time_idx])
         if pd.isna(dt):
             continue
-        deltas = (anchors["datetime"] - pd.Timestamp(dt)).abs()
-        if deltas.empty:
-            continue
-        nearest_idx = deltas.idxmin()
-        gap_h = float(deltas.loc[nearest_idx].total_seconds() / 3600.0)
-        if gap_h <= float(max_gap_hours):
-            out.at[i, "suggested_well"] = anchors.at[nearest_idx, "well"]
-            out.at[i, "suggested_test_id"] = anchors.at[nearest_idx, "test_id"]
-            out.at[i, "suggested_link_gap_hours"] = round(gap_h, 3)
-            out.at[i, "suggested_link_reason"] = f"Nearest confirmed text/Excel row within {gap_h:.2f} hr; review before approving."
-            out.at[i, "link_status"] = "suggested_needs_user_approval"
-            out.at[i, "review_required"] = True
-    return out
+        datetime_count += 1
+        if any(pd.notna(extract_number(row_tuple[col])) for col in recognized_indices):
+            numeric_count += 1
+    unit_tokens = sum(bool(re.search(r"(?:psi|psig|mmscf|bbl|stb|ppm|%|deg|hh:mm|/64|scf)", normalize_text(h))) for h in headers)
+    score = 20 + unique_recognized * 4 + min(datetime_count, 20) + min(numeric_count, 20) * 2 + min(unit_tokens, 12) * 0.5
+    return HeaderCandidate(start, height, headers, infos, score)
 
-
-def approve_suggested_ocr_links(df: pd.DataFrame) -> pd.DataFrame:
-    """Apply suggested OCR links after explicit user approval in Streamlit."""
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-    required = {"suggested_well", "suggested_test_id", "source_type"}
-    if not required.issubset(set(out.columns)):
-        return out
-    mask = (
-        out["source_type"].astype(str).str.contains("ocr", case=False, na=False)
-        & out["suggested_well"].notna()
-        & out["suggested_test_id"].notna()
-    )
-    out.loc[mask, "well"] = out.loc[mask, "suggested_well"]
-    out.loc[mask, "test_id"] = out.loc[mask, "suggested_test_id"]
-    out.loc[mask, "link_status"] = "ocr_link_approved"
-    out.loc[mask, "review_required"] = False
-    return out
-
-
-def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: int = 100) -> List[pd.DataFrame]:
-    """v43 upload router.
-
-    Supports existing Excel/CSV/DOCX/PDF/TXT parsing plus:
-      - WhatsApp exported ZIP bundles (_chat.txt + attachments + images)
-      - Direct CTU screen image OCR (JPG/JPEG/PNG)
-
-    OCR safety: CTU image rows are parsed as auxiliary rows and left unlinked until
-    reviewed/approved in the app. No nearest-well fill is applied automatically.
-    """
-    name = getattr(uploaded_file, "name", "uploaded")
-    suffix = Path(str(name)).suffix.lower().lstrip(".")
-
-    if suffix in IMAGE_SUFFIXES:
-        if not parse_images:
-            return []
-        return filter_usable_tables([parse_ctu_all_data_screen_image(uploaded_file, source_name=name)])
-
-    if suffix == "zip":
-        try:
-            raw = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
-            tables: List[pd.DataFrame] = []
-            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-                members = [m for m in zf.namelist() if not m.endswith("/") and not Path(m).name.startswith("._")]
-
-                # Build chat-message index first so OCR/image rows can get timestamps and suggestions.
-                all_messages: List[Dict[str, object]] = []
-                chat_names = []
-                for member in members:
-                    member_name = Path(member).name
-                    if Path(member_name).suffix.lower().lstrip(".") == "txt" and ("chat" in member_name.lower() or "_chat" in member_name.lower()):
-                        text = zf.read(member).decode("utf-8", errors="ignore")
-                        chat_names.append(member_name)
-                        all_messages.extend(parse_whatsapp_export_messages(text))
-                        df = parse_whatsapp_export_text(text, source_name=f"{name}:{member_name}")
-                        if not df.empty:
-                            df["source_member"] = member
-                            tables.append(df)
-
-                attachment_context = {}
-                for m in all_messages:
-                    att = str(m.get("attachment_name", "") or "").strip()
-                    if not att:
-                        continue
-                    attachment_context[Path(att).name] = m
-
-                # Parse non-chat attachments and OCR images.
-                for member in members:
-                    member_name = Path(member).name
-                    ext = Path(member_name).suffix.lower().lstrip(".")
-                    if not member_name or ext not in (DATA_SUFFIXES | IMAGE_SUFFIXES):
-                        continue
-                    if ext == "txt" and ("chat" in member_name.lower() or "_chat" in member_name.lower()):
-                        continue
-
-                    sub_file = UploadedBytes(zf.read(member), member_name)
-                    if ext in IMAGE_SUFFIXES:
-                        if not parse_images or max_ocr_images <= 0:
-                            continue
-                        max_ocr_images -= 1
-                    sub_tables = load_tabular_file(sub_file, parse_images=parse_images, max_ocr_images=max_ocr_images)
-                    ctx = attachment_context.get(member_name, {})
-                    for t in sub_tables or []:
-                        if t is None or t.empty:
-                            continue
-                        t = t.copy()
-                        t["attachment_name"] = member_name
-                        t["source_member"] = member
-                        if ctx:
-                            t["chat_sender"] = ctx.get("sender", "")
-                            t["chat_datetime"] = ctx.get("datetime", pd.NaT)
-                            t["message_index"] = ctx.get("message_index", np.nan)
-                            if "datetime" not in t.columns or pd.to_datetime(t["datetime"], errors="coerce").isna().all():
-                                if pd.notna(ctx.get("datetime", pd.NaT)):
-                                    t["datetime"] = ctx.get("datetime")
-                                    t["date"] = pd.Timestamp(ctx.get("datetime")).floor("D")
-                                    t["time_text"] = pd.Timestamp(ctx.get("datetime")).strftime("%H:%M")
-                            if ext in IMAGE_SUFFIXES:
-                                t["caption_text"] = str(ctx.get("body", ""))[:500]
-                        tables.append(t)
-
-            if not tables:
-                return []
-            merged = pd.concat(tables, ignore_index=True, sort=False)
-            merged = assign_test_ids(merged, gap_hours=12.0)
-            # No nearest-time OCR linking here. CTU/OCR image rows remain unlinked
-            # unless the user manually selects the correct Well/Test in Streamlit.
-            return filter_usable_tables([merged])
-        except Exception as e:
-            raise RuntimeError(f"Could not read WhatsApp ZIP {name}: {e}")
-
-    if suffix == "txt":
-        try:
-            text = uploaded_file.getvalue().decode("utf-8", errors="ignore")
-        except Exception:
-            if hasattr(uploaded_file, "seek"):
-                uploaded_file.seek(0)
-            text = uploaded_file.read().decode("utf-8", errors="ignore")
-        df = parse_whatsapp_plain_or_export_text(text, source_name=name)
-        if not df.empty:
-            df = assign_test_ids(df, gap_hours=12.0)
-            return filter_usable_tables([df])
+def _find_header_candidates(raw: pd.DataFrame) -> List[HeaderCandidate]:
+    if raw is None or raw.empty:
         return []
-
-    tables = load_tabular_file_base(uploaded_file)
-    out_tables = []
-    for t in tables or []:
-        if t is not None and not t.empty:
-            t = assign_test_ids(t, gap_hours=12.0)
-            out_tables.append(t)
-    return filter_usable_tables(out_tables)
-
-# v43.1 safety refinements: allow direct OCR rows even if no timestamp; keep them unlinked.
-def parse_datetime_from_filename(name: str):
-    """Parse common WhatsApp media filenames, including 'WhatsApp Image 2026-06-13 at 15.29.01.jpeg'."""
-    name = str(name or "")
-    patterns = [
-        r"(20\d{2})[-_](\d{2})[-_](\d{2})\s+at\s+(\d{1,2})[.:\-_](\d{2})[.:\-_](\d{2})",
-        r"(20\d{2})[-_](\d{2})[-_](\d{2})[-_](\d{2})[-_](\d{2})[-_](\d{2})",
-        r"(20\d{2})[-_](\d{2})[-_](\d{2})[-_](\d{2})[-_](\d{2})",
-        r"(\d{2})[-_](\d{2})[-_](20\d{2})[-_](\d{2})[-_](\d{2})[-_](\d{2})",
-    ]
-    for p in patterns:
-        m = re.search(p, name, flags=re.I)
-        if not m:
+    scan_rows = min(len(raw), 120)
+    candidates: List[HeaderCandidate] = []
+    for start in range(scan_rows):
+        for height in (1, 2, 3):
+            if start + height > len(raw):
+                continue
+            candidate = _header_candidate_score(raw, start, height)
+            if candidate.score >= 16:
+                candidates.append(candidate)
+    candidates.sort(key=lambda c: c.score, reverse=True)
+    selected: List[HeaderCandidate] = []
+    for candidate in candidates:
+        if any(abs(candidate.start_pos - previous.start_pos) <= 3 for previous in selected):
             continue
-        nums = list(map(int, m.groups()))
-        try:
-            if len(nums) == 6 and str(nums[0]).startswith("20"):
-                y, mo, d, hh, mm, ss = nums
-            elif len(nums) == 5:
-                y, mo, d, hh, mm = nums
-                ss = 0
-            else:
-                d, mo, y, hh, mm, ss = nums
-            return pd.Timestamp(year=y, month=mo, day=d, hour=hh, minute=mm, second=ss)
-        except Exception:
-            pass
-    return pd.NaT
+        selected.append(candidate)
+        if len(selected) >= 4:
+            break
+    return selected
 
 
-def is_usable_ocr_table(df: pd.DataFrame) -> bool:
-    if df is None or df.empty:
-        return False
-    if "source_type" not in df.columns:
-        return False
-    if not df["source_type"].astype(str).str.contains("ocr", case=False, na=False).any():
-        return False
-    return any(c in df.columns and pd.to_numeric(df[c], errors="coerce").notna().any() for c in COLUMN_LABELS if str(c).startswith("ctu_"))
-
-
-def filter_usable_tables(tables: List[pd.DataFrame]) -> List[pd.DataFrame]:
-    """Final safety filter for all upload types, including direct CTU OCR rows."""
-    return [t for t in tables if is_valid_timeseries(t) or is_usable_single_message_table(t) or is_usable_ocr_table(t)]
-
-# v43.2 optimized OCR overrides: fewer OCR passes for Streamlit performance.
-def _ocr_numeric_region_pil(crop_img):
-    Image, ImageOps, ImageEnhance, pytesseract = _try_import_ocr_libs()
-    if Image is None:
-        return np.nan, 0.0, "ocr_dependency_missing"
-    try:
-        gray = ImageOps.autocontrast(crop_img.convert("L"))
-        g = ImageEnhance.Contrast(gray).enhance(3.0)
-        g = ImageEnhance.Sharpness(g).enhance(2.0)
-        g = g.resize((max(90, g.width * 4), max(40, g.height * 4)))
-        variants = [g, ImageOps.invert(g), g.point(lambda p: 255 if p > 150 else 0)]
-        best = (-1, np.nan, "")
-        for im in variants:
-            try:
-                txt = pytesseract.image_to_string(im, config="--oem 3 --psm 7 -c tessedit_char_whitelist=-0123456789.")
-            except Exception:
-                continue
-            nums = _numbers_from_ocr_text(txt)
-            if not nums:
-                continue
-            val = _best_number_from_ocr_text(txt)
-            score = max(len(n.replace(".", "").replace("-", "")) for n in nums) + (2 if any("." in n for n in nums) else 0)
-            if pd.notna(val) and score > best[0]:
-                best = (score, val, str(txt).strip())
-        conf = min(1.0, max(0.0, best[0] / 8.0)) if best[0] >= 0 else 0.0
-        return best[1], conf, best[2]
-    except Exception:
-        return np.nan, 0.0, "ocr_image_error"
-
-
-def _ocr_numeric_region_cv2(crop_img):
-    try:
-        import cv2
-        import numpy as _np
-        import pytesseract
-    except Exception:
-        return np.nan, 0.0, "cv2_or_tesseract_missing"
-    try:
-        arr = _np.array(crop_img.convert("RGB"))
-        bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-        bgr = cv2.resize(bgr, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
-        lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
-        l, _, _ = cv2.split(lab)
-        gray = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(l)
-        variants = [gray, 255 - gray, cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 51, 3)]
-        best = (-1, np.nan, "")
-        for im in variants:
-            try:
-                txt = pytesseract.image_to_string(im, config="--oem 3 --psm 7 -c tessedit_char_whitelist=-0123456789.")
-            except Exception:
-                continue
-            nums = _numbers_from_ocr_text(txt)
-            if not nums:
-                continue
-            val = _best_number_from_ocr_text(txt)
-            score = max(len(n.replace(".", "").replace("-", "")) for n in nums) + (2 if any("." in n for n in nums) else 0)
-            if pd.notna(val) and score > best[0]:
-                best = (score, val, str(txt).strip())
-        conf = min(1.0, max(0.0, best[0] / 8.0)) if best[0] >= 0 else 0.0
-        return best[1], conf, best[2]
-    except Exception:
-        return np.nan, 0.0, "cv2_ocr_error"
-
-
-def _ocr_numeric_region(crop_img):
-    pil_val, pil_conf, pil_text = _ocr_numeric_region_pil(crop_img)
-    cv_val, cv_conf, cv_text = _ocr_numeric_region_cv2(crop_img)
-    if pd.notna(cv_val) and (pd.isna(pil_val) or cv_conf >= pil_conf):
-        return cv_val, cv_conf, cv_text
-    return pil_val, pil_conf, pil_text
-
-# v43.3 dtype-safe test ID assignment override.
-def assign_test_ids(df: pd.DataFrame, gap_hours: float = 12.0) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-    if "well" not in out.columns:
-        out["well"] = "Unknown"
-    if "datetime" not in out.columns:
-        out["datetime"] = pd.NaT
-    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
-    out["well"] = out["well"].fillna("Unknown").astype(str).str.strip().replace("", "Unknown")
-    out["test_id"] = out["test_id"].astype("object") if "test_id" in out.columns else pd.Series([None] * len(out), index=out.index, dtype="object")
-    out["test_sequence"] = pd.to_numeric(out["test_sequence"], errors="coerce") if "test_sequence" in out.columns else pd.Series([np.nan] * len(out), index=out.index, dtype="float")
-    sortable = out.sort_values(["well", "datetime", "source"], na_position="last").copy()
-    assigned = {}
-    for well, g in sortable.groupby("well", dropna=False):
-        well_txt = str(well or "Unknown").strip() or "Unknown"
-        if well_txt.lower() == "unknown":
-            for i in g.index:
-                assigned[i] = ("Unlinked_OCR_or_Unknown_Well", np.nan)
-            continue
-        seq = 0
-        last_dt = pd.NaT
-        current_id = None
-        for i, row in g.iterrows():
-            dt = row.get("datetime", pd.NaT)
-            if pd.isna(dt):
-                seq += 1
-                current_id = f"{well_txt}_T{seq:02d}_NoTime"
-                assigned[i] = (current_id, float(seq))
-                continue
-            new_test = current_id is None or pd.isna(last_dt) or (pd.Timestamp(dt) - pd.Timestamp(last_dt) > pd.Timedelta(hours=float(gap_hours)))
-            if new_test:
-                seq += 1
-                current_id = f"{well_txt}_{pd.Timestamp(dt).strftime('%Y%m%d_%H%M')}"
-            assigned[i] = (current_id, float(seq))
-            last_dt = pd.Timestamp(dt)
-    for i, (tid, seq) in assigned.items():
-        out.at[i, "test_id"] = tid
-        out.at[i, "test_sequence"] = seq
-    if "test_id" in out.columns and "datetime" in out.columns:
-        valid = out[~out["test_id"].astype(str).str.startswith("Unlinked") & out["datetime"].notna()].copy()
-        if not valid.empty:
-            starts = valid.groupby("test_id")["datetime"].min()
-            ends = valid.groupby("test_id")["datetime"].max()
-            out["test_start"] = out["test_id"].map(starts)
-            out["test_end"] = out["test_id"].map(ends)
-    return out
-
-# v43.4 preserve old TMU parser but add operation-note detection such as Flare test.
-_parse_tmu_message_base_v43 = parse_tmu_message
-
-def parse_tmu_message(message: str, source_name: str = "WhatsApp_Text") -> Dict[str, object]:
-    row = _parse_tmu_message_base_v43(message, source_name=source_name)
-    text = str(message or "")
-    if re.search(r"\bflare\s+test\b", text, flags=re.I):
-        row["note"] = append_note(row.get("note"), "Flare test")
-    if re.search(r"\bctu\b|coiled\s+tubing|coil\s+tubing", text, flags=re.I):
-        row["note"] = append_note(row.get("note"), "CTU operation")
-    return row
-
-
-# -----------------------------------------------------------------------------
-# v44 safety patch: no nearest-time CTU linking + robust WhatsApp bold well names
-# -----------------------------------------------------------------------------
-def clean_well_name_value(value: object) -> str:
-    """Clean WhatsApp/Excel well names without inventing a well.
-
-    Examples:
-      '*S8-58*' -> 'S8-58'
-      '*'       -> 'Unknown'
-    """
-    s = safe_text(value)
-    s = s.replace("\u200e", "").replace("\u200f", "")
-    s = re.sub(r"[*_`~]+", "", s)
-    s = re.sub(r"(?i)\bwell\s*name\b|\bwell\b", "", s)
-    s = re.sub(r"^[\s:=@\-]+", "", s).strip()
-    s = re.split(r"[\n\r,;]|\s{2,}", s)[0].strip()
-    s = s.strip(" .:;=()[]{}<>|'\"")
-    if not s or s.lower() in {"nan", "nat", "none", "unknown", "null", "-"}:
-        return "Unknown"
-    # Prefer the first token/candidate containing at least one digit, which is how
-    # almost all field well names appear: S8-58, B3C18-7, A-C83-1, BED15-33.
-    token_match = re.search(r"[A-Za-z0-9]+(?:[-/][A-Za-z0-9]+)*", s)
-    if token_match:
-        candidate = token_match.group(0).strip("-_/ .")
-        if candidate and re.search(r"[A-Za-z0-9]", candidate):
+def _well_from_raw(raw: pd.DataFrame, source_name: str, sheet_name: str) -> str:
+    for row_pos in range(min(len(raw), 40)):
+        row = raw.iloc[row_pos].tolist()
+        for col, value in enumerate(row):
+            norm = normalize_text(value)
+            if norm in {"well", "well name"} or norm.startswith("well "):
+                for next_col in range(col + 1, min(len(row), col + 5)):
+                    candidate = clean_well_name_value(row[next_col])
+                    if candidate != "Unknown":
+                        return candidate
+            match = re.search(r"\bwell(?: name)?\s*[:=-]\s*([A-Z0-9 _-]+)", safe_text(value), flags=re.I)
+            if match:
+                candidate = clean_well_name_value(match.group(1))
+                if candidate != "Unknown":
+                    return candidate
+    for text in (sheet_name, source_name):
+        candidate = guess_well_from_name(text)
+        if candidate != "Unknown":
             return candidate
     return "Unknown"
 
 
-def suggest_links_for_ocr_rows(df: pd.DataFrame, max_gap_hours: float = 0.0) -> pd.DataFrame:
-    """Disabled in v44 by design.
-
-    CTU/OCR rows are not linked or suggested by nearest time because that can
-    attach image data to the wrong test. The app asks the user to manually choose
-    the Well/Test ID after reviewing the image OCR numbers.
-    """
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-    if "source_type" in out.columns:
-        ocr_mask = out["source_type"].astype(str).str.contains("ocr", case=False, na=False)
-        for c in ["link_status", "review_required"]:
-            if c not in out.columns:
-                out[c] = pd.Series([None] * len(out), index=out.index, dtype="object")
-        out.loc[ocr_mask, "link_status"] = out.loc[ocr_mask, "link_status"].fillna("ocr_manual_link_required")
-        out.loc[ocr_mask, "review_required"] = True
-    return out
-
-
-def approve_suggested_ocr_links(df: pd.DataFrame) -> pd.DataFrame:
-    """No-op kept for backward compatibility with older app.py builds."""
-    return df
-
-
-_parse_tmu_message_base_v44 = parse_tmu_message
-
-def parse_tmu_message(message: str, source_name: str = "WhatsApp_Text") -> Dict[str, object]:
-    row = _parse_tmu_message_base_v44(message, source_name=source_name)
-    row["well"] = clean_well_name_value(row.get("well", "Unknown"))
-    text = str(message or "")
-    if row.get("well", "Unknown") == "Unknown":
-        guessed = guess_well_from_name(re.sub(r"[*_`~]+", "", text))
-        row["well"] = clean_well_name_value(guessed)
-    if re.search(r"\bflare\s+test\b", text, flags=re.I):
-        row["note"] = append_note(row.get("note"), "Flare test")
-    if re.search(r"\bctu\b|coiled\s+tubing|coil\s+tubing", text, flags=re.I):
-        row["note"] = append_note(row.get("note"), "CTU operation")
-    return row
-
-
-def assign_test_ids(df: pd.DataFrame, gap_hours: float = 12.0) -> pd.DataFrame:
-    """Assign test IDs by well name and time gap only.
-
-    - Different well names are always separate streams.
-    - Same well continues until the inactive gap exceeds gap_hours.
-    - OCR rows with Unknown well stay Unlinked until manual review.
-    """
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-    for c in ["source", "sheet", "source_type", "well", "datetime", "test_id", "test_sequence", "link_status", "review_required"]:
-        if c not in out.columns:
-            default = None if c in {"well", "test_id", "link_status", "source_type", "source", "sheet"} else np.nan
-            out[c] = pd.Series([default] * len(out), index=out.index, dtype="object")
-    out["well"] = out["well"].apply(clean_well_name_value).astype("object")
-    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
-    out["test_id"] = out["test_id"].astype("object")
-    out["link_status"] = out["link_status"].astype("object")
-    out["review_required"] = out["review_required"].astype("object")
-
-    sortable = out.sort_values(["well", "datetime", "source"], na_position="last").copy()
-    assigned = {}
-    for well, g in sortable.groupby("well", dropna=False):
-        well_txt = clean_well_name_value(well)
-        if well_txt == "Unknown":
-            for i, row in g.iterrows():
-                is_ocr = str(row.get("source_type", "")).lower().find("ocr") >= 0
-                assigned[i] = ("Unlinked_OCR_or_Unknown_Well" if is_ocr else "Unknown_Well_Unlinked", np.nan)
+def _generic_numeric_columns(raw_table: pd.DataFrame, headers: Sequence[str], occupied: set[int]) -> Dict[int, str]:
+    result: Dict[int, str] = {}
+    for col in range(raw_table.shape[1]):
+        if col in occupied:
             continue
-        seq = 0
-        last_dt = pd.NaT
-        current_id = None
-        for i, row in g.iterrows():
-            dt = row.get("datetime", pd.NaT)
-            if pd.isna(dt):
-                seq += 1
-                current_id = f"{well_txt}_T{seq:02d}_NoTime"
-                assigned[i] = (current_id, float(seq))
-                continue
-            dt = pd.Timestamp(dt)
-            new_test = current_id is None or pd.isna(last_dt) or (dt - pd.Timestamp(last_dt) > pd.Timedelta(hours=float(gap_hours)))
-            if new_test:
-                seq += 1
-                current_id = f"{well_txt}_{dt.strftime('%Y%m%d_%H%M')}"
-            assigned[i] = (current_id, float(seq))
-            last_dt = dt
-
-    for i, (tid, seq) in assigned.items():
-        out.at[i, "test_id"] = str(tid)
-        out.at[i, "test_sequence"] = seq
-
-    ocr_mask = out["source_type"].astype(str).str.contains("ocr", case=False, na=False)
-    unknown_ocr = ocr_mask & ((out["well"].astype(str).str.lower() == "unknown") | out["test_id"].astype(str).str.startswith("Unlinked"))
-    out.loc[unknown_ocr, "link_status"] = out.loc[unknown_ocr, "link_status"].fillna("ocr_manual_link_required")
-    out.loc[unknown_ocr, "review_required"] = True
-
-    valid = out[~out["test_id"].astype(str).str.startswith("Unlinked") & out["datetime"].notna()].copy()
-    if not valid.empty:
-        starts = valid.groupby("test_id")["datetime"].min()
-        ends = valid.groupby("test_id")["datetime"].max()
-        out["test_start"] = out["test_id"].map(starts)
-        out["test_end"] = out["test_id"].map(ends)
-    return out
-
-
-# v44.1 extra well-name cleanup for WhatsApp bold/plain first-line well names.
-_guess_well_from_name_base_v441 = guess_well_from_name
-
-def guess_well_from_name(name: str) -> Optional[str]:
-    base = _guess_well_from_name_base_v441(name)
-    if base:
-        return clean_well_name_value(base) if 'clean_well_name_value' in globals() else base
-    s = re.sub(r"[*_`~]+", "", str(name or ""))
-    extra_patterns = [
-        r"\b(OB\s*[-_ ]\s*\d+[A-Z]?)\b",          # Obaiyed OB-69
-        r"\b(S\d+\s*[-_ ]\s*\d+[A-Z]?)\b",        # S8-58
-        r"\b([A-Z]{1,4}\d+[A-Z]*\s*[-_ ]\s*\d+[A-Z]?)\b",
-    ]
-    for pat in extra_patterns:
-        m = re.search(pat, s, flags=re.I)
-        if m:
-            return clean_well_name_value(m.group(1)) if 'clean_well_name_value' in globals() else normalize_well_name(m.group(1))
-    return None
-
-# Override clean_well_name_value to reject non-well words such as 'to' and '*'.
-def clean_well_name_value(value: object) -> str:
-    s = safe_text(value)
-    s = s.replace("\u200e", "").replace("\u200f", "")
-    s = re.sub(r"[*_`~]+", "", s)
-    s = re.sub(r"(?i)\bwell\s*name\b|\bwell\b", "", s)
-    s = re.sub(r"^[\s:=@\-]+", "", s).strip()
-    s = re.split(r"[\n\r,;]|\s{2,}", s)[0].strip()
-    s = s.strip(" .:;=()[]{}<>|'\"")
-    if not s or s.lower() in {"nan", "nat", "none", "unknown", "null", "-", "to"}:
-        return "Unknown"
-    # Candidate must contain at least one digit to avoid false wells from normal words.
-    m = re.search(r"[A-Za-z0-9]*\d[A-Za-z0-9]*(?:[-/][A-Za-z0-9]+)*", s)
-    if m:
-        candidate = m.group(0).strip("-_/ .")
-        if candidate and re.search(r"\d", candidate):
-            return candidate.upper() if re.match(r"^[A-Za-z]{1,6}[-/ ]?\d", candidate) else candidate
-    return "Unknown"
-
-# Re-override parser and test-id assignment so the final clean_well_name_value is used.
-_parse_tmu_message_base_v441 = _parse_tmu_message_base_v44
-
-def parse_tmu_message(message: str, source_name: str = "WhatsApp_Text") -> Dict[str, object]:
-    row = _parse_tmu_message_base_v441(message, source_name=source_name)
-    text = str(message or "")
-    cleaned_guess = clean_well_name_value(row.get("well", "Unknown"))
-    if cleaned_guess == "Unknown":
-        guessed = guess_well_from_name(text)
-        cleaned_guess = clean_well_name_value(guessed)
-    row["well"] = cleaned_guess
-    if re.search(r"\bflare\s+test\b", text, flags=re.I):
-        row["note"] = append_note(row.get("note"), "Flare test")
-    if re.search(r"\bctu\b|coiled\s+tubing|coil\s+tubing", text, flags=re.I):
-        row["note"] = append_note(row.get("note"), "CTU operation")
-    return row
-
-# v44.2 final well cleaning: keep prefixes like OB-69, S8-58, B3C18-7, A-C83-1.
-def clean_well_name_value(value: object) -> str:
-    s = safe_text(value)
-    s = s.replace("\u200e", "").replace("\u200f", "")
-    s = re.sub(r"[*_`~]+", "", s)
-    s = re.sub(r"(?i)\bwell\s*name\b|\bwell\b", "", s)
-    s = re.sub(r"^[\s:=@\-]+", "", s).strip()
-    s = re.split(r"[\n\r,;]|\s{2,}", s)[0].strip()
-    s = s.strip(" .:;=()[]{}<>|'\"")
-    if not s or s.lower() in {"nan", "nat", "none", "unknown", "null", "-", "to"}:
-        return "Unknown"
-    # Find all candidate well-looking tokens that contain digits and optional letter prefixes.
-    pat = r"\b(?:[A-Za-z]{1,12}[-/ ]*)?[A-Za-z0-9]*\d[A-Za-z0-9]*(?:[-/][A-Za-z0-9]+)*\b"
-    candidates = []
-    for m in re.finditer(pat, s):
-        cand = re.sub(r"\s+", "", m.group(0).strip("-_/ ."))
-        if not cand or not re.search(r"\d", cand):
+        values = clean_tabular_numeric_series(raw_table.iloc[:, col])
+        if values.notna().sum() < 2:
             continue
-        if re.fullmatch(r"\d{1,2}[-/]\d{1,2}[-/]\d{2,4}", cand):
+        label = safe_text(headers[col]) or f"Column {col + 1}"
+        norm_label = normalize_text(label)
+        if not norm_label or re.search(r"^(?:unnamed|column \d+|source|sheet|source type|test id|link status|time text|index)$", norm_label):
             continue
-        candidates.append(cand)
-    if candidates:
-        # Prefer the last candidate because strings like 'Obaiyed OB-69' contain
-        # a field name first and the actual well token at the end.
-        return candidates[-1].upper()
-    return "Unknown"
-
-_parse_tmu_message_base_v442 = _parse_tmu_message_base_v441
-
-def parse_tmu_message(message: str, source_name: str = "WhatsApp_Text") -> Dict[str, object]:
-    row = _parse_tmu_message_base_v442(message, source_name=source_name)
-    text = str(message or "")
-    cleaned_guess = clean_well_name_value(row.get("well", "Unknown"))
-    if cleaned_guess == "Unknown":
-        guessed = guess_well_from_name(text)
-        cleaned_guess = clean_well_name_value(guessed)
-    row["well"] = cleaned_guess
-    if re.search(r"\bflare\s+test\b", text, flags=re.I):
-        row["note"] = append_note(row.get("note"), "Flare test")
-    if re.search(r"\bctu\b|coiled\s+tubing|coil\s+tubing", text, flags=re.I):
-        row["note"] = append_note(row.get("note"), "CTU operation")
-    return row
-
-# Re-override assign_test_ids to use v44.2 clean_well_name_value.
-def assign_test_ids(df: pd.DataFrame, gap_hours: float = 12.0) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-    for c in ["source", "sheet", "source_type", "well", "datetime", "test_id", "test_sequence", "link_status", "review_required"]:
-        if c not in out.columns:
-            default = None if c in {"well", "test_id", "link_status", "source_type", "source", "sheet"} else np.nan
-            out[c] = pd.Series([default] * len(out), index=out.index, dtype="object")
-    out["well"] = out["well"].apply(clean_well_name_value).astype("object")
-    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
-    out["test_id"] = out["test_id"].astype("object")
-    out["link_status"] = out["link_status"].astype("object")
-    out["review_required"] = out["review_required"].astype("object")
-    sortable = out.sort_values(["well", "datetime", "source"], na_position="last").copy()
-    assigned = {}
-    for well, g in sortable.groupby("well", dropna=False):
-        well_txt = clean_well_name_value(well)
-        if well_txt == "Unknown":
-            for i, row in g.iterrows():
-                is_ocr = str(row.get("source_type", "")).lower().find("ocr") >= 0
-                assigned[i] = ("Unlinked_OCR_or_Unknown_Well" if is_ocr else "Unknown_Well_Unlinked", np.nan)
-            continue
-        seq = 0
-        last_dt = pd.NaT
-        current_id = None
-        for i, row in g.iterrows():
-            dt = row.get("datetime", pd.NaT)
-            if pd.isna(dt):
-                seq += 1
-                current_id = f"{well_txt}_T{seq:02d}_NoTime"
-                assigned[i] = (current_id, float(seq))
-                continue
-            dt = pd.Timestamp(dt)
-            new_test = current_id is None or pd.isna(last_dt) or (dt - pd.Timestamp(last_dt) > pd.Timedelta(hours=float(gap_hours)))
-            if new_test:
-                seq += 1
-                current_id = f"{well_txt}_{dt.strftime('%Y%m%d_%H%M')}"
-            assigned[i] = (current_id, float(seq))
-            last_dt = dt
-    for i, (tid, seq) in assigned.items():
-        out.at[i, "test_id"] = str(tid)
-        out.at[i, "test_sequence"] = seq
-    ocr_mask = out["source_type"].astype(str).str.contains("ocr", case=False, na=False)
-    unknown_ocr = ocr_mask & ((out["well"].astype(str).str.lower() == "unknown") | out["test_id"].astype(str).str.startswith("Unlinked"))
-    out.loc[unknown_ocr, "link_status"] = out.loc[unknown_ocr, "link_status"].fillna("ocr_manual_link_required")
-    out.loc[unknown_ocr, "review_required"] = True
-    valid = out[~out["test_id"].astype(str).str.startswith("Unlinked") & out["datetime"].notna()].copy()
-    if not valid.empty:
-        starts = valid.groupby("test_id")["datetime"].min()
-        ends = valid.groupby("test_id")["datetime"].max()
-        out["test_start"] = out["test_id"].map(starts)
-        out["test_end"] = out["test_id"].map(ends)
-    return out
-
-
-# -----------------------------------------------------------------------------
-# v45 FINAL SAFETY OVERRIDES
-# -----------------------------------------------------------------------------
-# Purpose:
-# 1) Completely disable nearest-time CTU/OCR suggestions and any automatic OCR link.
-# 2) Prevent pandas dtype errors when text well names such as '*S8-58*' are assigned.
-# 3) Interpret max_ocr_images=0 as no limit; image OCR is skipped only when parse_images=False.
-
-PARSER_BUILD = "v45_whatsapp_zip_ctu_ocr_safe_no_nearest_link"
-
-
-def _v45_series_object(default=None, n=0, index=None):
-    return pd.Series([default] * int(n), index=index, dtype="object")
-
-
-def safe_object_columns(df: pd.DataFrame, columns=None) -> pd.DataFrame:
-    """Force mixed text/status columns to object dtype before assignment."""
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-    if columns is None:
-        columns = [
-            "well", "test_id", "source", "sheet", "source_type", "link_status",
-            "review_required", "suggested_well", "suggested_test_id",
-            "suggested_link_reason", "image_file", "attachment_name", "source_member",
-            "chat_sender", "caption_text", "ocr_template", "ocr_status",
-        ]
-    for c in columns:
-        if c not in out.columns:
-            out[c] = _v45_series_object(None, len(out), out.index)
-        else:
-            out[c] = out[c].astype("object")
-    return out
-
-
-def suggest_links_for_ocr_rows(df: pd.DataFrame, max_gap_hours: float = 0.0) -> pd.DataFrame:
-    """v45 disabled: no nearest-time suggestion, no automatic CTU/OCR well/test fill."""
-    if df is None or df.empty:
-        return df
-    out = safe_object_columns(df)
-    ocr_mask = out.get("source_type", pd.Series([""] * len(out), index=out.index)).astype(str).str.contains("ocr", case=False, na=False)
-    out.loc[ocr_mask, "link_status"] = out.loc[ocr_mask, "link_status"].where(
-        out.loc[ocr_mask, "link_status"].notna(), "ocr_manual_link_required"
-    )
-    out.loc[ocr_mask, "review_required"] = True
-    # Keep old columns empty if older app versions look for them.
-    out.loc[ocr_mask, "suggested_well"] = None
-    out.loc[ocr_mask, "suggested_test_id"] = None
-    out.loc[ocr_mask, "suggested_link_reason"] = "disabled_no_nearest_time_linking"
-    return out
-
-
-def approve_suggested_ocr_links(df: pd.DataFrame) -> pd.DataFrame:
-    """v45 no-op; user must manually select well/test in Streamlit review table."""
-    return df
-
-
-def clean_well_name_value(value: object) -> str:
-    """Final robust well-name cleanup for WhatsApp bold/hidden characters."""
-    s = safe_text(value)
-    s = s.replace("\u200e", "").replace("\u200f", "").replace("\ufeff", "")
-    s = re.sub(r"[*_`~]+", "", s)  # WhatsApp markdown bold/italic
-    s = re.sub(r"(?i)\bwell\s*name\b|\bwell\b", "", s)
-    s = re.sub(r"^[\s:=@\-]+", "", s).strip()
-    s = re.split(r"[\n\r,;]|\s{2,}", s)[0].strip()
-    s = s.strip(" .:;=()[]{}<>|'\"")
-    if not s or s.lower() in {"nan", "nat", "none", "unknown", "null", "-", "to", "*"}:
-        return "Unknown"
-    # Avoid dates becoming wells.
-    if re.fullmatch(r"\d{1,2}[-/]\d{1,2}[-/]\d{2,4}", s):
-        return "Unknown"
-    # Pure numeric values are usually BS&W/salinity/rates from partial WhatsApp messages, not well names.
-    if re.fullmatch(r"\d+(?:\.\d+)?", s):
-        return "Unknown"
-    # Examples: S8-58, OB-69, B3C18-7, A-C83-1, BED15-33.
-    pat = r"\b(?:[A-Za-z]{1,12}[-/ ]*)?[A-Za-z0-9]*\d[A-Za-z0-9]*(?:[-/][A-Za-z0-9]+)*\b"
-    candidates = []
-    for m in re.finditer(pat, s):
-        cand = re.sub(r"\s+", "", m.group(0).strip("-_/ ."))
-        if not cand or not re.search(r"\d", cand):
-            continue
-        if re.fullmatch(r"\d{1,2}[-/]\d{1,2}[-/]\d{2,4}", cand):
-            continue
-        candidates.append(cand)
-    if candidates:
-        return candidates[-1].upper()
-    return "Unknown"
-
-
-def guess_well_from_name(name: str) -> Optional[str]:
-    """Final well guess used after WhatsApp markdown cleanup."""
-    s = re.sub(r"[*_`~]+", "", str(name or ""))
-    # Prefer explicit Obaiyed/OB style when present.
-    patterns = [
-        r"\b(OB\s*[-_ ]\s*\d+[A-Z]?)\b",
-        r"\b(S\d+\s*[-_ ]\s*\d+[A-Z]?)\b",
-        r"\b([A-Z]{1,4}\d+[A-Z]*\s*[-_ ]\s*\d+[A-Z]?)\b",
-        r"\b([A-Z]{1,4}\s*[-_ ]\s*[A-Z]?\d+[A-Z]*\s*[-_ ]\s*\d+[A-Z]?)\b",
-    ]
-    for pat in patterns:
-        m = re.search(pat, s, flags=re.I)
-        if m:
-            well = clean_well_name_value(m.group(1))
-            if well != "Unknown":
-                return well
-    return None
-
-
-_parse_tmu_message_before_v45 = parse_tmu_message
-
-def parse_tmu_message(message: str, source_name: str = "WhatsApp_Text") -> Dict[str, object]:
-    row = _parse_tmu_message_before_v45(message, source_name=source_name)
-    text = str(message or "")
-    cleaned = clean_well_name_value(row.get("well", "Unknown"))
-    if cleaned == "Unknown":
-        cleaned = clean_well_name_value(guess_well_from_name(text))
-    row["well"] = cleaned
-    if re.search(r"\bflare\s+test\b", text, flags=re.I):
-        row["note"] = append_note(row.get("note"), "Flare test")
-    if re.search(r"\bctu\b|coiled\s+tubing|coil\s+tubing", text, flags=re.I):
-        row["note"] = append_note(row.get("note"), "CTU operation")
-    return row
-
-
-def assign_test_ids(df: pd.DataFrame, gap_hours: float = 12.0) -> pd.DataFrame:
-    """Assign test IDs by well name and same-well time gap only.
-
-    CTU/OCR rows with Unknown well remain unlinked. Nothing is filled by nearest time.
-    """
-    if df is None or df.empty:
-        return df
-    out = safe_object_columns(df)
-    out["well"] = out["well"].apply(clean_well_name_value).astype("object")
-    out["datetime"] = pd.to_datetime(out.get("datetime"), errors="coerce")
-    if "test_sequence" not in out.columns:
-        out["test_sequence"] = np.nan
-    out["test_sequence"] = pd.to_numeric(out["test_sequence"], errors="coerce")
-
-    sortable_cols = [c for c in ["well", "datetime", "source"] if c in out.columns]
-    sortable = out.sort_values(sortable_cols, na_position="last").copy() if sortable_cols else out.copy()
-    assigned = {}
-
-    for well, g in sortable.groupby("well", dropna=False):
-        well_txt = clean_well_name_value(well)
-        if well_txt == "Unknown":
-            for i, row in g.iterrows():
-                is_ocr = "ocr" in str(row.get("source_type", "")).lower()
-                assigned[i] = ("Unlinked_OCR_or_Unknown_Well" if is_ocr else "Unknown_Well_Unlinked", np.nan)
-            continue
-
-        seq = 0
-        last_dt = pd.NaT
-        current_id = None
-        for i, row in g.iterrows():
-            dt = row.get("datetime", pd.NaT)
-            if pd.isna(dt):
-                seq += 1
-                current_id = f"{well_txt}_T{seq:02d}_NoTime"
-                assigned[i] = (current_id, float(seq))
-                continue
-            dt = pd.Timestamp(dt)
-            new_test = current_id is None or pd.isna(last_dt) or (dt - pd.Timestamp(last_dt) > pd.Timedelta(hours=float(gap_hours)))
-            if new_test:
-                seq += 1
-                current_id = f"{well_txt}_{dt.strftime('%Y%m%d_%H%M')}"
-            assigned[i] = (current_id, float(seq))
-            last_dt = dt
-
-    for i, (tid, seq) in assigned.items():
-        out.at[i, "test_id"] = str(tid)
-        out.at[i, "test_sequence"] = seq
-
-    ocr_mask = out["source_type"].astype(str).str.contains("ocr", case=False, na=False)
-    unknown_ocr = ocr_mask & ((out["well"].astype(str).str.lower() == "unknown") | out["test_id"].astype(str).str.startswith("Unlinked"))
-    out.loc[unknown_ocr, "link_status"] = "ocr_manual_link_required"
-    out.loc[unknown_ocr, "review_required"] = True
-
-    valid = out[~out["test_id"].astype(str).str.startswith("Unlinked") & out["datetime"].notna()].copy()
-    if not valid.empty:
-        starts = valid.groupby("test_id")["datetime"].min()
-        ends = valid.groupby("test_id")["datetime"].max()
-        out["test_start"] = out["test_id"].map(starts)
-        out["test_end"] = out["test_id"].map(ends)
-    return out
-
-
-# Keep a final explicit router so older code paths cannot call the old nearest-time suggester.
-def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: int = 300) -> List[pd.DataFrame]:
-    name = getattr(uploaded_file, "name", "uploaded")
-    suffix = Path(str(name)).suffix.lower().lstrip(".")
-
-    if suffix in IMAGE_SUFFIXES:
-        if not parse_images:
-            return []
-        df = parse_ctu_all_data_screen_image(uploaded_file, source_name=name)
-        if df is not None and not df.empty:
-            df = safe_object_columns(df)
-            df = assign_test_ids(df, gap_hours=12.0)
-        return filter_usable_tables([df])
-
-    if suffix == "zip":
-        try:
-            raw = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
-            tables: List[pd.DataFrame] = []
-            ocr_count = 0
-            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-                members = [m for m in zf.namelist() if not m.endswith("/") and not Path(m).name.startswith("._")]
-
-                all_messages: List[Dict[str, object]] = []
-                for member in members:
-                    member_name = Path(member).name
-                    ext = Path(member_name).suffix.lower().lstrip(".")
-                    if ext == "txt" and ("chat" in member_name.lower() or "_chat" in member_name.lower()):
-                        text = zf.read(member).decode("utf-8", errors="ignore")
-                        msgs = parse_whatsapp_export_messages(text)
-                        all_messages.extend(msgs)
-                        df = parse_whatsapp_export_text(text, source_name=f"{name}:{member_name}")
-                        if df is not None and not df.empty:
-                            df = safe_object_columns(df)
-                            df["source_member"] = member
-                            tables.append(df)
-
-                attachment_context = {}
-                for m in all_messages:
-                    att = str(m.get("attachment_name", "") or "").strip()
-                    if att:
-                        attachment_context[Path(att).name] = m
-
-                for member in members:
-                    member_name = Path(member).name
-                    ext = Path(member_name).suffix.lower().lstrip(".")
-                    if not member_name or ext not in (DATA_SUFFIXES | IMAGE_SUFFIXES):
-                        continue
-                    if ext == "txt" and ("chat" in member_name.lower() or "_chat" in member_name.lower()):
-                        continue
-
-                    if ext in IMAGE_SUFFIXES:
-                        if not parse_images:
-                            continue
-                        # max_ocr_images=0 means no limit in v45.
-                        if int(max_ocr_images or 0) > 0 and ocr_count >= int(max_ocr_images):
-                            continue
-                        ocr_count += 1
-
-                    sub_file = UploadedBytes(zf.read(member), member_name)
-                    sub_tables = load_tabular_file(sub_file, parse_images=parse_images, max_ocr_images=max_ocr_images)
-                    ctx = attachment_context.get(member_name, {})
-                    for t in sub_tables or []:
-                        if t is None or t.empty:
-                            continue
-                        t = safe_object_columns(t)
-                        t["attachment_name"] = member_name
-                        t["source_member"] = member
-                        if ctx:
-                            t["chat_sender"] = ctx.get("sender", "")
-                            t["chat_datetime"] = ctx.get("datetime", pd.NaT)
-                            t["message_index"] = ctx.get("message_index", np.nan)
-                            # Use exact WhatsApp attachment timestamp only when the attachment parser did not provide time.
-                            if "datetime" not in t.columns or pd.to_datetime(t["datetime"], errors="coerce").isna().all():
-                                if pd.notna(ctx.get("datetime", pd.NaT)):
-                                    t["datetime"] = ctx.get("datetime")
-                                    t["date"] = pd.Timestamp(ctx.get("datetime")).floor("D")
-                                    t["time_text"] = pd.Timestamp(ctx.get("datetime")).strftime("%H:%M")
-                            if ext in IMAGE_SUFFIXES:
-                                t["caption_text"] = str(ctx.get("body", ""))[:500]
-                        tables.append(t)
-
-            if not tables:
-                return []
-            merged = pd.concat(tables, ignore_index=True, sort=False)
-            merged = safe_object_columns(merged)
-            merged = assign_test_ids(merged, gap_hours=12.0)
-            # Explicitly keep OCR rows unlinked. No nearest-time suggestions.
-            merged = suggest_links_for_ocr_rows(merged, max_gap_hours=0.0)
-            return filter_usable_tables([merged])
-        except Exception as e:
-            raise RuntimeError(f"Could not read WhatsApp ZIP {name}: {e}")
-
-    if suffix == "txt":
-        try:
-            text = uploaded_file.getvalue().decode("utf-8", errors="ignore")
-        except Exception:
-            if hasattr(uploaded_file, "seek"):
-                uploaded_file.seek(0)
-            text = uploaded_file.read().decode("utf-8", errors="ignore")
-        df = parse_whatsapp_plain_or_export_text(text, source_name=name)
-        if df is not None and not df.empty:
-            df = safe_object_columns(df)
-            df = assign_test_ids(df, gap_hours=12.0)
-            return filter_usable_tables([df])
-        return []
-
-    tables = load_tabular_file_base(uploaded_file)
-    out_tables = []
-    for t in tables or []:
-        if t is not None and not t.empty:
-            t = safe_object_columns(t)
-            t = assign_test_ids(t, gap_hours=12.0)
-            out_tables.append(t)
-    return filter_usable_tables(out_tables)
-
-# -----------------------------------------------------------------------------
-# v46 final overrides: stricter WhatsApp TMU row acceptance + safer CTU OCR.
-# -----------------------------------------------------------------------------
-PRODUCTION_NUMERIC_FIELDS_V46 = [
-    "gross_rate_bpd", "oil_rate_stbd", "water_rate_bpd", "gas_rate_mmscfd",
-    "gas_formation_mmscfd", "whp_psi", "sep_p_psi", "flp_psi", "bsw_pct",
-    "salinity_kppm", "h2s_ppm", "co2_mole_pct", "pumping_pressure_psi",
-    "n2_rate_scfm", "choke_pct", "choke_size_64", "choke_ambiguous",
-]
-CORE_RATE_OR_PRESSURE_FIELDS_V46 = [
-    "gross_rate_bpd", "oil_rate_stbd", "water_rate_bpd", "gas_rate_mmscfd",
-    "whp_psi", "sep_p_psi", "pumping_pressure_psi", "bsw_pct",
-]
-
-CTU_PLAUSIBLE_RANGES_V46 = {
-    "ctu_weight_lbf": (-200000.0, 200000.0),
-    "ctu_lt_weight_lbf": (-200000.0, 200000.0),
-    "ctu_wellhead_pressure_psi": (-50.0, 2500.0),
-    "ctu_circulation_pressure_psi": (-50.0, 5000.0),
-    "ctu_reel_depth_ft": (-1000.0, 40000.0),
-    "ctu_reel_speed_ftmin": (-1000.0, 1000.0),
-    "ctu_fluid_rate_bpm": (-10.0, 50.0),
-    "ctu_n2_rate_scfm": (-100.0, 20000.0),
-    "ctu_fluid_total_bbl": (-100.0, 100000.0),
-    "ctu_n2_total_scf": (-100.0, 100000000.0),
-}
-
-CTU_REQUIRED_FIELDS_V46 = {
-    "ctu_weight_lbf", "ctu_wellhead_pressure_psi", "ctu_circulation_pressure_psi",
-    "ctu_reel_depth_ft", "ctu_reel_speed_ftmin", "ctu_fluid_rate_bpm", "ctu_n2_rate_scfm",
-}
-
-
-def _row_has_valid_numeric_v46(row: Dict[str, object], fields: List[str]) -> bool:
-    for k in fields:
-        if k in row:
-            try:
-                if pd.notna(pd.to_numeric(pd.Series([row.get(k)]), errors="coerce").iloc[0]):
-                    return True
-            except Exception:
-                pass
-    return False
-
-
-def _clean_whatsapp_message_body_v46(body: object) -> str:
-    text = str(body or "")
-    text = text.replace("\u200e", "").replace("\u200f", "").replace("\ufeff", "")
-    text = text.replace("\xa0", " ")
-    # WhatsApp formatting only, not data.
-    text = re.sub(r"[*_`~]+", "", text)
-    # Remove attachment-only tails that can pollute value extraction.
-    text = re.sub(r"<attached:[^>]+>", "", text, flags=re.I)
-    text = re.sub(r"\bimage omitted\b|\bvideo omitted\b|\baudio omitted\b", "", text, flags=re.I)
-    return text.strip()
-
-
-def _is_probably_full_tmu_reading_v46(body: str) -> bool:
-    b = normalize_text(body)
-    if is_system_or_noise_message(b):
-        return False
-    # Accept normal PICO/TMU production reports, not comments like "return oil & water".
-    has_identity = bool(re.search(r"\b(pico\s*t?mu|tmu[-\s]*\d+|well\s*name|well\s*:)", b, flags=re.I))
-    numeric_line_hits = 0
-    for pat in [
-        r"\bchoke\b\s*[:=@]", r"\bw\.?\s*h\.?\s*p\.?\b\s*[:=@]", r"\bsep\.?\s*p\.?\b\s*[:=@]",
-        r"\bgross\s*rate\b\s*[:=@]", r"\boil\s*rate\b\s*[:=@]", r"\bwater\s*rate\b\s*[:=@]",
-        r"\bgas\s*rate\b\s*[:=@]", r"\bbs\s*&\s*w\b\s*[:=@]", r"\bpumping\s*p\b\s*[:=@]",
-    ]:
-        if re.search(pat, body, flags=re.I):
-            numeric_line_hits += 1
-    return has_identity and numeric_line_hits >= 2
-
-
-def parse_whatsapp_export_text(text: str, source_name="WhatsApp_Export") -> pd.DataFrame:
-    """v46: parse only real TMU numeric readings from WhatsApp export.
-
-    This intentionally drops chat comments/rubbish and operation notes that do not
-    contain actual numeric test readings. Notes can be added manually in the app.
-    """
-    messages = parse_whatsapp_export_messages(text)
-    if not messages:
-        return pd.DataFrame()
-
-    rows = []
-    for m in messages:
-        body_raw = str(m.get("body", ""))
-        body = _clean_whatsapp_message_body_v46(body_raw)
-        if not _is_probably_full_tmu_reading_v46(body):
-            continue
-        row = parse_tmu_message(body, source_name=source_name)
-        # Must contain at least one real numeric production/pressure value.
-        if not _row_has_valid_numeric_v46(row, CORE_RATE_OR_PRESSURE_FIELDS_V46):
-            continue
-        # Avoid rows that have only choke or metadata but no plotted test reading.
-        valid_numeric_count = sum(
-            1 for k in PRODUCTION_NUMERIC_FIELDS_V46
-            if k in row and pd.notna(pd.to_numeric(pd.Series([row.get(k)]), errors="coerce").iloc[0])
-        )
-        if valid_numeric_count < 2:
-            continue
-
-        msg_dt = m.get("datetime", pd.NaT)
-        if ("datetime" not in row or pd.isna(row.get("datetime", pd.NaT))) and pd.notna(msg_dt):
-            row["datetime"] = msg_dt
-            row["date"] = pd.Timestamp(msg_dt).floor("D")
-            row["time_text"] = pd.Timestamp(msg_dt).strftime("%H:%M")
-
-        row["source_type"] = "whatsapp_export_text"
-        row["chat_sender"] = m.get("sender", "")
-        row["chat_datetime"] = msg_dt
-        row["message_index"] = m.get("message_index", np.nan)
-        row["attachment_name"] = m.get("attachment_name", "")
-        row["whatsapp_message_body"] = body[:500]
-        row["link_status"] = "text_confirmed_by_well" if clean_well_name_value(row.get("well")) != "Unknown" else "text_needs_well_review"
-        rows.append(row)
-
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows)
-    # Remove exact duplicates created by repeated quoted/attached messages.
-    subset = [c for c in ["well", "datetime", "gross_rate_bpd", "oil_rate_stbd", "water_rate_bpd", "whp_psi", "sep_p_psi"] if c in df.columns]
-    if subset:
-        df = df.drop_duplicates(subset=subset, keep="first")
-    return df.reset_index(drop=True)
-
-
-def parse_whatsapp_plain_or_export_text(text: str, source_name="WhatsApp_Text") -> pd.DataFrame:
-    export_df = parse_whatsapp_export_text(text, source_name=source_name)
-    if export_df is not None and not export_df.empty:
-        return export_df
-    df = parse_many_tmu_messages(_clean_whatsapp_message_body_v46(text), source_name=source_name)
-    if df is not None and not df.empty:
-        df["source_type"] = "pasted_whatsapp_text"
-        df["link_status"] = "text_confirmed_by_well"
-    return df
-
-
-def _normalize_ctu_ocr_value_v46(field: str, value: object) -> float:
-    try:
-        v = float(value)
-    except Exception:
-        return np.nan
-    if not np.isfinite(v):
-        return np.nan
-
-    lo, hi = CTU_PLAUSIBLE_RANGES_V46.get(field, (-np.inf, np.inf))
-    # Tesseract often loses decimal points on HMI screens: 12096 -> 120.96.
-    # Try decimal restoration before rejecting.
-    candidates = [v]
-    for div in [10.0, 100.0, 1000.0]:
-        candidates.append(v / div)
-    # Preserve negative sign for speed if needed.
-    for c in candidates:
-        if lo <= c <= hi:
-            # For pressure fields, prefer decimal-restored value when raw is impossible.
-            if lo <= v <= hi:
-                return float(v)
-            return float(c)
-    return np.nan
-
-
-_parse_ctu_all_data_screen_image_base_v46 = parse_ctu_all_data_screen_image
-
-def parse_ctu_all_data_screen_image(uploaded_file, source_name="Image_OCR") -> pd.DataFrame:
-    """v46: stricter CTU/PICO screen OCR.
-
-    Only returns a row when enough plausible CTU fields are detected. Random chat
-    photos are ignored instead of becoming rubbish OCR rows.
-    """
-    df = _parse_ctu_all_data_screen_image_base_v46(uploaded_file, source_name=source_name)
-    if df is None or df.empty:
-        return pd.DataFrame()
-    out = df.copy()
-    found = 0
-    confidences = []
-    for field in list(CTU_PLAUSIBLE_RANGES_V46.keys()):
-        if field in out.columns:
-            v = _normalize_ctu_ocr_value_v46(field, out.at[out.index[0], field])
-            if pd.notna(v):
-                out.at[out.index[0], field] = v
-                found += 1
-            else:
-                out = out.drop(columns=[field], errors="ignore")
-    try:
-        conf = float(out.get("ocr_confidence", pd.Series([0.0])).iloc[0])
-        confidences.append(conf)
-    except Exception:
-        pass
-    key_found = sum(1 for f in CTU_REQUIRED_FIELDS_V46 if f in out.columns and pd.notna(pd.to_numeric(out[f], errors="coerce").iloc[0]))
-    # Stricter gate: enough plausible fields, or at least multiple key fields.
-    if found < 4 or key_found < 3:
-        return pd.DataFrame()
-    out["ocr_fields_found"] = found
-    out["ocr_status"] = "parsed_review_required"
-    out["link_status"] = "ocr_manual_link_required"
-    out["review_required"] = True
-    return out
-
-
-# v46 final usable filters: a table with only empty rows/comments is not usable.
-def is_usable_single_message_table(df: pd.DataFrame) -> bool:
-    if df is None or df.empty:
-        return False
-    # OCR handled separately.
-    if "source_type" in df.columns and df["source_type"].astype(str).str.contains("ocr", case=False, na=False).any():
-        return is_usable_ocr_table(df)
-    has_dt = "datetime" in df.columns and pd.to_datetime(df["datetime"], errors="coerce").notna().any()
-    if not has_dt:
-        return False
-    return any(c in df.columns and pd.to_numeric(df[c], errors="coerce").notna().any() for c in CORE_RATE_OR_PRESSURE_FIELDS_V46)
-
-
-def filter_usable_tables(tables: List[pd.DataFrame]) -> List[pd.DataFrame]:
-    out = []
-    for t in tables or []:
-        if t is None or t.empty:
-            continue
-        # Drop rows with no useful numeric values, except valid OCR rows.
-        tt = t.copy()
-        if "source_type" in tt.columns:
-            ocr_mask = tt["source_type"].astype(str).str.contains("ocr", case=False, na=False)
-        else:
-            ocr_mask = pd.Series([False] * len(tt), index=tt.index)
-        non_ocr = ~ocr_mask
-        useful = pd.Series([False] * len(tt), index=tt.index)
-        for c in CORE_RATE_OR_PRESSURE_FIELDS_V46:
-            if c in tt.columns:
-                useful |= pd.to_numeric(tt[c], errors="coerce").notna()
-        ocr_useful = pd.Series([False] * len(tt), index=tt.index)
-        for c in CTU_PLAUSIBLE_RANGES_V46.keys():
-            if c in tt.columns:
-                ocr_useful |= pd.to_numeric(tt[c], errors="coerce").notna()
-        keep = (non_ocr & useful) | (ocr_mask & ocr_useful)
-        tt = tt.loc[keep].copy()
-        if not tt.empty and (is_valid_timeseries(tt) or is_usable_single_message_table(tt) or is_usable_ocr_table(tt)):
-            out.append(tt)
-    return out
-
-# v46.1 OCR decimal preference override.
-def _normalize_ctu_ocr_value_v46(field: str, value: object) -> float:
-    try:
-        v = float(value)
-    except Exception:
-        return np.nan
-    if not np.isfinite(v):
-        return np.nan
-    lo, hi = CTU_PLAUSIBLE_RANGES_V46.get(field, (-np.inf, np.inf))
-    abs_v = abs(v)
-    # When decimals disappear, pressures like 120.96 often become 12096.
-    if field in {"ctu_wellhead_pressure_psi", "ctu_circulation_pressure_psi"}:
-        if abs_v >= 10000 and lo <= v / 100.0 <= hi:
-            return float(v / 100.0)
-        if abs_v >= 2500:
-            for div in [100.0, 10.0, 1000.0]:
-                c = v / div
-                if lo <= c <= hi:
-                    return float(c)
-    if field in {"ctu_reel_speed_ftmin", "ctu_fluid_rate_bpm"}:
-        if abs_v > hi:
-            for div in [100.0, 10.0, 1000.0]:
-                c = v / div
-                if lo <= c <= hi:
-                    return float(c)
-    if field in {"ctu_weight_lbf", "ctu_lt_weight_lbf", "ctu_reel_depth_ft"}:
-        if not (lo <= v <= hi):
-            for div in [100.0, 10.0, 1000.0]:
-                c = v / div
-                if lo <= c <= hi:
-                    return float(c)
-    return float(v) if lo <= v <= hi else np.nan
-
-# v46.2 final router: exact same-message CTU linking from WhatsApp caption only.
-def _apply_exact_caption_context_to_ocr_v46(t: pd.DataFrame, ctx: Dict[str, object], ext: str) -> pd.DataFrame:
-    if t is None or t.empty:
-        return t
-    out = safe_object_columns(t)
-    if ext not in IMAGE_SUFFIXES:
-        return out
-    caption = _clean_whatsapp_message_body_v46(ctx.get("body", "")) if ctx else ""
-    if caption:
-        out["caption_text"] = caption[:1000]
-    is_ocr = out.get("source_type", pd.Series([""] * len(out), index=out.index)).astype(str).str.contains("ocr", case=False, na=False)
-    if not is_ocr.any():
-        return out
-    if not caption:
-        return out
-    try:
-        cap_row = parse_tmu_message(caption, source_name="WhatsApp_caption_context")
-    except Exception:
-        cap_row = {}
-    cap_well = clean_well_name_value(cap_row.get("well", "Unknown"))
-    cap_dt = pd.to_datetime(cap_row.get("datetime", pd.NaT), errors="coerce")
-    if cap_well != "Unknown":
-        out.loc[is_ocr, "well"] = cap_well
-        out.loc[is_ocr, "link_status"] = "ocr_linked_by_same_whatsapp_message_caption"
-        out.loc[is_ocr, "review_required"] = True  # still allow review, but not Unknown
-    if pd.notna(cap_dt):
-        out.loc[is_ocr, "datetime"] = cap_dt
-        out.loc[is_ocr, "date"] = pd.Timestamp(cap_dt).floor("D")
-        out.loc[is_ocr, "time_text"] = pd.Timestamp(cap_dt).strftime("%H:%M")
-    elif ctx and pd.notna(ctx.get("datetime", pd.NaT)):
-        msg_dt = ctx.get("datetime")
-        out.loc[is_ocr, "datetime"] = msg_dt
-        out.loc[is_ocr, "date"] = pd.Timestamp(msg_dt).floor("D")
-        out.loc[is_ocr, "time_text"] = pd.Timestamp(msg_dt).strftime("%H:%M")
-    if cap_row.get("test_unit"):
-        out.loc[is_ocr, "test_unit"] = cap_row.get("test_unit")
-    return out
-
-
-def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: int = 1000) -> List[pd.DataFrame]:
-    name = getattr(uploaded_file, "name", "uploaded")
-    suffix = Path(str(name)).suffix.lower().lstrip(".")
-
-    if suffix in IMAGE_SUFFIXES:
-        if not parse_images:
-            return []
-        df = parse_ctu_all_data_screen_image(uploaded_file, source_name=name)
-        if df is not None and not df.empty:
-            df = safe_object_columns(df)
-            df = assign_test_ids(df, gap_hours=12.0)
-        return filter_usable_tables([df])
-
-    if suffix == "zip":
-        try:
-            raw = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
-            tables: List[pd.DataFrame] = []
-            ocr_count = 0
-            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-                members = [m for m in zf.namelist() if not m.endswith("/") and not Path(m).name.startswith("._")]
-                all_messages: List[Dict[str, object]] = []
-                for member in members:
-                    member_name = Path(member).name
-                    ext = Path(member_name).suffix.lower().lstrip(".")
-                    if ext == "txt" and ("chat" in member_name.lower() or "_chat" in member_name.lower()):
-                        text = zf.read(member).decode("utf-8", errors="ignore")
-                        msgs = parse_whatsapp_export_messages(text)
-                        all_messages.extend(msgs)
-                        df = parse_whatsapp_export_text(text, source_name=f"{name}:{member_name}")
-                        if df is not None and not df.empty:
-                            df = safe_object_columns(df)
-                            df["source_member"] = member
-                            tables.append(df)
-
-                attachment_context: Dict[str, Dict[str, object]] = {}
-                for m in all_messages:
-                    att = str(m.get("attachment_name", "") or "").strip()
-                    if att:
-                        attachment_context[Path(att).name] = m
-
-                for member in members:
-                    member_name = Path(member).name
-                    ext = Path(member_name).suffix.lower().lstrip(".")
-                    if not member_name or ext not in (DATA_SUFFIXES | IMAGE_SUFFIXES):
-                        continue
-                    if ext == "txt" and ("chat" in member_name.lower() or "_chat" in member_name.lower()):
-                        continue
-                    if ext in IMAGE_SUFFIXES:
-                        if not parse_images:
-                            continue
-                        if int(max_ocr_images or 0) > 0 and ocr_count >= int(max_ocr_images):
-                            continue
-                        ocr_count += 1
-
-                    sub_file = UploadedBytes(zf.read(member), member_name)
-                    sub_tables = load_tabular_file(sub_file, parse_images=parse_images, max_ocr_images=max_ocr_images)
-                    ctx = attachment_context.get(member_name, {})
-                    for t in sub_tables or []:
-                        if t is None or t.empty:
-                            continue
-                        t = safe_object_columns(t)
-                        t["attachment_name"] = member_name
-                        t["source_member"] = member
-                        if ctx:
-                            t["chat_sender"] = ctx.get("sender", "")
-                            t["chat_datetime"] = ctx.get("datetime", pd.NaT)
-                            t["message_index"] = ctx.get("message_index", np.nan)
-                            if ext in IMAGE_SUFFIXES:
-                                t = _apply_exact_caption_context_to_ocr_v46(t, ctx, ext)
-                            else:
-                                if "datetime" not in t.columns or pd.to_datetime(t["datetime"], errors="coerce").isna().all():
-                                    if pd.notna(ctx.get("datetime", pd.NaT)):
-                                        t["datetime"] = ctx.get("datetime")
-                                        t["date"] = pd.Timestamp(ctx.get("datetime")).floor("D")
-                                        t["time_text"] = pd.Timestamp(ctx.get("datetime")).strftime("%H:%M")
-                        tables.append(t)
-            if not tables:
-                return []
-            merged = pd.concat(tables, ignore_index=True, sort=False)
-            merged = safe_object_columns(merged)
-            merged = assign_test_ids(merged, gap_hours=12.0)
-            merged = suggest_links_for_ocr_rows(merged, max_gap_hours=0.0)
-            return filter_usable_tables([merged])
-        except Exception as e:
-            raise RuntimeError(f"Could not read WhatsApp ZIP {name}: {e}")
-
-    if suffix == "txt":
-        try:
-            text = uploaded_file.getvalue().decode("utf-8", errors="ignore")
-        except Exception:
-            if hasattr(uploaded_file, "seek"):
-                uploaded_file.seek(0)
-            text = uploaded_file.read().decode("utf-8", errors="ignore")
-        df = parse_whatsapp_plain_or_export_text(text, source_name=name)
-        if df is not None and not df.empty:
-            df = safe_object_columns(df)
-            df = assign_test_ids(df, gap_hours=12.0)
-            return filter_usable_tables([df])
-        return []
-
-    tables = load_tabular_file_base(uploaded_file)
-    out_tables = []
-    for t in tables or []:
-        if t is not None and not t.empty:
-            t = safe_object_columns(t)
-            t = assign_test_ids(t, gap_hours=12.0)
-            out_tables.append(t)
-    return filter_usable_tables(out_tables)
-
-# -----------------------------------------------------------------------------
-# v48 final safety override: never miss Pumping Pressure columns from Excel.
-# -----------------------------------------------------------------------------
-def _looks_like_pumping_pressure_column_v48(col: object) -> bool:
-    c = clean_header(col)
-    c2 = canonical_key(col)
-    txt = f" {c} {c2} "
-    if any(bad in txt for bad in ["frequency", "freq", "hz", "speed", "rate", "n2", "nitrogen", "depth", "temp", "temperature", "total"]):
-        # Do not confuse pump frequency/rate/temp with pressure.
-        if not re.search(r"\b(pump|pumping)[_\s.\-/]*p\b|pumping[.\s_\-/]*pressure|pump[.\s_\-/]*pressure", txt):
-            return False
-    return bool(re.search(
-        r"\b(pump|pumping)[_\s.\-/]*p\b|pumping[.\s_\-/]*pressure|pump[.\s_\-/]*pressure|circulation[.\s_\-/]*pressure",
-        txt,
-        flags=re.I,
-    ))
-
-
-def ensure_pumping_pressure_column_v48(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-    current = pd.to_numeric(out.get("pumping_pressure_psi", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
-    if current.notna().sum() > 0:
-        out["pumping_pressure_psi"] = current
-        return out
-    candidates = []
-    for col in list(out.columns):
-        if str(col) == "pumping_pressure_psi":
-            continue
-        if _looks_like_pumping_pressure_column_v48(col):
-            vals = pd.to_numeric(
-                out[col].astype(str)
-                .str.replace(",", "", regex=False)
-                .str.replace("%", "", regex=False)
-                .str.extract(r"([-+]?\d+(?:\.\d+)?)", expand=False),
-                errors="coerce",
-            )
-            if vals.notna().sum() >= max(1, min(3, len(out) // 20)):
-                candidates.append((int(vals.notna().sum()), str(col), vals))
-    if candidates:
-        candidates.sort(reverse=True, key=lambda x: x[0])
-        out["pumping_pressure_psi"] = candidates[0][2]
-    return out
-
-
-_load_tabular_file_v47_final = load_tabular_file
-
-def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: int = 1000) -> List[pd.DataFrame]:
-    tables = _load_tabular_file_v47_final(uploaded_file, parse_images=parse_images, max_ocr_images=max_ocr_images)
-    fixed = []
-    for t in tables or []:
-        if t is not None and not t.empty:
-            fixed.append(ensure_pumping_pressure_column_v48(t))
-    return fixed
-
-
-# -----------------------------------------------------------------------------
-# v49: robust hidden-column Pumping Pressure extraction from Excel.
-# Some TMU Excel files keep the real Pumping Pressure column far to the right
-# (for example hidden column EG with header "pumping.p" / unit "psi").  The
-# standard table parser may reject or rename hidden helper columns, so this
-# final pass scans the raw workbook and merges that pressure series by datetime.
-# -----------------------------------------------------------------------------
-_load_tabular_file_v48_streamlit_final = load_tabular_file
-
-
-def _uploaded_bytes_v49(uploaded_file):
-    name = getattr(uploaded_file, "name", "uploaded")
-    try:
-        data = uploaded_file.getvalue()
-    except Exception:
-        try:
-            uploaded_file.seek(0)
-        except Exception:
-            pass
-        data = uploaded_file.read()
-    return data, name
-
-
-def _parse_time_series_v49(series: pd.Series) -> pd.Series:
-    """Improved Excel time parser: supports values like 1.5 as 12:00 next-day fraction."""
-    import datetime as _dt
-    def one(x):
-        if pd.isna(x):
-            return pd.NaT
-        if isinstance(x, pd.Timestamp):
-            return pd.Timestamp("1900-01-01") + pd.Timedelta(hours=x.hour, minutes=x.minute, seconds=x.second)
-        if isinstance(x, _dt.datetime):
-            return pd.Timestamp("1900-01-01") + pd.Timedelta(hours=x.hour, minutes=x.minute, seconds=x.second)
-        if isinstance(x, _dt.time):
-            return pd.Timestamp("1900-01-01") + pd.Timedelta(hours=x.hour, minutes=x.minute, seconds=x.second)
-        if isinstance(x, (int, float, np.number)) and not isinstance(x, bool):
-            xf = float(x)
-            if xf >= 0:
-                frac = xf % 1.0
-                seconds = int(round(frac * 24 * 3600))
-                return pd.Timestamp("1900-01-01") + pd.Timedelta(seconds=seconds)
-        s = str(x)
-        m = re.search(r"(\d{1,2})[:.](\d{2})(?:[:.](\d{2}))?", s)
-        if m:
-            hh = int(m.group(1))
-            mm = int(m.group(2))
-            ss = int(m.group(3) or 0)
-            return pd.Timestamp("1900-01-01") + pd.Timedelta(hours=hh, minutes=mm, seconds=ss)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)
-            return pd.to_datetime(s, errors="coerce")
-    return series.map(one)
-
-
-def _combine_date_time_v49(date_series, time_series):
-    dates = parse_date_series(date_series)
-    times = _parse_time_series_v49(time_series)
-    out = []
-    for d, t, raw_t in zip(dates, times, time_series):
-        if pd.isna(d):
-            out.append(pd.NaT)
-            continue
-        extra_days = 0
-        try:
-            if isinstance(raw_t, (int, float, np.number)) and not isinstance(raw_t, bool):
-                extra_days = int(np.floor(float(raw_t)))
-        except Exception:
-            extra_days = 0
-        if pd.notna(t):
-            out.append(pd.Timestamp(d.date()) + pd.Timedelta(days=extra_days, hours=t.hour, minutes=t.minute, seconds=t.second))
-        else:
-            out.append(pd.Timestamp(d.date()))
-    return pd.Series(out, index=date_series.index, dtype="datetime64[ns]")
-
-
-def _looks_like_pumping_pressure_header_v49(value: object, unit_value: object = "") -> bool:
-    c = clean_header(value)
-    ck = canonical_key(value)
-    u = clean_header(unit_value)
-    txt = f" {c} {ck} {u} "
-    if not re.search(r"pump|pumping|circulation", txt, flags=re.I):
-        return False
-    if re.search(r"freq|frequency|hz|speed|rate|n2|nitrogen|temp|temperature|depth|total", txt, flags=re.I):
-        if not re.search(r"pump[\s._/-]*p\b|pumping[\s._/-]*p\b|pump[\s._/-]*pressure|pumping[\s._/-]*pressure|circulation[\s._/-]*pressure", txt, flags=re.I):
-            return False
-    return bool(re.search(r"pump[\s._/-]*p\b|pumping[\s._/-]*p\b|pump[\s._/-]*pressure|pumping[\s._/-]*pressure|pumping\.p|circulation[\s._/-]*pressure", txt, flags=re.I))
-
-
-def extract_hidden_pumping_pressure_from_excel_v49(data: bytes, name: str) -> pd.DataFrame:
-    suffix = str(name).split(".")[-1].lower()
-    if suffix not in {"xlsx", "xls"}:
-        return pd.DataFrame()
-    rows = []
-    try:
-        sheets = pd.read_excel(io.BytesIO(data), sheet_name=None, header=None, dtype=object)
-    except Exception:
-        return pd.DataFrame()
-
-    for sheet_name, raw in sheets.items():
-        if raw is None or raw.empty:
-            continue
-        default_well = extract_well_from_raw(raw, source_name=name, sheet_name=str(sheet_name)) or "Unknown"
-        scan_rows = min(25, len(raw))
-        candidate_cols = []
-        for r in range(scan_rows):
-            for c in range(raw.shape[1]):
-                val = raw.iat[r, c] if c < raw.shape[1] else None
-                unit = raw.iat[r + 1, c] if r + 1 < len(raw) else ""
-                if _looks_like_pumping_pressure_header_v49(val, unit):
-                    candidate_cols.append((r, c))
-        for header_r, c in candidate_cols:
-            value_series = pd.to_numeric(
-                pd.Series(raw.iloc[header_r + 1 :, c]).astype(str)
-                .str.replace(",", "", regex=False)
-                .str.extract(r"([-+]?\d+(?:\.\d+)?)", expand=False),
-                errors="coerce",
-            )
-            if value_series.notna().sum() < 3:
-                continue
-            idx = value_series.index
-            # Prefer first two columns as Date/Time, which is how these TMU sheets are structured.
-            dt = _combine_date_time_v49(raw.iloc[idx, 0], raw.iloc[idx, 1])
-            valid = value_series.notna() & dt.notna()
-            if valid.sum() < 3:
-                continue
-            for row_idx in value_series[valid].index:
-                rows.append({
-                    "source": name,
-                    "sheet": str(sheet_name),
-                    "well": clean_well_name_value(default_well),
-                    "datetime": pd.Timestamp(dt.loc[row_idx]),
-                    "date": pd.Timestamp(dt.loc[row_idx]).floor("D"),
-                    "time_text": pd.Timestamp(dt.loc[row_idx]).strftime("%H:%M"),
-                    "pumping_pressure_psi": float(value_series.loc[row_idx]),
-                    "source_type": "excel_hidden_pumping_pressure",
-                })
-    if not rows:
-        return pd.DataFrame()
-    out = pd.DataFrame(rows).drop_duplicates(subset=["well", "datetime"], keep="last")
-    return out
-
-
-def merge_pumping_pressure_tables_v49(tables, pump_df: pd.DataFrame):
-    if pump_df is None or pump_df.empty:
-        return tables
-    if not tables:
-        return [pump_df]
-    merged_tables = []
-    pump_df = pump_df.copy()
-    pump_df["datetime"] = pd.to_datetime(pump_df["datetime"], errors="coerce")
-    for df in tables:
-        if df is None or df.empty:
-            merged_tables.append(df)
-            continue
-        out = df.copy()
-        if "datetime" not in out.columns:
-            merged_tables.append(out)
-            continue
-        out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
-        if "well" not in out.columns:
-            out["well"] = "Unknown"
-        tmp = pump_df[["well", "datetime", "pumping_pressure_psi"]].copy()
-        tmp["well"] = tmp["well"].astype(str)
-        out["well"] = out["well"].astype(str)
-        out = out.merge(tmp, on=["well", "datetime"], how="left", suffixes=("", "__hidden"))
-        if "pumping_pressure_psi__hidden" in out.columns:
-            base = pd.to_numeric(out.get("pumping_pressure_psi", pd.Series(np.nan, index=out.index)), errors="coerce")
-            hidden = pd.to_numeric(out["pumping_pressure_psi__hidden"], errors="coerce")
-            out["pumping_pressure_psi"] = base.combine_first(hidden)
-            out = out.drop(columns=["pumping_pressure_psi__hidden"], errors="ignore")
-        merged_tables.append(out)
-    return merged_tables
-
-
-def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: int = 1000) -> List[pd.DataFrame]:
-    data, name = _uploaded_bytes_v49(uploaded_file)
-    suffix = str(name).split(".")[-1].lower()
-    base_tables = _load_tabular_file_v48_streamlit_final(UploadedBytes(data, name), parse_images=parse_images, max_ocr_images=max_ocr_images)
-    fixed_tables = [ensure_pumping_pressure_column_v48(t) for t in (base_tables or []) if t is not None and not t.empty]
-    if suffix in {"xlsx", "xls"}:
-        pump_df = extract_hidden_pumping_pressure_from_excel_v49(data, name)
-        fixed_tables = merge_pumping_pressure_tables_v49(fixed_tables, pump_df)
-        fixed_tables = [ensure_pumping_pressure_column_v48(t) for t in fixed_tables if t is not None and not t.empty]
-    return fixed_tables
-
-
-# -----------------------------------------------------------------------------
-# v51: stronger pumping-pressure rescue and cache-busting build id
-# -----------------------------------------------------------------------------
-PARSER_BUILD_ID = "v52_xml_pump_notes_layout_20260616"
-
-_load_tabular_file_v50_final = load_tabular_file
-
-
-def _clean_merge_well_v51(x: object) -> str:
-    try:
-        y = clean_well_name_value(x)
-    except Exception:
-        y = x
-    s = str(y or "").strip().strip("*")
-    if not s or s.lower() in {"nan", "none", "unknown", "to", "*"}:
-        return "Unknown"
-    return s.upper()
-
-
-def _to_number_series_v51(s: pd.Series) -> pd.Series:
-    return pd.to_numeric(
-        s.astype(str)
-        .str.replace(",", "", regex=False)
-        .str.replace("%", "", regex=False)
-        .str.extract(r"([-+]?\d+(?:\.\d+)?)", expand=False),
-        errors="coerce",
-    )
-
-
-def _looks_like_pumping_pressure_header_v51(value: object, unit_value: object = "") -> bool:
-    # Handles hidden Excel headers such as: pumping.p / psi, Pumping P, Pump P,
-    # Pump Pressure, Pumping Pressure, Circulation Pressure.
-    h = f" {clean_header(value)} {canonical_key(value)} "
-    u = f" {clean_header(unit_value)} {canonical_key(unit_value)} "
-    txt = h + u
-    if not re.search(r"pump|pumping|circulation", txt, flags=re.I):
-        return False
-    # Avoid pump frequency / speed / rate / temp unless the compact header clearly says P/pressure.
-    if re.search(r"freq|frequency|hz|speed|rate|n2|nitrogen|temp|temperature|depth|total", txt, flags=re.I):
-        if not re.search(r"pump[\s._/-]*p\b|pumping[\s._/-]*p\b|pump[\s._/-]*pressure|pumping[\s._/-]*pressure|circulation[\s._/-]*pressure|pumping\.p|pump\.p", txt, flags=re.I):
-            return False
-    return bool(re.search(r"pump[\s._/-]*p\b|pumping[\s._/-]*p\b|pump[\s._/-]*pressure|pumping[\s._/-]*pressure|pumping\.p|pump\.p|circulation[\s._/-]*pressure", txt, flags=re.I))
-
-
-def _date_time_from_raw_v51(raw: pd.DataFrame, idx) -> pd.Series:
-    # First try columns A/B, because the uploaded TMU sheets put Date and Time there.
-    try:
-        dt = _combine_date_time_v49(raw.iloc[idx, 0], raw.iloc[idx, 1])
-        if pd.to_datetime(dt, errors="coerce").notna().sum() >= 3:
-            return dt
-    except Exception:
-        pass
-
-    # Then scan for date/time headers in the first 35 rows.
-    date_col = None
-    time_col = None
-    scan_rows = min(35, len(raw))
-    for r in range(scan_rows):
-        for c in range(raw.shape[1]):
-            v = clean_header(raw.iat[r, c] if c < raw.shape[1] else "")
-            if date_col is None and re.search(r"\bdate\b", v):
-                date_col = c
-            if time_col is None and re.search(r"\btime\b|hh:mm", v):
-                time_col = c
-        if date_col is not None and time_col is not None:
-            break
-    if date_col is not None and time_col is not None:
-        try:
-            dt = _combine_date_time_v49(raw.iloc[idx, date_col], raw.iloc[idx, time_col])
-            if pd.to_datetime(dt, errors="coerce").notna().sum() >= 3:
-                return dt
-        except Exception:
-            pass
-    return pd.Series([pd.NaT] * len(idx), index=idx)
-
-
-def _extract_pumping_pressure_from_pandas_raw_v51(data: bytes, name: str) -> pd.DataFrame:
-    suffix = str(name).split(".")[-1].lower()
-    if suffix not in {"xlsx", "xls"}:
-        return pd.DataFrame()
-    try:
-        sheets = pd.read_excel(io.BytesIO(data), sheet_name=None, header=None, dtype=object)
-    except Exception:
-        return pd.DataFrame()
-
-    rows = []
-    for sheet_name, raw in sheets.items():
-        if raw is None or raw.empty:
-            continue
-        # Excel files may have formatting extended to XFD (16,384 columns).
-        # Prune all-empty columns before scanning headers, otherwise regex scanning
-        # becomes extremely slow.  Hidden data columns such as EG are preserved
-        # because they contain real values.
-        raw = raw.dropna(axis=1, how="all")
-        if raw.shape[1] > 400:
-            sample = raw.head(250).astype(str).replace({"nan": "", "NaT": ""})
-            keep_cols = [c for c in sample.columns if sample[c].str.strip().ne("").any()]
-            raw = raw.loc[:, keep_cols]
-        default_well = _clean_merge_well_v51(extract_well_from_raw(raw, source_name=name, sheet_name=str(sheet_name)) or "Unknown")
-        candidate_cols = []
-        scan_rows = min(50, len(raw))
-        for r in range(scan_rows):
-            for c in range(raw.shape[1]):
-                val = raw.iat[r, c]
-                unit_below = raw.iat[r + 1, c] if r + 1 < len(raw) else ""
-                unit_above = raw.iat[r - 1, c] if r - 1 >= 0 else ""
-                unit_right = raw.iat[r, c + 1] if c + 1 < raw.shape[1] else ""
-                if _looks_like_pumping_pressure_header_v51(val, f"{unit_below} {unit_above} {unit_right}"):
-                    candidate_cols.append((r, c))
-        seen = set()
-        for header_r, c in candidate_cols:
-            if (header_r, c) in seen:
-                continue
-            seen.add((header_r, c))
-            # Use data below the header, but also allow one or two unit rows directly below it.
-            for start_r in [header_r + 1, header_r + 2, header_r + 3]:
-                if start_r >= len(raw):
-                    continue
-                idx = raw.index[start_r:]
-                vals = _to_number_series_v51(pd.Series(raw.iloc[start_r:, c], index=idx))
-                if vals.notna().sum() < 3:
-                    continue
-                dt = _date_time_from_raw_v51(raw, idx)
-                valid = vals.notna() & pd.to_datetime(dt, errors="coerce").notna()
-                if valid.sum() < 3:
-                    continue
-                for row_idx in vals[valid].index:
-                    dtv = pd.Timestamp(dt.loc[row_idx])
-                    rows.append({
-                        "source": name,
-                        "sheet": str(sheet_name),
-                        "well": default_well,
-                        "well_key_v51": default_well,
-                        "datetime": dtv,
-                        "date": dtv.floor("D"),
-                        "time_text": dtv.strftime("%H:%M"),
-                        "pumping_pressure_psi": float(vals.loc[row_idx]),
-                        "source_type": "excel_raw_pumping_pressure_v51",
-                    })
-                break
-    if not rows:
-        return pd.DataFrame()
-    out = pd.DataFrame(rows)
-    out = out.drop_duplicates(subset=["sheet", "well_key_v51", "datetime"], keep="last")
-    return out
-
-
-def _extract_pumping_pressure_from_openpyxl_v51(data: bytes, name: str) -> pd.DataFrame:
-    # Extra fallback for hidden/far-right columns.  openpyxl sees hidden columns
-    # such as EG even when the visual sheet hides them.
-    suffix = str(name).split(".")[-1].lower()
-    if suffix not in {"xlsx"}:
-        return pd.DataFrame()
-    try:
-        from openpyxl import load_workbook
-    except Exception:
-        return pd.DataFrame()
-    try:
-        wb = load_workbook(io.BytesIO(data), read_only=False, data_only=True)
-    except Exception:
-        return pd.DataFrame()
-
-    rows = []
-    for ws in wb.worksheets:
-        max_r = min(ws.max_row or 0, 5000)
-        max_c = min(ws.max_column or 0, 300)
-        if max_r < 3 or max_c < 3:
-            continue
-        # Build a small raw dataframe for well extraction and datetime parsing.
-        raw_vals = []
-        for r in range(1, max_r + 1):
-            raw_vals.append([ws.cell(r, c).value for c in range(1, max_c + 1)])
-        raw = pd.DataFrame(raw_vals)
-        default_well = _clean_merge_well_v51(extract_well_from_raw(raw, source_name=name, sheet_name=str(ws.title)) or "Unknown")
-        candidate_cols = []
-        for r in range(1, min(50, max_r) + 1):
-            for c in range(1, max_c + 1):
-                val = ws.cell(r, c).value
-                if val is None:
-                    continue
-                unit_below = ws.cell(r + 1, c).value if r + 1 <= max_r else ""
-                unit_above = ws.cell(r - 1, c).value if r - 1 >= 1 else ""
-                unit_right = ws.cell(r, c + 1).value if c + 1 <= max_c else ""
-                if _looks_like_pumping_pressure_header_v51(val, f"{unit_below} {unit_above} {unit_right}"):
-                    candidate_cols.append((r - 1, c - 1))
-        for header_r0, c0 in candidate_cols:
-            for start_r0 in [header_r0 + 1, header_r0 + 2, header_r0 + 3]:
-                if start_r0 >= len(raw):
-                    continue
-                idx = raw.index[start_r0:]
-                vals = _to_number_series_v51(pd.Series(raw.iloc[start_r0:, c0], index=idx))
-                if vals.notna().sum() < 3:
-                    continue
-                dt = _date_time_from_raw_v51(raw, idx)
-                valid = vals.notna() & pd.to_datetime(dt, errors="coerce").notna()
-                if valid.sum() < 3:
-                    continue
-                for row_idx in vals[valid].index:
-                    dtv = pd.Timestamp(dt.loc[row_idx])
-                    rows.append({
-                        "source": name,
-                        "sheet": str(ws.title),
-                        "well": default_well,
-                        "well_key_v51": default_well,
-                        "datetime": dtv,
-                        "date": dtv.floor("D"),
-                        "time_text": dtv.strftime("%H:%M"),
-                        "pumping_pressure_psi": float(vals.loc[row_idx]),
-                        "source_type": "excel_openpyxl_pumping_pressure_v51",
-                    })
-                break
-    if not rows:
-        return pd.DataFrame()
-    out = pd.DataFrame(rows)
-    out = out.drop_duplicates(subset=["sheet", "well_key_v51", "datetime"], keep="last")
-    return out
-
-
-def extract_any_pumping_pressure_from_excel_v51(data: bytes, name: str) -> pd.DataFrame:
-    frames = []
-    for fn in [_extract_pumping_pressure_from_pandas_raw_v51, _extract_pumping_pressure_from_openpyxl_v51, extract_hidden_pumping_pressure_from_excel_v49]:
-        try:
-            df = fn(data, name)
-            if df is not None and not df.empty:
-                frames.append(df)
-        except Exception:
-            pass
-    if not frames:
-        return pd.DataFrame()
-    out = pd.concat(frames, ignore_index=True, sort=False)
-    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
-    out["well"] = out["well"].map(_clean_merge_well_v51)
-    out["well_key_v51"] = out["well"].map(_clean_merge_well_v51)
-    out["pumping_pressure_psi"] = pd.to_numeric(out["pumping_pressure_psi"], errors="coerce")
-    out = out.dropna(subset=["datetime", "pumping_pressure_psi"])
-    out = out.drop_duplicates(subset=["well_key_v51", "datetime"], keep="last")
-    return out
-
-
-def merge_pumping_pressure_tables_v51(tables, pump_df: pd.DataFrame):
-    if pump_df is None or pump_df.empty:
-        return tables
-    pump_df = pump_df.copy()
-    pump_df["datetime"] = pd.to_datetime(pump_df["datetime"], errors="coerce")
-    pump_df["well_key_v51"] = pump_df.get("well", "Unknown").map(_clean_merge_well_v51) if isinstance(pump_df.get("well", None), pd.Series) else "Unknown"
-    pump_df = pump_df.dropna(subset=["datetime", "pumping_pressure_psi"])
-    if pump_df.empty:
-        return tables
-    if not tables:
-        return [pump_df]
-
-    merged_tables = []
-    used_any = False
-    for df in tables:
-        if df is None or df.empty:
-            merged_tables.append(df)
-            continue
-        out = df.copy()
-        if "datetime" not in out.columns:
-            merged_tables.append(out)
-            continue
-        out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
-        if "well" not in out.columns:
-            out["well"] = "Unknown"
-        out["well_key_v51"] = out["well"].map(_clean_merge_well_v51)
-        tmp = pump_df[["well_key_v51", "datetime", "pumping_pressure_psi"]].copy()
-
-        # First and safest: clean well + datetime.
-        out = out.merge(tmp, on=["well_key_v51", "datetime"], how="left", suffixes=("", "__pump_v51"))
-        if "pumping_pressure_psi__pump_v51" in out.columns:
-            base = pd.to_numeric(out.get("pumping_pressure_psi", pd.Series(np.nan, index=out.index)), errors="coerce")
-            hidden = pd.to_numeric(out["pumping_pressure_psi__pump_v51"], errors="coerce")
-            out["pumping_pressure_psi"] = base.combine_first(hidden)
-            out = out.drop(columns=["pumping_pressure_psi__pump_v51"], errors="ignore")
-
-        # Second: datetime only, but only when there is a single real well in the uploaded table.
-        if pd.to_numeric(out.get("pumping_pressure_psi", pd.Series(np.nan, index=out.index)), errors="coerce").notna().sum() == 0:
-            real_wells = [w for w in out["well_key_v51"].dropna().unique().tolist() if w and w != "Unknown"]
-            if len(real_wells) == 1:
-                tmp2 = pump_df[["datetime", "pumping_pressure_psi"]].drop_duplicates("datetime", keep="last")
-                out = out.drop(columns=[c for c in out.columns if c.endswith("__pump_v51")], errors="ignore")
-                out = out.merge(tmp2, on="datetime", how="left", suffixes=("", "__pump_v51"))
-                if "pumping_pressure_psi__pump_v51" in out.columns:
-                    base = pd.to_numeric(out.get("pumping_pressure_psi", pd.Series(np.nan, index=out.index)), errors="coerce")
-                    hidden = pd.to_numeric(out["pumping_pressure_psi__pump_v51"], errors="coerce")
-                    out["pumping_pressure_psi"] = base.combine_first(hidden)
-                    out = out.drop(columns=["pumping_pressure_psi__pump_v51"], errors="ignore")
-
-        # Third: row-order fallback for the same single-well sheet when datetime parsing differs slightly.
-        current_count = pd.to_numeric(out.get("pumping_pressure_psi", pd.Series(np.nan, index=out.index)), errors="coerce").notna().sum()
-        if current_count == 0:
-            real_wells = [w for w in out["well_key_v51"].dropna().unique().tolist() if w and w != "Unknown"]
-            if len(real_wells) == 1 and abs(len(out) - len(pump_df)) <= max(3, int(0.15 * max(len(out), len(pump_df)))):
-                out_sorted_idx = out.sort_values("datetime").index.tolist()
-                pump_sorted = pump_df.sort_values("datetime")["pumping_pressure_psi"].reset_index(drop=True)
-                n = min(len(out_sorted_idx), len(pump_sorted))
-                out["pumping_pressure_psi"] = pd.to_numeric(out.get("pumping_pressure_psi", pd.Series(np.nan, index=out.index)), errors="coerce")
-                for pos in range(n):
-                    if pd.isna(out.at[out_sorted_idx[pos], "pumping_pressure_psi"]):
-                        out.at[out_sorted_idx[pos], "pumping_pressure_psi"] = pump_sorted.iloc[pos]
-
-        final_count = pd.to_numeric(out.get("pumping_pressure_psi", pd.Series(np.nan, index=out.index)), errors="coerce").notna().sum()
-        if final_count > 0:
-            used_any = True
-        out = out.drop(columns=["well_key_v51"], errors="ignore")
-        merged_tables.append(out)
-
-    # If no existing table accepted the pumping series, append it so the user can still see it.
-    if not used_any:
-        merged_tables.append(pump_df.drop(columns=["well_key_v51"], errors="ignore"))
-    return merged_tables
-
-
-def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: int = 1000) -> List[pd.DataFrame]:
-    data, name = _uploaded_bytes_v49(uploaded_file)
-    suffix = str(name).split(".")[-1].lower()
-    base_tables = _load_tabular_file_v50_final(UploadedBytes(data, name), parse_images=parse_images, max_ocr_images=max_ocr_images)
-    fixed_tables = [ensure_pumping_pressure_column_v48(t) for t in (base_tables or []) if t is not None and not t.empty]
-    if suffix in {"xlsx", "xls"}:
-        # Speed guard: if the normal/v49 parser already found Pumping Pressure,
-        # do not run the heavier raw/openpyxl rescue again.  This also avoids
-        # repeated workbook reads on Streamlit Cloud.
-        has_pump = False
-        for _t in fixed_tables:
-            if "pumping_pressure_psi" in _t.columns and pd.to_numeric(_t["pumping_pressure_psi"], errors="coerce").notna().sum() > 0:
-                has_pump = True
-                break
-        if not has_pump:
-            pump_df = extract_any_pumping_pressure_from_excel_v51(data, name)
-            fixed_tables = merge_pumping_pressure_tables_v51(fixed_tables, pump_df)
-            fixed_tables = [ensure_pumping_pressure_column_v48(t) for t in fixed_tables if t is not None and not t.empty]
-    return fixed_tables
-
-
-# -----------------------------------------------------------------------------
-# v52: very fast XML-based pumping-pressure rescue for hidden/far-right columns.
-# This solves templates such as S8-58 where Pumping Pressure is in hidden/far
-# right column EG with header "pumping.p" / unit "psi".  It reads the XLSX XML
-# directly instead of relying only on the main table parser, so Excel hidden
-# columns, styled empty columns, and max-column=16384 artifacts do not hide the
-# field.
-# -----------------------------------------------------------------------------
-import zipfile as _zipfile_v52
-import xml.etree.ElementTree as _ET_v52
-
-
-def _xlsx_col_to_num_v52(col_letters: str) -> int:
-    n = 0
-    for ch in str(col_letters).upper():
-        if "A" <= ch <= "Z":
-            n = n * 26 + (ord(ch) - ord("A") + 1)
-    return n
-
-
-def _xlsx_cell_ref_parts_v52(ref: str):
-    m = re.match(r"^([A-Z]+)(\d+)$", str(ref).upper())
-    if not m:
-        return None, None
-    return _xlsx_col_to_num_v52(m.group(1)), int(m.group(2))
-
-
-def _read_shared_strings_v52(zf) -> list:
-    try:
-        data = zf.read("xl/sharedStrings.xml")
-    except Exception:
-        return []
-    ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
-    root = _ET_v52.fromstring(data)
-    out = []
-    for si in root.findall("m:si", ns):
-        parts = []
-        for t in si.findall(".//m:t", ns):
-            parts.append(t.text or "")
-        out.append("".join(parts))
-    return out
-
-
-def _iter_xlsx_sheet_cells_v52(zf, sheet_path: str, shared_strings: list):
-    """Yield (row, col, value) for non-empty worksheet cells."""
-    ns_uri = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
-    try:
-        with zf.open(sheet_path) as fh:
-            for event, elem in _ET_v52.iterparse(fh, events=("end",)):
-                if elem.tag != ns_uri + "c":
-                    continue
-                ref = elem.attrib.get("r", "")
-                col, row = _xlsx_cell_ref_parts_v52(ref)
-                if not row or not col:
-                    elem.clear()
-                    continue
-                typ = elem.attrib.get("t")
-                value = None
-                if typ == "inlineStr":
-                    parts = []
-                    for tnode in elem.findall(".//" + ns_uri + "t"):
-                        parts.append(tnode.text or "")
-                    value = "".join(parts)
-                else:
-                    vnode = elem.find(ns_uri + "v")
-                    if vnode is not None and vnode.text is not None:
-                        raw = vnode.text
-                        if typ == "s":
-                            try:
-                                value = shared_strings[int(float(raw))]
-                            except Exception:
-                                value = raw
-                        else:
-                            value = raw
-                if value not in [None, ""]:
-                    yield row, col, value
-                elem.clear()
-    except Exception:
-        return
-
-
-def _workbook_sheet_paths_v52(zf):
-    """Return list of (sheet_name, sheet_path) for workbook sheets."""
-    ns_main = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main", "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships"}
-    rel_ns = {"pr": "http://schemas.openxmlformats.org/package/2006/relationships"}
-    try:
-        wb_root = _ET_v52.fromstring(zf.read("xl/workbook.xml"))
-        rel_root = _ET_v52.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
-    except Exception:
-        return []
-    rels = {}
-    for rel in rel_root.findall("pr:Relationship", rel_ns):
-        rid = rel.attrib.get("Id")
-        target = rel.attrib.get("Target", "")
-        if rid:
-            if not target.startswith("xl/"):
-                target = "xl/" + target.lstrip("/")
-            rels[rid] = target
-    sheets = []
-    for sh in wb_root.findall(".//m:sheet", ns_main):
-        name = sh.attrib.get("name", "Sheet")
-        rid = sh.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
-        path = rels.get(rid)
-        if path:
-            sheets.append((name, path))
-    return sheets
-
-
-def _excel_datetime_from_values_v52(date_val, time_val):
-    def _to_float(x):
-        try:
-            if x is None or str(x).strip() == "":
-                return np.nan
-            return float(str(x).strip())
-        except Exception:
-            return np.nan
-
-    # Date may be Excel serial, a datetime-like string, or already parsed text.
-    d = pd.NaT
-    fv = _to_float(date_val)
-    if pd.notna(fv) and fv > 1000:
-        try:
-            d = pd.Timestamp("1899-12-30") + pd.to_timedelta(float(fv), unit="D")
-        except Exception:
-            d = pd.NaT
-    if pd.isna(d):
-        d = pd.to_datetime(date_val, errors="coerce", dayfirst=True)
-
-    # Time may be Excel serial fraction, serial datetime, datetime.time string, HH:MM, or text.
-    t = None
-    tf = _to_float(time_val)
-    if pd.notna(tf):
-        frac = tf % 1.0
-        try:
-            seconds = int(round(frac * 24 * 3600))
-            t = (pd.Timestamp("1900-01-01") + pd.Timedelta(seconds=seconds)).time()
-        except Exception:
-            t = None
-    if t is None:
-        ts = pd.to_datetime(str(time_val), errors="coerce")
-        if pd.notna(ts):
-            t = pd.Timestamp(ts).time()
-    if pd.isna(d) or t is None:
-        return pd.NaT
-    return pd.Timestamp.combine(pd.Timestamp(d).date(), t)
-
-
-def _well_from_sheet_or_file_v52(sheet_name: str, name: str) -> str:
-    source = f"{sheet_name} {name}"
-    # Preserve field names like B3 C18-7 / B3C18-7.  Older generic guessing may
-    # return only C18-7, which blocks well+datetime merging.
-    m = re.search(r"\b(B\d+)\s*[-_ ]?\s*(C\d{1,3}[-_ ]?\d+)\b", source, flags=re.I)
-    if m:
-        return (m.group(1) + m.group(2)).replace(" ", "").replace("_", "-").upper()
-    m = re.search(r"\b(S\d+[-_ ]?\d+)\b", source, flags=re.I)
-    if m:
-        return m.group(1).replace(" ", "").replace("_", "-").upper()
-    return guess_well_from_name(str(sheet_name)) or guess_well_from_name(str(name)) or "Unknown"
-
-
-def _extract_pumping_pressure_from_xlsx_xml_v52(data: bytes, name: str) -> pd.DataFrame:
-    rows = []
-    try:
-        zf = _zipfile_v52.ZipFile(io.BytesIO(data))
-    except Exception:
-        return pd.DataFrame()
-    with zf:
-        shared = _read_shared_strings_v52(zf)
-        sheet_paths = _workbook_sheet_paths_v52(zf)
-        for sheet_name, sheet_path in sheet_paths:
-            sparse = {}
-            max_row = 0
-            for r, c, v in _iter_xlsx_sheet_cells_v52(zf, sheet_path, shared):
-                sparse[(r, c)] = v
-                max_row = max(max_row, r)
-            if not sparse:
-                continue
-
-            # Find all credible pumping-pressure header cells.  Reject operation
-            # comments like "start pumping N2" because they do not look like Pump P.
-            header_cells = []
-            for (r, c), v in sparse.items():
-                current_txt = clean_header(v)
-                # Only the header cell itself may identify the field.  Neighboring
-                # cells are used only for units/context, not to turn a plain "PSI"
-                # unit cell into a Pumping Pressure header.
-                if not re.search(r"pump|pumping|circulation", current_txt, flags=re.I):
-                    continue
-                unit_context = " ".join(str(sparse.get((rr, cc), "")) for rr in range(r - 2, r + 3) for cc in range(c - 1, c + 2))
-                if _looks_like_pumping_pressure_header_v51(v, unit_context):
-                    header_cells.append((r, c, v))
-            if not header_cells:
-                continue
-
-            # Find date/time columns from header rows.  If template does not label
-            # them, default to A=date, B=time, which is used by the field templates.
-            date_col, time_col = 1, 2
-            for rr in range(1, min(12, max_row) + 1):
-                for cc in range(1, 12):
-                    txt = clean_header(sparse.get((rr, cc), ""))
-                    if txt in {"date", "d mm yyy", "d mmm yyyy"} or txt.startswith("date"):
-                        date_col = cc
-                    if txt in {"time", "hh mm", "hh:mm"} or txt.startswith("time"):
-                        time_col = cc
-
-            well = _well_from_sheet_or_file_v52(str(sheet_name), str(name))
-            for hr, pc, hv in header_cells:
-                for r in range(hr + 1, max_row + 1):
-                    pump_raw = sparse.get((r, pc))
-                    pump_val = extract_number(pump_raw)
-                    if pd.isna(pump_val):
-                        continue
-                    dt = _excel_datetime_from_values_v52(sparse.get((r, date_col)), sparse.get((r, time_col)))
-                    if pd.isna(dt):
-                        continue
-                    rows.append({
-                        "source": name,
-                        "sheet": sheet_name,
-                        "well": well,
-                        "datetime": dt,
-                        "date": pd.Timestamp(dt).normalize(),
-                        "time_text": pd.Timestamp(dt).strftime("%H:%M"),
-                        "pumping_pressure_psi": float(pump_val),
-                        "source_type": "excel_xml_pumping_pressure_v52",
-                        "pump_header_cell": f"R{hr}C{pc}",
-                    })
-    if not rows:
-        return pd.DataFrame()
-    out = pd.DataFrame(rows)
-    out["well"] = out["well"].map(_clean_merge_well_v51)
-    out["well_key_v51"] = out["well"].map(_clean_merge_well_v51)
-    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
-    out["pumping_pressure_psi"] = pd.to_numeric(out["pumping_pressure_psi"], errors="coerce")
-    out = out.dropna(subset=["datetime", "pumping_pressure_psi"])
-    out = out.drop_duplicates(subset=["well_key_v51", "datetime"], keep="last")
-    return out
-
-
-def extract_any_pumping_pressure_from_excel_v52(data: bytes, name: str) -> pd.DataFrame:
-    # Fast XML first.  If it succeeds, trust it and skip the slow pandas/openpyxl
-    # fallbacks.  This is critical for templates whose used range extends to XFD.
-    try:
-        xml_df = _extract_pumping_pressure_from_xlsx_xml_v52(data, name)
-        if xml_df is not None and not xml_df.empty:
-            out = xml_df.copy()
-        else:
-            raise ValueError("XML pump extraction found no rows")
-    except Exception:
-        frames = []
-        for fn in [_extract_pumping_pressure_from_pandas_raw_v51, _extract_pumping_pressure_from_openpyxl_v51, extract_hidden_pumping_pressure_from_excel_v49]:
-            try:
-                df = fn(data, name)
-                if df is not None and not df.empty:
-                    frames.append(df)
-            except Exception:
-                pass
-        if not frames:
-            return pd.DataFrame()
-        out = pd.concat(frames, ignore_index=True, sort=False)
-    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
-    out["well"] = out.get("well", "Unknown").map(_clean_merge_well_v51) if isinstance(out.get("well", None), pd.Series) else "Unknown"
-    out["well_key_v51"] = out["well"].map(_clean_merge_well_v51)
-    out["pumping_pressure_psi"] = pd.to_numeric(out["pumping_pressure_psi"], errors="coerce")
-    out = out.dropna(subset=["datetime", "pumping_pressure_psi"])
-    # Prefer XML/header-specific rows over broad pandas/openpyxl rows when duplicates exist.
-    out["_pump_priority_v52"] = out.get("source_type", "").astype(str).str.contains("xml|hidden", case=False, na=False).astype(int)
-    out = out.sort_values(["well_key_v51", "datetime", "_pump_priority_v52"]).drop_duplicates(subset=["well_key_v51", "datetime"], keep="last")
-    out = out.drop(columns=["_pump_priority_v52"], errors="ignore")
-    return out
-
-
-def force_restore_pumping_pressure_v52(tables, pump_df: pd.DataFrame):
-    """Always merge pump rescue; append pump-only table only if merge still fails."""
-    if pump_df is None or pump_df.empty:
-        return tables
-    fixed = merge_pumping_pressure_tables_v51(tables, pump_df)
-    # Make sure the canonical column is numeric and visible in every returned table.
-    out_tables = []
-    any_visible = False
-    for t in fixed or []:
-        if t is None or t.empty:
-            continue
-        t = ensure_pumping_pressure_column_v48(t)
-        if "pumping_pressure_psi" in t.columns:
-            t["pumping_pressure_psi"] = pd.to_numeric(t["pumping_pressure_psi"], errors="coerce")
-            if t["pumping_pressure_psi"].notna().sum() > 0:
-                any_visible = True
-        out_tables.append(t)
-    if not any_visible:
-        out_tables.append(pump_df.drop(columns=["well_key_v51"], errors="ignore"))
-    return out_tables
-
-
-# Keep previous loader, but force cache-busted XML Pumping Pressure rescue for Excel.
-_load_tabular_file_v51_final = load_tabular_file
-
-def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: int = 1000) -> List[pd.DataFrame]:
-    data, name = _uploaded_bytes_v49(uploaded_file)
-    suffix = str(name).split(".")[-1].lower()
-    # Use v50 base loader to avoid v51 slow openpyxl rescue. v52 XML rescue is applied below.
-    base_loader = globals().get("_load_tabular_file_v50_final", _load_tabular_file_v51_final)
-    base_tables = base_loader(UploadedBytes(data, name), parse_images=parse_images, max_ocr_images=max_ocr_images)
-    fixed_tables = [ensure_pumping_pressure_column_v48(t) for t in (base_tables or []) if t is not None and not t.empty]
-    if suffix in {"xlsx", "xls"}:
-        pump_df = extract_any_pumping_pressure_from_excel_v52(data, name)
-        fixed_tables = force_restore_pumping_pressure_v52(fixed_tables, pump_df)
-        fixed_tables = [ensure_pumping_pressure_column_v48(t) for t in fixed_tables if t is not None and not t.empty]
-    return fixed_tables
-
-# =============================================================================
-# v53 — safe XLSX preflight / fast XML loader + cross-file de-duplication
-# =============================================================================
-# Why this exists:
-# Some field workbooks have an accidentally inflated Excel used range such as
-# A1:FU1048518 or A1:XFC56.  pandas/openpyxl may allocate or scan the entire
-# range, which can exhaust Streamlit Cloud memory and show the generic
-# "Oh no. Error running app" page.  v53 detects those workbooks before the
-# normal loader and reads only non-empty XML cells in a bounded data region.
-
-import zipfile as _zipfile_v53
-import xml.etree.ElementTree as _ET_v53
-
-PARSER_BUILD_ID_V53 = "v54-safe-xlsx-object-dtype-20260621"
-PARSER_BUILD_ID_V54 = "v54-safe-xlsx-object-dtype-20260621"
-
-# Internal bookkeeping columns must never appear as plot features.
-try:
-    BASE_NON_PLOT_COLS.update({
-        "_upload_order", "_table_order", "_source_row_order",
-        "_well_key_v53", "_datetime_key_v53", "_completeness_v53",
-    })
-except Exception:
-    pass
-
-
-def _xlsx_col_number_v53(col_letters: str) -> int:
-    n = 0
-    for ch in str(col_letters or "").upper():
-        if "A" <= ch <= "Z":
-            n = n * 26 + (ord(ch) - 64)
-    return n
-
-
-def _xlsx_ref_parts_v53(ref: str):
-    m = re.match(r"^([A-Za-z]+)(\d+)$", str(ref or ""))
-    if not m:
-        return 0, 0
-    return int(m.group(2)), _xlsx_col_number_v53(m.group(1))
-
-
-def _xlsx_dimension_parts_v53(ref: str):
-    last = str(ref or "A1").split(":")[-1]
-    return _xlsx_ref_parts_v53(last)
-
-
-def xlsx_preflight_v53(data: bytes) -> dict:
-    """Inspect XLSX dimensions without loading cells into pandas/openpyxl."""
-    result = {
-        "is_xlsx": False,
-        "suspicious": False,
-        "max_declared_row": 0,
-        "max_declared_col": 0,
-        "sheet_xml_uncompressed": 0,
-        "reasons": [],
-    }
-    try:
-        with _zipfile_v53.ZipFile(io.BytesIO(data)) as zf:
-            result["is_xlsx"] = True
-            for info in zf.infolist():
-                if not (info.filename.startswith("xl/worksheets/sheet") and info.filename.endswith(".xml")):
-                    continue
-                result["sheet_xml_uncompressed"] += int(info.file_size or 0)
-                try:
-                    with zf.open(info.filename) as fh:
-                        head = fh.read(32768)
-                    m = re.search(br"<dimension\s+ref=\"([^\"]+)\"", head)
-                    if m:
-                        r, c = _xlsx_dimension_parts_v53(m.group(1).decode("utf-8", errors="ignore"))
-                        result["max_declared_row"] = max(result["max_declared_row"], r)
-                        result["max_declared_col"] = max(result["max_declared_col"], c)
-                except Exception:
-                    pass
-    except Exception:
-        return result
-
-    # These limits are far above normal TMU sheets but below pathological Excel
-    # used ranges.  Actual non-empty cells outside the bounds are exceptionally
-    # unlikely for production-test sheets.
-    if result["max_declared_row"] > 20000:
-        result["reasons"].append("inflated row dimension")
-    if result["max_declared_col"] > 512:
-        result["reasons"].append("inflated column dimension")
-    if result["sheet_xml_uncompressed"] > 25_000_000:
-        result["reasons"].append("very large worksheet XML")
-    result["suspicious"] = bool(result["reasons"])
+        result[col] = "raw__" + slugify(label)
     return result
 
 
-def _read_shared_strings_fast_v53(zf) -> list:
+def _parse_candidate(
+    raw: pd.DataFrame,
+    candidate: HeaderCandidate,
+    *,
+    source_name: str,
+    sheet_name: str,
+    default_well: str,
+) -> pd.DataFrame:
+    data = raw.iloc[candidate.start_pos + candidate.height :].copy().reset_index(drop=False)
+    if data.empty:
+        return pd.DataFrame()
+    source_rows = data["index"].tolist()
+    data = data.drop(columns=["index"])
+    infos = candidate.infos
+    canonical = [info.canonical for info in infos]
+
+    if "datetime" in canonical:
+        idx = canonical.index("datetime")
+        dt = _repair_datetime_ordered(data.iloc[:, idx].tolist())
+        dt.index = data.index
+    elif "date" in canonical and "time" in canonical:
+        date_idx, time_idx = canonical.index("date"), canonical.index("time")
+        dt = combine_date_time(data.iloc[:, date_idx], data.iloc[:, time_idx])
+    else:
+        return pd.DataFrame()
+
+    output = pd.DataFrame(index=data.index)
+    output["datetime"] = dt
+    output["source"] = source_name
+    output["sheet"] = sheet_name
+    if "source_meta" in canonical:
+        meta_idx = canonical.index("source_meta")
+        meta_values = data.iloc[:, meta_idx].map(safe_text)
+        output["source"] = meta_values.where(meta_values.ne(""), source_name)
+    if "sheet_meta" in canonical:
+        meta_idx = canonical.index("sheet_meta")
+        meta_values = data.iloc[:, meta_idx].map(safe_text)
+        output["sheet"] = meta_values.where(meta_values.ne(""), sheet_name)
+    if "source_type_meta" in canonical:
+        meta_idx = canonical.index("source_type_meta")
+        output["source_type"] = data.iloc[:, meta_idx].map(safe_text)
+    if "note_meta" in canonical:
+        meta_idx = canonical.index("note_meta")
+        output["note"] = data.iloc[:, meta_idx].map(safe_text)
+    if "gas_rate_status_meta" in canonical:
+        meta_idx = canonical.index("gas_rate_status_meta")
+        output["gas_rate_status"] = data.iloc[:, meta_idx].map(safe_text)
+    output["source_row"] = source_rows
+    output["source_priority"] = output["source"].map(_source_priority)
+    output["source_group"] = output["source"].astype(str) + "::" + output["sheet"].astype(str)
+
+    if "well" in canonical:
+        well_idx = canonical.index("well")
+        output["well"] = data.iloc[:, well_idx].map(clean_well_name_value)
+        output["well"] = output["well"].where(output["well"].ne("Unknown"), default_well)
+    else:
+        output["well"] = default_well
+
+    occupied: set[int] = {
+        idx for idx, key in enumerate(canonical) if key in {"date", "time", "datetime", "well", "source_meta", "sheet_meta", "source_type_meta", "note_meta", "gas_rate_status_meta"}
+    }
+    note_parts: List[pd.Series] = []
+    for col, info in enumerate(infos):
+        key = info.canonical
+        if key in {None, "date", "time", "datetime", "well", "source_meta", "sheet_meta", "source_type_meta", "note_meta", "gas_rate_status_meta"}:
+            continue
+        occupied.add(col)
+        converted = _convert_numeric(data.iloc[:, col], info)
+        if key in output.columns:
+            output[key] = pd.to_numeric(output[key], errors="coerce").combine_first(converted)
+        else:
+            output[key] = converted
+
+    # Preserve unknown numeric channels for simple device/export tables. Complex
+    # TMU sheets contain many hidden formula/helper columns that should not be
+    # exposed as measurements.
+    recognized_count = len({key for key in canonical if key and key not in {"date", "time", "datetime", "well"}})
+    if recognized_count <= 10:
+        for col, raw_key in _generic_numeric_columns(data, candidate.headers, occupied).items():
+            output[raw_key] = clean_tabular_numeric_series(data.iloc[:, col])
+            COLUMN_LABELS.setdefault(raw_key, safe_text(candidate.headers[col]) or raw_key)
+
+    # Capture operational text from non-mapped columns only on rows that also have data.
+    for col in range(data.shape[1]):
+        if col in occupied or canonical[col] in {"date", "time", "datetime", "well"}:
+            continue
+        text_series = data.iloc[:, col].map(safe_text)
+        text_series = text_series.where(~text_series.str.fullmatch(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", na=False), "")
+        if text_series.str.len().gt(3).any():
+            note_parts.append(text_series)
+    if note_parts:
+        notes = output.get("note", pd.Series("", index=output.index, dtype=object)).fillna("").astype(object)
+        for part in note_parts:
+            notes = pd.Series([append_note(a, b) for a, b in zip(notes, part)], index=notes.index)
+        output["note"] = notes
+    elif "note" not in output.columns:
+        output["note"] = ""
+
+    numeric_cols = [
+        col for col in output.columns
+        if col not in BASE_NON_PLOT_COLS and pd.to_numeric(output[col], errors="coerce").notna().any()
+    ]
+    useful = output["datetime"].notna()
+    if numeric_cols:
+        useful &= output[numeric_cols].apply(lambda row: pd.to_numeric(row, errors="coerce").notna().any(), axis=1)
+    else:
+        useful &= False
+    output = output.loc[useful].copy()
+    if output.empty:
+        return output
+
+    # Infer Tm unit only when no unit was given.
+    if "motor_temp_f" in output.columns:
+        vals = pd.to_numeric(output["motor_temp_f"], errors="coerce")
+        if vals.notna().any() and vals.median() < 180 and any(info.canonical == "motor_temp_f" and info.unit == "infer" for info in infos):
+            output["motor_temp_c"] = vals
+            output.drop(columns=["motor_temp_f"], inplace=True)
+
+    output["date"] = output["datetime"].dt.date
+    output["time_text"] = output["datetime"].dt.strftime("%H:%M")
+    output["test_unit"] = sheet_name
+    return _postprocess_table(output)
+
+
+def _postprocess_table(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    if "datetime" not in out.columns:
+        return pd.DataFrame()
+    repaired = _repair_datetime_ordered(out["datetime"].tolist())
+    repaired.index = out.index
+    out["datetime"] = repaired
+    out = _align_dates_to_source_name(out)
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce").dt.round("s")
+    out = out.loc[out["datetime"].notna()].copy()
+    if out.empty:
+        return out
+    if "well" not in out.columns:
+        out["well"] = "Unknown"
+    out["well"] = out["well"].map(clean_well_name_value)
+    for col in list(out.columns):
+        if col in BASE_NON_PLOT_COLS or col == "gas_rate_status":
+            continue
+        numeric = pd.to_numeric(out[col], errors="coerce")
+        if numeric.notna().any():
+            out[col] = numeric.astype("float64")
+    # Normalize common template storage conventions after every parser path.
+    if "choke_pct" in out.columns:
+        vals = pd.to_numeric(out["choke_pct"], errors="coerce")
+        out["choke_pct"] = vals.where(~((vals > 0) & (vals <= 1.0)), vals * 100.0)
+    if "choke_size_64" in out.columns:
+        vals = pd.to_numeric(out["choke_size_64"], errors="coerce")
+        inch_mask = vals.notna() & (vals.abs() > 0) & (vals.abs() <= 2.0)
+        out["choke_size_64"] = vals.where(~inch_mask, vals * 64.0)
+    if "salinity_kppm" in out.columns:
+        vals = pd.to_numeric(out["salinity_kppm"], errors="coerce")
+        out["salinity_kppm"] = vals.where(vals.abs() <= 1000, vals / 1000.0)
+
+    if "pumping_pressure_psi" in out.columns and "pump_intake_pressure_psi" in out.columns:
+        pump = pd.to_numeric(out["pumping_pressure_psi"], errors="coerce")
+        intake = pd.to_numeric(out["pump_intake_pressure_psi"], errors="coerce")
+        comparable = pump.notna() & intake.notna()
+        source_text = out.get("source", pd.Series("", index=out.index)).astype(str)
+        compatibility = source_text.str.contains(r"legacy|compatible|temporary", case=False, regex=True, na=False)
+        equal = comparable & np.isclose(pump, intake, rtol=1e-9, atol=1e-9) & compatibility
+        out.loc[equal, "pumping_pressure_psi"] = np.nan
+        if pd.to_numeric(out["pumping_pressure_psi"], errors="coerce").notna().sum() == 0:
+            out.drop(columns=["pumping_pressure_psi"], inplace=True)
+
+    for col, default in {
+        "source": "Unknown source", "sheet": "Data", "note": "", "test_unit": "Data",
+        "source_type": "tabular", "link_status": "source_confirmed",
+    }.items():
+        if col not in out.columns:
+            out[col] = default
+    # Always regenerate display date/time from the repaired canonical datetime.
+    # Source date/time cells may contain the exact defects that this pipeline fixes
+    # (wrong overnight date, 1900-dated time, or floating 17:29:59 values).
+    out["date"] = out["datetime"].dt.date
+    out["time_text"] = out["datetime"].dt.strftime("%H:%M")
+    return out.sort_values(["well", "datetime", "source", "sheet"], kind="stable").reset_index(drop=True)
+
+
+def _parse_xlsx(data: bytes, name: str) -> List[pd.DataFrame]:
+    tables: List[pd.DataFrame] = []
+    diagnostics: List[str] = []
+
+    # Decide by workbook structure, not file size. Standard TMU reports are
+    # handled by the mature fast parser; one-sheet simple DateTime/device tables
+    # use the deterministic v66 parser. This avoids scanning enormous formatted
+    # tails while still accepting new device/export templates.
     try:
-        root = _ET_v53.fromstring(zf.read("xl/sharedStrings.xml"))
-    except Exception:
-        return []
-    ns_uri = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
-    out = []
-    for si in root.findall(ns_uri + "si"):
-        out.append("".join((t.text or "") for t in si.findall(".//" + ns_uri + "t")))
-    return out
+        with zipfile.ZipFile(io.BytesIO(data)) as _probe:
+            _shared = _read_shared_strings(_probe)
+            _sheets = _workbook_sheet_paths(_probe)
+            simple_table = _xlsx_simple_table_signature(_probe, _sheets, _shared)
+        if not simple_table:
+            legacy_tables = legacy.load_tabular_file(
+                UploadedBytes(data, name), parse_images=False, max_ocr_images=0
+            )
+            legacy_tables = [_postprocess_table(table) for table in legacy_tables]
+            legacy_tables = [table for table in legacy_tables if is_valid_timeseries(table)]
+            if legacy_tables:
+                return _deduplicate_table_interpretations(legacy_tables)
+    except Exception as exc:
+        diagnostics.append(f"fast legacy path: {exc}")
 
-
-def _iter_sheet_cells_limited_v53(zf, sheet_path: str, shared_strings: list,
-                                  max_rows: int = 20000, max_cols: int = 512):
-    """Yield non-empty cells, stopping before inflated empty worksheet tails."""
-    ns_uri = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
-    with zf.open(sheet_path) as fh:
-        for _, elem in _ET_v53.iterparse(fh, events=("end",)):
-            if elem.tag != ns_uri + "c":
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        shared = _read_shared_strings(zf)
+        for sheet_name, sheet_path in _workbook_sheet_paths(zf):
+            try:
+                raw = _read_sheet_sparse(zf, sheet_path, shared)
+            except Exception as exc:
+                diagnostics.append(f"{sheet_name}: {exc}")
                 continue
-            row, col = _xlsx_ref_parts_v53(elem.attrib.get("r", ""))
-            if row <= 0 or col <= 0:
-                elem.clear()
+            if raw.empty:
                 continue
-            # Excel serializes cells in row order. Once the bound is exceeded,
-            # the remaining million-row formatted tail can be ignored safely.
-            if row > max_rows:
-                elem.clear()
-                break
-            if col > max_cols:
-                elem.clear()
-                continue
-            typ = elem.attrib.get("t")
-            value = None
-            if typ == "inlineStr":
-                value = "".join((tn.text or "") for tn in elem.findall(".//" + ns_uri + "t"))
-            else:
-                vnode = elem.find(ns_uri + "v")
-                if vnode is not None and vnode.text is not None:
-                    raw = vnode.text
-                    if typ == "s":
-                        try:
-                            value = shared_strings[int(float(raw))]
-                        except Exception:
-                            value = raw
-                    elif typ == "b":
-                        value = str(raw).strip() == "1"
-                    else:
-                        value = raw
-            if value not in (None, ""):
-                yield row, col, value
-            elem.clear()
-
-
-def _excel_serial_date_v53(value):
-    """Convert only plausible modern Excel serial dates.
-
-    Values such as 1234, 1423, 2600, and 2613 are operational measurements in
-    these TMU sheets and must never be interpreted as calendar years/dates.
-    """
+            default_well = _well_from_raw(raw, name, sheet_name)
+            candidates = _find_header_candidates(raw)
+            for candidate in candidates:
+                try:
+                    table = _parse_candidate(
+                        raw, candidate, source_name=name, sheet_name=sheet_name,
+                        default_well=default_well,
+                    )
+                except Exception as exc:
+                    diagnostics.append(f"{sheet_name} row {candidate.start_pos + 1}: {exc}")
+                    continue
+                if is_valid_timeseries(table):
+                    tables.append(table)
+                    # Most sheets contain one primary data table. Do not produce
+                    # overlapping duplicate interpretations from nearby headers.
+                    break
+    tables = _deduplicate_table_interpretations(tables)
+    if tables:
+        non_helper = [
+            table for table in tables
+            if not re.search(r"(?:^|\b)(form|cover|summary|cmsf|shrinkage)(?:\b|$)",
+                             safe_text(table.get("sheet", pd.Series([""])).iloc[0]), flags=re.I)
+        ]
+        if non_helper:
+            tables = non_helper
+        # Prefer the richest interpretation when a workbook contains helper
+        # summaries plus the real time-series sheet.
+        tables.sort(key=lambda table: (len(table), len(available_numeric_columns(table))), reverse=True)
+        return tables
+    # Fallback preserves PDF/image/rare workbook behavior from prior releases.
     try:
-        f = float(str(value).strip())
-    except Exception:
-        return value
-    if 20000.0 <= f <= 80000.0:
-        try:
-            ts = pd.Timestamp("1899-12-30") + pd.to_timedelta(f, unit="D")
-            return ts if 1900 <= int(ts.year) <= 2100 else value
-        except Exception:
-            return value
-    return value
-
-
-def _excel_serial_time_v53(value):
-    try:
-        f = float(str(value).strip())
-    except Exception:
-        return value
-    # Some copied TMU sheets use cumulative Excel day values above 1 or 2 in
-    # the Time column. Only the fractional day is the clock time. Since this
-    # function is called only for a strongly detected Time column, values below
-    # 10 days are safe to normalize and must not be dropped.
-    if 0 <= f < 10:
-        try:
-            seconds = int(round((f % 1.0) * 86400)) % 86400
-            return (pd.Timestamp("1900-01-01") + pd.Timedelta(seconds=seconds)).time()
-        except Exception:
-            return value
-    return value
-
-
-def _normalize_excel_date_time_columns_v53(raw: pd.DataFrame) -> pd.DataFrame:
-    if raw is None or raw.empty:
-        return raw
-
-    # Rebuild from Python lists. This prevents Arrow/string/datetime extension
-    # arrays from surviving into the raw worksheet and avoids pandas setitem bugs.
-    out = pd.DataFrame(
-        [[cell for cell in row] for row in raw.to_numpy(dtype=object).tolist()],
-        index=raw.index.copy(),
-        columns=raw.columns.copy(),
-        dtype=object,
+        fallback = legacy.load_tabular_file(UploadedBytes(data, name), parse_images=False, max_ocr_images=0)
+        fallback = [_postprocess_table(table) for table in fallback]
+        fallback = [table for table in fallback if is_valid_timeseries(table)]
+        if fallback:
+            return fallback
+    except Exception as exc:
+        diagnostics.append(f"legacy fallback: {exc}")
+    detail = "; ".join(diagnostics[:8])
+    raise RuntimeError(
+        f"no usable time-series table detected. The file was read safely, but no row set contained "
+        f"a valid date/time plus numeric readings. {detail}".strip()
     )
 
-    date_cols = []
-    time_cols = []
-    header_end_by_col = {}
-    for r in range(min(30, len(out))):
-        for c in range(out.shape[1]):
-            txt = clean_header(out.iat[r, c])
-            if not txt:
+
+# ---------------------------------------------------------------------------
+# CSV and generic delimited files
+# ---------------------------------------------------------------------------
+
+
+def _decode_text_bytes(data: bytes) -> tuple[str, str]:
+    # UTF-16 must be tried before Latin-1 because Latin-1 accepts every byte.
+    encodings = ("utf-8-sig", "utf-8", "utf-16", "utf-16-le", "utf-16-be", "cp1252", "latin-1")
+    for encoding in encodings:
+        try:
+            text = data.decode(encoding, errors="strict")
+            if "\x00" in text and not encoding.startswith("utf-16"):
                 continue
-            if re.search(r"(^|\b)date($|\b)|d/mm|d-mmm|yyyy", txt):
-                date_cols.append(c)
-                header_end_by_col[c] = max(header_end_by_col.get(c, 0), r)
-            if re.search(r"(^|\b)time($|\b)|hh:mm", txt):
-                time_cols.append(c)
-                header_end_by_col[c] = max(header_end_by_col.get(c, 0), r)
-
-    # Use A/B fallback only when their values actually look like date/time data.
-    if not date_cols and out.shape[1] >= 1:
-        sample = out.iloc[: min(len(out), 100), 0].tolist()
-        plausible = sum(
-            1 for v in sample
-            if isinstance(v, (pd.Timestamp,))
-            or (isinstance(v, (int, float, np.number)) and not isinstance(v, bool) and 20000 <= float(v) <= 80000)
-            or bool(re.search(r"\d{1,4}[/-]\d{1,2}[/-]\d{1,4}", str(v or "")))
-        )
-        if plausible >= 2:
-            date_cols = [0]
-    if not time_cols and out.shape[1] >= 2:
-        sample = out.iloc[: min(len(out), 100), 1].tolist()
-        plausible = sum(
-            1 for v in sample
-            if hasattr(v, "hour") and hasattr(v, "minute") and not isinstance(v, (str, int, float, np.number))
-            or (isinstance(v, (int, float, np.number)) and not isinstance(v, bool) and 0 <= float(v) < 2)
-            or bool(re.fullmatch(r"\s*\d{1,2}[:.]\d{2}(?::\d{2})?\s*(?:am|pm)?\s*", str(v or ""), re.I))
-        )
-        if plausible >= 2:
-            time_cols = [1]
-
-    for c in sorted(set(date_cols)):
-        start = header_end_by_col.get(c, -1) + 1
-        values = out.iloc[:, c].tolist()
-        for i in range(max(0, start), len(values)):
-            values[i] = _excel_serial_date_v53(values[i])
-        out.iloc[:, c] = pd.Series(values, index=out.index, dtype=object).to_numpy(dtype=object)
-
-    for c in sorted(set(time_cols)):
-        start = header_end_by_col.get(c, -1) + 1
-        values = out.iloc[:, c].tolist()
-        for i in range(max(0, start), len(values)):
-            values[i] = _excel_serial_time_v53(values[i])
-        out.iloc[:, c] = pd.Series(values, index=out.index, dtype=object).to_numpy(dtype=object)
-
-    return pd.DataFrame(out.to_numpy(dtype=object), index=out.index, columns=out.columns, dtype=object)
-
-def _raw_dataframe_from_sheet_xml_v53(zf, sheet_path: str, shared_strings: list,
-                                      max_rows: int = 20000, max_cols: int = 512):
-    sparse = {}
-    max_r = 0
-    max_c = 0
-    for r, c, v in _iter_sheet_cells_limited_v53(
-        zf, sheet_path, shared_strings, max_rows=max_rows, max_cols=max_cols
-    ):
-        sparse[(r, c)] = v
-        max_r = max(max_r, r)
-        max_c = max(max_c, c)
-    if not sparse or max_r <= 0 or max_c <= 0:
-        return pd.DataFrame()
-    matrix = [[None] * max_c for _ in range(max_r)]
-    for (r, c), v in sparse.items():
-        matrix[r - 1][c - 1] = v
-    raw = pd.DataFrame(matrix, dtype=object)
-    raw = raw.dropna(how="all").dropna(axis=1, how="all")
-    return _normalize_excel_date_time_columns_v53(raw)
+            return text.replace("\x00", ""), encoding
+        except UnicodeDecodeError:
+            continue
+    return data.decode("latin-1", errors="replace").replace("\x00", ""), "latin-1"
 
 
-def _load_suspicious_xlsx_fast_v53(data: bytes, name: str) -> List[pd.DataFrame]:
-    tables = []
+def _detect_delimiter(text: str) -> str:
+    sample = "\n".join(line for line in text.splitlines()[:30] if line.strip())
     try:
-        with _zipfile_v53.ZipFile(io.BytesIO(data)) as zf:
-            shared = _read_shared_strings_fast_v53(zf)
-            sheet_paths = _workbook_sheet_paths_v52(zf)
-            for sheet_name, sheet_path in sheet_paths:
-                raw = _raw_dataframe_from_sheet_xml_v53(zf, sheet_path, shared)
-                if raw is None or raw.empty:
-                    continue
-                default_well = extract_well_from_raw(raw, source_name=name, sheet_name=str(sheet_name))
-                candidates = parse_excel_sheet_attempts(
-                    raw, source_name=name, sheet_name=str(sheet_name), default_well=default_well
-                )
-                if candidates:
-                    best = candidates[0].copy()
-                    best["source_type"] = "excel_fast_xml_v53"
-                    tables.append(best)
+        dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+        return dialect.delimiter
+    except Exception:
+        counts = {sep: sample.count(sep) for sep in [",", ";", "\t", "|"]}
+        return max(counts, key=counts.get) if counts and max(counts.values()) else ","
+
+
+def _parse_delimited(data: bytes, name: str) -> List[pd.DataFrame]:
+    text, _encoding = _decode_text_bytes(data)
+    if not text.strip():
+        raise RuntimeError("file is blank")
+    sep = _detect_delimiter(text)
+    try:
+        raw = pd.read_csv(io.StringIO(text), sep=sep, header=None, dtype=object, engine="python")
     except Exception as exc:
-        raise RuntimeError(f"Safe XML parser could not read {name}: {exc}")
-    return filter_usable_tables(filter_preferred_tables(tables))
+        raise RuntimeError(f"could not read delimited text: {exc}") from exc
+    raw = raw.dropna(axis=0, how="all").dropna(axis=1, how="all")
+    if raw.empty:
+        raise RuntimeError("file is blank")
+    raw.index = range(1, len(raw) + 1)
+    default_well = _well_from_raw(raw, name, "CSV")
+    tables: List[pd.DataFrame] = []
+    for candidate in _find_header_candidates(raw):
+        table = _parse_candidate(raw, candidate, source_name=name, sheet_name="CSV", default_well=default_well)
+        if is_valid_timeseries(table):
+            tables.append(table)
+            break
+    if tables:
+        return tables
+    # Pasted WhatsApp exported as text/CSV can still be parsed by the report parser.
+    wa = parse_whatsapp_plain_or_export_text(text, source_name=name)
+    if is_valid_timeseries(wa):
+        return [wa]
+    raise RuntimeError(
+        "no usable time-series table detected. Check that the first data header contains DateTime "
+        "or Date + Time and at least one numeric measurement column."
+    )
 
 
-def _missing_value_v53(value) -> bool:
-    if value is None:
-        return True
+# ---------------------------------------------------------------------------
+# WhatsApp parsing
+# ---------------------------------------------------------------------------
+
+
+def _clean_whatsapp_text(text: object) -> str:
+    value = str(text or "")
+    value = value.replace("\u200e", "").replace("\u200f", "").replace("\ufeff", "")
+    value = value.replace("\xa0", " ")
+    value = re.sub(r"[*_`~]+", "", value)
+    value = re.sub(r"\r\n?", "\n", value)
+    value = re.sub(r"[ \t]+", " ", value)
+    return value.strip()
+
+
+def split_messages(text: str) -> List[str]:
+    cleaned = _clean_whatsapp_text(text)
+    if not cleaned:
+        return []
+    header = re.compile(r"(?im)^\s*(?:PICO\s*TMU|TMU)\s*[- ]?\s*\d+\b[^\n]*")
+    starts = [match.start() for match in header.finditer(cleaned)]
+    if not starts:
+        starts = [match.start() for match in re.finditer(r"(?im)^\s*date\s*[:=@-]?\s*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", cleaned)]
+    if len(starts) <= 1:
+        return [cleaned]
+    return [cleaned[start : (starts[index + 1] if index + 1 < len(starts) else len(cleaned))].strip() for index, start in enumerate(starts)]
+
+
+def _value_after_label(text: str, labels: Sequence[str]) -> str:
+    for label in labels:
+        match = re.search(rf"(?im)^\s*{label}\s*(?:[:=@-]\s*)?(.+?)\s*$", text)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+def parse_tmu_message(message: str, source_name: str = "WhatsApp_Text") -> Dict[str, object]:
+    text = _clean_whatsapp_text(message)
+    date_text = _value_after_label(text, [r"date"])
+    time_text = _value_after_label(text, [r"time"])
+    date_value = _safe_datetime_scalar(date_text)
+    fraction = _time_fraction(time_text)
+    dt = pd.NaT
+    if pd.notna(date_value) and math.isfinite(fraction):
+        dt = date_value.normalize() + pd.to_timedelta(fraction, unit="D")
+
+    well = clean_well_name_value(_value_after_label(text, [r"well\s*name", r"well"]))
+    if well == "Unknown":
+        well = guess_well_from_name(text)
+
+    row: Dict[str, object] = {
+        "source": source_name,
+        "sheet": "WhatsApp",
+        "source_type": "pasted_whatsapp_text",
+        "well": well,
+        "datetime": dt,
+        "note": "",
+        "test_unit": "WhatsApp",
+        "source_priority": _source_priority(source_name),
+        "source_group": source_name,
+    }
+
+
+    mappings = [
+        ("choke_pct", [r"choke"], "%"),
+        ("whp_psi", [r"w\.?\s*h\.?\s*p\.?", r"whp", r"wellhead pressure"], "psi"),
+        ("sep_p_psi", [r"sep\.?\s*p\.?", r"separator pressure"], "psi"),
+        ("gross_rate_bpd", [r"gross rate"], "bpd"),
+        ("oil_rate_stbd", [r"oil rate", r"cond rate"], "bpd"),
+        ("water_rate_bpd", [r"water rate"], "bpd"),
+        ("bsw_pct", [r"bs\s*&?\s*w", r"bsw", r"water cut"], "%"),
+        ("salinity_kppm", [r"salinity"], "kppm"),
+        ("co2_mole_pct", [r"co2"], "%"),
+        ("h2s_ppm", [r"h2s"], "ppm"),
+        ("pumping_pressure_psi", [r"pumping pressure", r"pump p"], "psi"),
+    ]
+    for key, labels, unit in mappings:
+        raw = _value_after_label(text, labels)
+        value = extract_number(raw)
+        if pd.notna(value):
+            if key == "choke_pct" and 0 < value <= 1:
+                value *= 100.0
+            if key == "salinity_kppm" and "ppm" in normalize_text(raw) and "kppm" not in normalize_text(raw) and "k ppm" not in normalize_text(raw):
+                value /= 1000.0
+            row[key] = value
+
+    gas_raw = _value_after_label(text, [r"gas rate", r"total gas rate"])
+    gas_value = extract_number(gas_raw)
+    if pd.notna(gas_value):
+        row["gas_rate_mmscfd"] = gas_value
+    else:
+        norm = normalize_text(gas_raw)
+        status = None
+        if "low gas" in norm:
+            status = "Low gas"
+        elif re.search(r"\b(no|zero|nil) gas\b", norm):
+            status = "No gas"
+        elif "trace gas" in norm:
+            status = "Trace gas"
+        elif norm:
+            status = safe_text(gas_raw)
+        if status:
+            row["gas_rate_status"] = status
+            row["note"] = append_note(row.get("note"), f"Gas rate: {status}")
+    if re.search(r"(?im)^\s*production test\s*$", text):
+        row["note"] = append_note(row.get("note"), "Production test")
+    return row
+
+
+def parse_many_tmu_messages(text: str, source_name: str = "WhatsApp_Text") -> pd.DataFrame:
+    rows: List[Dict[str, object]] = []
+    for index, chunk in enumerate(split_messages(text), start=1):
+        row = parse_tmu_message(chunk, source_name=source_name)
+        numeric = sum(pd.notna(extract_number(row.get(key))) for key in CANONICAL_NUMERIC_FIELDS if key in row)
+        if pd.notna(row.get("datetime")) and numeric >= 1:
+            row["message_index"] = index
+            rows.append(row)
+    if not rows:
+        return pd.DataFrame()
+    return _postprocess_table(pd.DataFrame(rows))
+
+
+def parse_whatsapp_plain_or_export_text(text: str, source_name: str = "WhatsApp_Text") -> pd.DataFrame:
+    # Legacy export parser handles WhatsApp timestamp prefixes and attachment captions.
     try:
-        if pd.isna(value):
-            return True
+        exported = legacy.parse_whatsapp_export_text(text, source_name=source_name)
+        if exported is not None and not exported.empty:
+            return _postprocess_table(exported)
     except Exception:
         pass
-    if isinstance(value, str) and value.strip().lower() in {"", "nan", "nat", "none", "unknown"}:
-        return True
-    return False
+    return parse_many_tmu_messages(text, source_name=source_name)
 
 
-def _normalized_well_key_v53(value) -> str:
-    try:
-        key = _clean_merge_well_v51(value)
-    except Exception:
-        key = str(value or "").strip().upper()
-    key = re.sub(r"\s+", "", str(key or "").upper()).replace("_", "-")
-    key = re.sub(r"-+", "-", key).strip("-*")
-    if key in {"", "UNKNOWN", "NAN", "NONE", "*"}:
-        return ""
-    return key
+# ---------------------------------------------------------------------------
+# Public loading API
+# ---------------------------------------------------------------------------
+
+
+def is_valid_timeseries(df: pd.DataFrame) -> bool:
+    if df is None or df.empty or "datetime" not in df.columns:
+        return False
+    dt = pd.to_datetime(df["datetime"], errors="coerce")
+    if dt.notna().sum() == 0:
+        return False
+    numeric_cols = available_numeric_columns(df)
+    return bool(numeric_cols and any(pd.to_numeric(df[col], errors="coerce").notna().any() for col in numeric_cols))
+
+
+def _deduplicate_table_interpretations(tables: Sequence[pd.DataFrame]) -> List[pd.DataFrame]:
+    unique: List[pd.DataFrame] = []
+    signatures = set()
+    for table in tables:
+        if not is_valid_timeseries(table):
+            continue
+        dt = pd.to_datetime(table["datetime"], errors="coerce")
+        numeric = tuple(sorted(available_numeric_columns(table)))
+        signature = (
+            _well_key(table["well"].iloc[0]) if "well" in table.columns and len(table) else "",
+            len(table), str(dt.min()), str(dt.max()), numeric,
+        )
+        if signature not in signatures:
+            signatures.add(signature)
+            unique.append(table)
+    return unique
+
+
+def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: int = 1000) -> List[pd.DataFrame]:
+    data, name = _uploaded_bytes(uploaded_file)
+    suffix = Path(name).suffix.lower()
+    if suffix in {".xlsx", ".xlsm"}:
+        return _parse_xlsx(data, name)
+    if suffix == ".xls":
+        try:
+            book = pd.read_excel(io.BytesIO(data), sheet_name=None, header=None, dtype=object, engine="xlrd")
+            tables: List[pd.DataFrame] = []
+            for sheet_name, raw in book.items():
+                raw = raw.dropna(axis=0, how="all").dropna(axis=1, how="all")
+                default_well = _well_from_raw(raw, name, sheet_name)
+                for candidate in _find_header_candidates(raw):
+                    table = _parse_candidate(raw, candidate, source_name=name, sheet_name=sheet_name, default_well=default_well)
+                    if is_valid_timeseries(table):
+                        tables.append(table)
+                        break
+            if tables:
+                return _deduplicate_table_interpretations(tables)
+        except Exception:
+            pass
+    if suffix in {".csv", ".tsv"}:
+        return _parse_delimited(data, name)
+    if suffix in {".txt", ".log"}:
+        text, _ = _decode_text_bytes(data)
+        table = parse_whatsapp_plain_or_export_text(text, source_name=name)
+        if is_valid_timeseries(table):
+            return [table]
+    # ZIP, PDF, DOCX and images retain mature extraction/OCR support.
+    fallback = legacy.load_tabular_file(
+        UploadedBytes(data, name), parse_images=parse_images, max_ocr_images=max_ocr_images
+    )
+    normalized = [_postprocess_table(table) for table in fallback]
+    normalized = [table for table in normalized if is_valid_timeseries(table)]
+    if normalized:
+        return _deduplicate_table_interpretations(normalized)
+    raise RuntimeError(
+        "no usable time-series table detected. The file may be blank, or it has no valid date/time plus numeric readings."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Duplicate merging and test segmentation
+# ---------------------------------------------------------------------------
+
+
+def _row_completeness(row: pd.Series) -> int:
+    count = 0
+    for col, value in row.items():
+        if col in BASE_NON_PLOT_COLS:
+            continue
+        if not _is_missing(value):
+            count += 1
+    return count
 
 
 def merge_duplicate_test_rows_v53(df: pd.DataFrame) -> pd.DataFrame:
-    """Merge repeated uploads by normalized well + minute timestamp.
+    """Merge repeated/incomplete reports by normalized well + minute.
 
-    A later/complete report often repeats rows from an earlier incomplete report.
-    For each duplicate timestamp, keep the most complete row, then fill any gaps
-    from the other copies. Conflicting populated values stay with the most
-    complete row; ties prefer the later uploaded file.
+    Values are coalesced column-by-column. A more complete row wins conflicts;
+    final/clean files and later upload order break ties. Blank cells never erase
+    an existing measurement.
     """
-    if df is None or df.empty or "datetime" not in df.columns:
+    if df is None or df.empty:
         return df
-    out = df.copy().reset_index(drop=True)
-    if "well" not in out.columns:
-        out["well"] = "Unknown"
-    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
-    out["_source_row_order"] = np.arange(len(out), dtype=int)
-    if "_upload_order" not in out.columns:
-        out["_upload_order"] = 0
-    if "_table_order" not in out.columns:
-        out["_table_order"] = 0
-    out["_well_key_v53"] = out["well"].map(_normalized_well_key_v53)
-    out["_datetime_key_v53"] = out["datetime"].dt.floor("min")
+    out = df.copy()
+    out["datetime"] = parse_datetime_series(out.get("datetime", pd.Series(index=out.index)))
+    out["well"] = out.get("well", pd.Series("Unknown", index=out.index)).map(clean_well_name_value)
+    out["_well_key"] = out["well"].map(_well_key)
+    out["_minute_key"] = out["datetime"].dt.round("min")
+    out["_source_order"] = np.arange(len(out), dtype=int)
+    if "source_priority" in out.columns:
+        out["source_priority"] = pd.to_numeric(out["source_priority"], errors="coerce").fillna(0)
+    else:
+        out["source_priority"] = 0.0
+    if "source" in out.columns:
+        out["source_priority"] += out["source"].map(_source_priority)
+    out["_row_completeness"] = out.apply(_row_completeness, axis=1)
 
-    numeric_cols = [
-        c for c in available_numeric_columns(out)
-        if not str(c).startswith("_") and c not in {"duplicate_rows_merged"}
-    ]
-    canonical_cols = [c for c in numeric_cols if not str(c).startswith("raw__")]
-    raw_cols = [c for c in numeric_cols if str(c).startswith("raw__")]
-    canonical_score = out[canonical_cols].notna().sum(axis=1) * 3 if canonical_cols else 0
-    raw_score = out[raw_cols].notna().sum(axis=1) if raw_cols else 0
-    out["_completeness_v53"] = canonical_score + raw_score
+    key_valid = out["_well_key"].ne("") & out["_minute_key"].notna()
+    valid = out.loc[key_valid].copy()
+    invalid = out.loc[~key_valid].copy()
+    merged_rows: List[Dict[str, object]] = []
 
-    valid_key = (
-        out["_well_key_v53"].astype(str).str.len().gt(0)
-        & out["_datetime_key_v53"].notna()
-    )
-    keep_records = []
-    used = set()
-
-    # Only group rows that have a trustworthy well and time. Unknown/NaT rows are
-    # kept separately to avoid accidental cross-well merges.
-    grouped = out.loc[valid_key].groupby(["_well_key_v53", "_datetime_key_v53"], sort=False, dropna=False)
-    for (_, dt_key), group in grouped:
-        idxs = list(group.index)
-        used.update(idxs)
-        if len(idxs) == 1:
-            rec = out.loc[idxs[0]].copy()
-            rec["datetime"] = dt_key
-            keep_records.append(rec)
-            continue
+    for _, group in valid.groupby(["_well_key", "_minute_key"], sort=False, dropna=False):
         ranked = group.sort_values(
-            ["_completeness_v53", "_upload_order", "_table_order", "_source_row_order"],
-            ascending=[False, False, False, False],
-            kind="stable",
+            ["_row_completeness", "source_priority", "_source_order"],
+            ascending=[False, False, False], kind="stable",
         )
-        base = ranked.iloc[0].copy()
-        notes = []
-        for _, row in ranked.iterrows():
-            for c in out.columns:
-                if c in {"_well_key_v53", "_datetime_key_v53", "_completeness_v53"}:
+        base = ranked.iloc[0].to_dict()
+        for _, row in ranked.iloc[1:].iterrows():
+            for col in out.columns:
+                if col in {"_well_key", "_minute_key", "_source_order", "_row_completeness"}:
                     continue
-                val = row.get(c)
-                if c == "note":
-                    if not _missing_value_v53(val):
-                        txt = str(val).strip()
-                        if txt and txt not in notes:
-                            notes.append(txt)
-                    continue
-                if _missing_value_v53(base.get(c)) and not _missing_value_v53(val):
-                    base[c] = val
-        if notes:
-            base["note"] = "; ".join(notes)
-        base["datetime"] = dt_key
-        base["date"] = pd.Timestamp(dt_key).normalize()
-        base["time_text"] = pd.Timestamp(dt_key).strftime("%H:%M")
-        keep_records.append(base)
+                if col == "note":
+                    base[col] = append_note(base.get(col), row.get(col))
+                elif _is_missing(base.get(col)) and not _is_missing(row.get(col)):
+                    base[col] = row.get(col)
+        base["datetime"] = pd.Timestamp(base["_minute_key"])
+        merged_rows.append(base)
 
-    for idx in out.index:
-        if idx not in used:
-            keep_records.append(out.loc[idx].copy())
-
-    if not keep_records:
-        return out.drop(columns=["_well_key_v53", "_datetime_key_v53", "_completeness_v53", "_source_row_order"], errors="ignore")
-    result = pd.DataFrame(keep_records)
-    result = result.sort_values(["well", "datetime", "_upload_order", "_source_row_order"], na_position="last", kind="stable")
-    result = result.drop(columns=["_well_key_v53", "_datetime_key_v53", "_completeness_v53", "_source_row_order"], errors="ignore")
-    return result.reset_index(drop=True)
+    merged = pd.DataFrame(merged_rows)
+    if not invalid.empty:
+        merged = pd.concat([merged, invalid], ignore_index=True, sort=False)
+    merged.drop(columns=["_well_key", "_minute_key", "_source_order", "_row_completeness"], inplace=True, errors="ignore")
+    return _postprocess_table(merged)
 
 
-# Final loader override. Keep the prior v52 loader for normal workbooks and use
-# bounded XML parsing only for suspicious/inflated XLSX files.
-_load_tabular_file_v52_before_v53 = load_tabular_file
-
-def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: int = 1000) -> List[pd.DataFrame]:
-    data, name = _uploaded_bytes_v49(uploaded_file)
-    suffix = str(name).split(".")[-1].lower()
-    if suffix == "xlsx":
-        preflight = xlsx_preflight_v53(data)
-        if preflight.get("suspicious"):
-            tables = _load_suspicious_xlsx_fast_v53(data, name)
-            # XML-only pump rescue is safe even for inflated worksheets. Do not
-            # invoke pandas/openpyxl fallbacks on these files.
-            try:
-                pump_df = _extract_pumping_pressure_from_xlsx_xml_v52(data, name)
-            except Exception:
-                pump_df = pd.DataFrame()
-            tables = force_restore_pumping_pressure_v52(tables, pump_df)
-            return [ensure_pumping_pressure_column_v48(t) for t in tables if t is not None and not t.empty]
-    return _load_tabular_file_v52_before_v53(
-        UploadedBytes(data, name), parse_images=parse_images, max_ocr_images=max_ocr_images
-    )
-
-# v53.1: use the bounded XML reader as the primary path for every XLSX.  This
-# avoids slow openpyxl/pandas behaviour not only for million-row used ranges but
-# also for files with accidental XFC column formatting.  Normal loader remains a
-# fallback only for non-suspicious XLSX files when XML parsing finds no table.
-_load_tabular_file_v53_prefer_xml_previous = load_tabular_file
-
-def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: int = 1000) -> List[pd.DataFrame]:
-    data, name = _uploaded_bytes_v49(uploaded_file)
-    suffix = str(name).split(".")[-1].lower()
-    if suffix == "xlsx":
-        preflight = xlsx_preflight_v53(data)
-        tables = _load_suspicious_xlsx_fast_v53(data, name)
-        try:
-            pump_df = _extract_pumping_pressure_from_xlsx_xml_v52(data, name)
-        except Exception:
-            pump_df = pd.DataFrame()
-        if tables:
-            tables = force_restore_pumping_pressure_v52(tables, pump_df)
-            return [ensure_pumping_pressure_column_v48(t) for t in tables if t is not None and not t.empty]
-        # Never send a suspicious workbook into pandas/openpyxl after the safe
-        # parser fails; returning no table is safer than crashing the whole app.
-        if preflight.get("suspicious"):
-            return []
-    return _load_tabular_file_v53_prefer_xml_previous(
-        UploadedBytes(data, name), parse_images=parse_images, max_ocr_images=max_ocr_images
-    )
-
-# =============================================================================
-# v56 - faster first load + unit-safe choke handling
-# =============================================================================
-
-def _sheet_is_helper_v56(sheet_name: object, raw: pd.DataFrame) -> bool:
-    name = clean_header(sheet_name)
-    helper = bool(re.search(r"\b(form|cover|summary|chart|cmsf|shrinkage|lookup|calculation|calc)\b", name))
-    # Never skip a large sheet only because its title contains a helper word.
-    return helper and (raw is None or raw.shape[0] < 20)
-
-
-def _extract_pumping_pressure_from_raw_v56(raw: pd.DataFrame, name: str, sheet_name: str,
-                                            default_well: str) -> pd.DataFrame:
-    """Extract hidden/far-right Pumping Pressure from an already-read raw sheet.
-
-    v52 re-opened and rescanned the XLSX XML after the main parse. On files with
-    inflated used ranges that doubled the load time. v56 reuses the same raw
-    dataframe, so Pumping Pressure rescue adds only a small header scan.
-    """
-    if raw is None or raw.empty:
-        return pd.DataFrame()
-    scan_rows = min(50, len(raw))
-    candidates = []
-    for r in range(scan_rows):
-        for c in range(raw.shape[1]):
-            val = raw.iat[r, c]
-            if val is None or not re.search(r"pump|pumping|circulation", clean_header(val), flags=re.I):
+def assign_test_ids(df: pd.DataFrame, gap_hours: float = 12.0) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    out["well"] = out.get("well", pd.Series("Unknown", index=out.index)).map(clean_well_name_value)
+    out["datetime"] = parse_datetime_series(out.get("datetime", pd.Series(index=out.index)))
+    assignments: Dict[object, Tuple[str, float]] = {}
+    for well, group in out.sort_values(["well", "datetime"], kind="stable").groupby("well", dropna=False):
+        sequence = 0
+        current_id = ""
+        last_dt = pd.NaT
+        for index, row in group.iterrows():
+            dt = row.get("datetime")
+            if pd.isna(dt):
+                sequence += 1
+                assignments[index] = (f"{well}_NoTime_{sequence}", float(sequence))
                 continue
-            nearby = []
-            for rr in range(max(0, r - 2), min(len(raw), r + 3)):
-                for cc in range(max(0, c - 1), min(raw.shape[1], c + 2)):
-                    nearby.append(str(raw.iat[rr, cc] or ""))
-            if _looks_like_pumping_pressure_header_v51(val, " ".join(nearby)):
-                candidates.append((r, c))
-    if not candidates:
-        return pd.DataFrame()
-
-    well = _clean_merge_well_v51(default_well or _well_from_sheet_or_file_v52(sheet_name, name))
-    rows = []
-    for header_r, c in candidates:
-        for start_r in (header_r + 1, header_r + 2, header_r + 3):
-            if start_r >= len(raw):
-                continue
-            idx = raw.index[start_r:]
-            vals = _to_number_series_v51(pd.Series(raw.iloc[start_r:, c], index=idx))
-            if vals.notna().sum() < 2:
-                continue
-            dt = _date_time_from_raw_v51(raw, idx)
-            dt = pd.to_datetime(dt, errors="coerce")
-            valid = vals.notna() & dt.notna()
-            if valid.sum() < 2:
-                continue
-            for row_idx in vals[valid].index:
-                dtv = pd.Timestamp(dt.loc[row_idx])
-                rows.append({
-                    "source": name,
-                    "sheet": str(sheet_name),
-                    "well": well,
-                    "datetime": dtv,
-                    "date": dtv.normalize(),
-                    "time_text": dtv.strftime("%H:%M"),
-                    "pumping_pressure_psi": float(vals.loc[row_idx]),
-                    "source_type": "excel_raw_reused_pumping_v56",
-                })
-            break
-    if not rows:
-        return pd.DataFrame()
-    out = pd.DataFrame(rows)
-    out["well_key_v51"] = out["well"].map(_clean_merge_well_v51)
-    return out.drop_duplicates(subset=["well_key_v51", "datetime"], keep="last")
+            dt = pd.Timestamp(dt)
+            if not current_id or pd.isna(last_dt) or dt - pd.Timestamp(last_dt) > pd.Timedelta(hours=float(gap_hours)):
+                sequence += 1
+                current_id = f"{well}_{dt:%Y%m%d_%H%M}"
+            assignments[index] = (current_id, float(sequence))
+            last_dt = dt
+    out["test_id"] = ""
+    out["test_sequence"] = np.nan
+    for index, (test_id, sequence) in assignments.items():
+        out.at[index, "test_id"] = test_id
+        out.at[index, "test_sequence"] = sequence
+    return out
 
 
-def _parse_raw_sheet_fast_v56(raw: pd.DataFrame, source_name: str, sheet_name: str,
-                              default_well: str) -> pd.DataFrame:
-    """Use one strong parse for familiar TMU sheets; run all fallbacks only if needed."""
+# ---------------------------------------------------------------------------
+# UI compatibility functions
+# ---------------------------------------------------------------------------
+
+
+def available_numeric_columns(df: pd.DataFrame) -> List[str]:
+    if df is None or df.empty:
+        return []
+    columns: List[str] = []
+    for col in df.columns:
+        if col in BASE_NON_PLOT_COLS or str(col).startswith("_"):
+            continue
+        if col == "gas_rate_status":
+            continue
+        values = pd.to_numeric(df[col], errors="coerce")
+        if values.notna().any():
+            columns.append(col)
+    return columns
+
+
+def column_label(col: object) -> str:
+    key = str(col)
+    if key in COLUMN_LABELS:
+        return COLUMN_LABELS[key]
+    if key.startswith("raw__"):
+        return key[5:].replace("_", " ").title()
     try:
-        primary = standardize_dataframe(
-            table_from_raw(raw), source_name=source_name, sheet_name=sheet_name,
-            default_well=default_well,
-        )
+        return legacy.column_label(col)
     except Exception:
-        primary = pd.DataFrame()
-
-    if primary is not None and not primary.empty and is_valid_timeseries(primary):
-        canonical = [
-            c for c in available_numeric_columns(primary)
-            if not str(c).startswith("raw__")
-        ]
-        valid_dt = pd.to_datetime(primary.get("datetime"), errors="coerce").notna().sum() if "datetime" in primary.columns else 0
-        if len(canonical) >= 4 and valid_dt >= 2:
-            return primary
-
-    candidates = parse_excel_sheet_attempts(
-        raw, source_name=source_name, sheet_name=sheet_name, default_well=default_well
-    )
-    return candidates[0].copy() if candidates else pd.DataFrame()
+        return key.replace("_", " ").title()
 
 
-def _load_xlsx_fast_v56(data: bytes, name: str):
-    tables = []
-    pump_frames = []
+def apply_fill_method(df: pd.DataFrame, features: Iterable[str], method: str) -> pd.DataFrame:
+    return legacy.apply_fill_method(df, features, method)
+
+
+def apply_user_column_mappings(df: pd.DataFrame, mappings: Mapping[str, str]) -> pd.DataFrame:
     try:
-        with _zipfile_v53.ZipFile(io.BytesIO(data)) as zf:
-            shared = _read_shared_strings_fast_v53(zf)
-            for sheet_name, sheet_path in _workbook_sheet_paths_v52(zf):
-                raw = _raw_dataframe_from_sheet_xml_v53(zf, sheet_path, shared)
-                if raw is None or raw.empty or _sheet_is_helper_v56(sheet_name, raw):
-                    continue
-                default_well = extract_well_from_raw(raw, source_name=name, sheet_name=str(sheet_name))
-                pump = _extract_pumping_pressure_from_raw_v56(
-                    raw, name=name, sheet_name=str(sheet_name), default_well=default_well
-                )
-                if pump is not None and not pump.empty:
-                    pump_frames.append(pump)
-                best = _parse_raw_sheet_fast_v56(
-                    raw, source_name=name, sheet_name=str(sheet_name), default_well=default_well
-                )
-                if best is not None and not best.empty:
-                    best = best.copy()
-                    best["source_type"] = "excel_fast_xml_v56"
-                    tables.append(best)
-    except Exception as exc:
-        raise RuntimeError(f"Safe XML parser could not read {name}: {exc}")
-
-    tables = filter_usable_tables(filter_preferred_tables(tables))
-    pump_df = pd.concat(pump_frames, ignore_index=True, sort=False) if pump_frames else pd.DataFrame()
-    if not pump_df.empty:
-        pump_df["datetime"] = pd.to_datetime(pump_df["datetime"], errors="coerce")
-        pump_df["pumping_pressure_psi"] = pd.to_numeric(pump_df["pumping_pressure_psi"], errors="coerce")
-        pump_df = pump_df.dropna(subset=["datetime", "pumping_pressure_psi"])
-        pump_df = pump_df.drop_duplicates(subset=["well_key_v51", "datetime"], keep="last")
-    return tables, pump_df
+        return legacy.apply_user_column_mappings(df, mappings)
+    except Exception:
+        return df
 
 
-_load_tabular_file_v55_final_before_v56 = load_tabular_file
-
-
-def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: int = 1000) -> List[pd.DataFrame]:
-    data, name = _uploaded_bytes_v49(uploaded_file)
-    suffix = str(name).split(".")[-1].lower()
-    if suffix == "xlsx":
-        tables, pump_df = _load_xlsx_fast_v56(data, name)
-        if tables:
-            if pump_df is not None and not pump_df.empty:
-                tables = force_restore_pumping_pressure_v52(tables, pump_df)
-            return [
-                ensure_pumping_pressure_column_v48(t)
-                for t in tables if t is not None and not t.empty
-            ]
-        # Suspicious workbooks must never fall through to a memory-heavy reader.
-        if xlsx_preflight_v53(data).get("suspicious"):
-            return []
-    return _load_tabular_file_v55_final_before_v56(
-        UploadedBytes(data, name), parse_images=parse_images, max_ocr_images=max_ocr_images
-    )
+# Re-export mature OCR/linking helpers used by older integrations.
+for _name in [
+    "suggest_links_for_ocr_rows", "approve_suggested_ocr_links",
+    "parse_ctu_all_data_screen_image", "parse_whatsapp_export_text",
+    "parse_whatsapp_export_messages", "parse_expro_mpfm_text",
+]:
+    if hasattr(legacy, _name) and _name not in globals():
+        globals()[_name] = getattr(legacy, _name)

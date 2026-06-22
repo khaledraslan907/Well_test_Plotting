@@ -1,0 +1,28 @@
+TMU Dashboard v66 regression results
+====================================
+
+PASS — Python compilation:
+- app.py
+- tmu_parser.py
+- tmu_parser_legacy.py
+- whatsapp_webhook_fastapi.py
+
+PASS — representative files:
+- S8-58 hidden Pumping Pressure: 92 rows, 78 pressure readings, 477–1765 psi
+- B3 C18-7 Pumping Pressure: 74 rows, 21 readings, 674–1069 psi
+- Device export: 24 readings, 21-Jun-2026 17:30 to 22-Jun-2026 05:00
+- Edited device export: isolated date defects repaired to the same 24-point sequence
+- B16C6-9 scientific gas notation: 24 readings, about 0.0983–0.1552 MMSCF/D
+- B15-40 complex TMU workbook: 23 readings with operational text excluded
+- Dashboard CSV re-import/date repair: 50 source rows recognized
+- Windows-1252 CSV with degree symbol: parsed successfully
+- Four repeated pasted WhatsApp reports: four independent rows; Low gas retained as status
+- B16C6-9 production + device merge: 24 unique timestamps; production and device values coalesced
+- 17 B15-38 workbooks: 753 source rows loaded without failure; 466 unique well+minute rows after requested duplicate merging; zero duplicate well+minute keys remain
+
+First-load timing in the test container:
+- 17 B15-38 workbooks: approximately 14 seconds total
+- Individual normal workbook: typically below 1 second
+- Malformed workbook with a million-row declared range: several seconds, without memory failure
+
+Note: timings vary by Streamlit server CPU and file size. Parsed results are cached after first load.

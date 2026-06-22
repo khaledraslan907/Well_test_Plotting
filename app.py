@@ -53,7 +53,10 @@ available_numeric_columns = _tmu_parser.available_numeric_columns
 _parser_column_label = _tmu_parser.column_label
 load_tabular_file = _tmu_parser.load_tabular_file
 parse_many_tmu_messages = _tmu_parser.parse_many_tmu_messages
-PARSER_BUILD_ID = getattr(_tmu_parser, 'PARSER_BUILD_ID_V59', getattr(_tmu_parser, 'PARSER_BUILD_ID_V58', getattr(_tmu_parser, 'PARSER_BUILD_ID_V57', getattr(_tmu_parser, 'PARSER_BUILD_ID_V56', getattr(_tmu_parser, 'PARSER_BUILD_ID_V55', getattr(_tmu_parser, 'PARSER_BUILD_ID', 'v59'))))))
+parse_whatsapp_plain_or_export_text = getattr(
+    _tmu_parser, "parse_whatsapp_plain_or_export_text", parse_many_tmu_messages
+)
+PARSER_BUILD_ID = getattr(_tmu_parser, 'PARSER_BUILD_ID_V66', getattr(_tmu_parser, 'PARSER_BUILD_ID_V65', getattr(_tmu_parser, 'PARSER_BUILD_ID_V64', getattr(_tmu_parser, 'PARSER_BUILD_ID_V63', getattr(_tmu_parser, 'PARSER_BUILD_ID_V62', getattr(_tmu_parser, 'PARSER_BUILD_ID_V61', getattr(_tmu_parser, 'PARSER_BUILD_ID_V59', getattr(_tmu_parser, 'PARSER_BUILD_ID_V58', getattr(_tmu_parser, 'PARSER_BUILD_ID', 'v66')))))))))
 assign_test_ids = getattr(_tmu_parser, "assign_test_ids", lambda df, gap_hours=12.0: df)
 
 DISPLAY_LABEL_FILE = Path(__file__).with_name("user_display_labels.json")
@@ -840,7 +843,7 @@ if uploaded_files:
 
 if whatsapp_text.strip():
     try:
-        msg_df = parse_many_tmu_messages(whatsapp_text, source_name="Pasted_WhatsApp_Text")
+        msg_df = parse_whatsapp_plain_or_export_text(whatsapp_text, source_name="Pasted_WhatsApp_Text")
         if not msg_df.empty:
             frames.append(msg_df)
         else:
