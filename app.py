@@ -21,7 +21,7 @@ import streamlit as st
 try:
     import tmu_parser as _tmu_parser
 except Exception as _parser_import_error:
-    st.set_page_config(page_title="TMU Production Test Dashboard", page_icon="📈", layout="wide")
+    st.set_page_config(page_title="TMU Production Intelligence", page_icon="🛢️", layout="wide")
     st.error("Could not import tmu_parser.py. Make sure app.py and tmu_parser.py are in the same folder and were both updated from the same ZIP package.")
     st.code("""
 Required files in the same folder:
@@ -43,7 +43,7 @@ _missing_required = [
     if not hasattr(_tmu_parser, name)
 ]
 if _missing_required:
-    st.set_page_config(page_title="TMU Production Test Dashboard", page_icon="📈", layout="wide")
+    st.set_page_config(page_title="TMU Production Intelligence", page_icon="🛢️", layout="wide")
     st.error("Your tmu_parser.py is older than app.py. Update tmu_parser.py from the latest package.")
     st.code("Missing parser functions: " + ", ".join(_missing_required))
     st.stop()
@@ -56,7 +56,7 @@ parse_many_tmu_messages = _tmu_parser.parse_many_tmu_messages
 parse_whatsapp_plain_or_export_text = getattr(
     _tmu_parser, "parse_whatsapp_plain_or_export_text", parse_many_tmu_messages
 )
-PARSER_BUILD_ID = getattr(_tmu_parser, 'PARSER_BUILD_ID_V66', getattr(_tmu_parser, 'PARSER_BUILD_ID_V65', getattr(_tmu_parser, 'PARSER_BUILD_ID_V64', getattr(_tmu_parser, 'PARSER_BUILD_ID_V63', getattr(_tmu_parser, 'PARSER_BUILD_ID_V62', getattr(_tmu_parser, 'PARSER_BUILD_ID_V61', getattr(_tmu_parser, 'PARSER_BUILD_ID_V59', getattr(_tmu_parser, 'PARSER_BUILD_ID_V58', getattr(_tmu_parser, 'PARSER_BUILD_ID', 'v66')))))))))
+PARSER_BUILD_ID = getattr(_tmu_parser, 'PARSER_BUILD_ID', 'v70')
 assign_test_ids = getattr(_tmu_parser, "assign_test_ids", lambda df, gap_hours=12.0: df)
 
 DISPLAY_LABEL_FILE = Path(__file__).with_name("user_display_labels.json")
@@ -238,51 +238,85 @@ def apply_user_column_mappings(df: pd.DataFrame, mapping: Optional[dict] = None)
 
 
 FEATURE_COLORS = {
-    "gross_rate_bpd": "#1f77b4",
-    "oil_rate_stbd": "#2ca02c",
-    "water_rate_bpd": "#17becf",
-    "whp_psi": "#9467bd",
-    "sep_p_psi": "#8c564b",
-    "flp_psi": "#7f7f7f",
-    "bsw_pct": "#bcbd22",
-    "salinity_kppm": "#d62728",
-    "pumping_pressure_psi": "#ff7f0e",
-    "gas_rate_mmscfd": "#1f9ed4",
-    "gas_formation_mmscfd": "#00b5ad",
-    "choke_pct": "#e377c2",
-    "n2_rate_scfm": "#6f42c1",
-    "h2s_ppm": "#8c1c13",
-    "co2_mole_pct": "#2f4f4f",
-    "water_cum_bbl": "#4daf4a",
-    "oil_api": "#a65628",
-    "gas_sg": "#636363",
-    "ct_pressure_psi": "#ff1493",
-    "ct_depth_m": "#20b2aa",
-    "ct_running_speed_ftmin": "#6495ed",
-    "ct_pipe_weight_lbf": "#708090",
-    "flow_press_psi": "#636efa",
-    "flow_temp_c": "#ef553b",
-    "mpfm_press_psig": "#ab63fa",
-    "mpfm_temp_f": "#ffa15a",
-    "dp_mbar": "#19d3f3",
-    "qoil_s_stbd": "#2ca02c",
-    "qwat_s_bpd": "#17becf",
-    "qgas_s_mmscfd": "#1f9ed4",
-    "qoil_a_bpd": "#00cc96",
-    "qwat_a_bpd": "#00b5ad",
-    "qgas_a_mmcfd": "#1ca9c9",
-    "wlr_s_pct": "#bcbd22",
-    "qgross_s_bpd": "#1f77b4",
-    "gor_s_scf_stb": "#ff6692",
-    "gvf_a_pct": "#b6e880",
-    "choke_size_64": "#e377c2",
-    "choke_ambiguous": "#e377c2",
-    "choke_unified": "#e377c2",
+    # Production rates
+    "gross_rate_bpd": "#607D8B",          # steel grey / total liquid
+    "qgross_s_bpd": "#607D8B",
+    "oil_rate_stbd": "#2E7D32",          # oil green
+    "qoil_s_stbd": "#2E7D32",
+    "qoil_a_bpd": "#43A047",
+    "water_rate_bpd": "#1976D2",         # water blue
+    "qwat_s_bpd": "#1976D2",
+    "qwat_a_bpd": "#42A5F5",
+    "gas_rate_mmscfd": "#00ACC1",        # gas cyan
+    "qgas_s_mmscfd": "#00ACC1",
+    "qgas_a_mmcfd": "#26C6DA",
+    "gas_formation_mmscfd": "#00897B",   # formation gas teal
+    "n2_rate_mmscfd": "#7E57C2",
+    "n2_rate_scfm": "#7E57C2",           # nitrogen violet
+
+    # Surface / pumping pressures
+    "whp_psi": "#C62828",                # wellhead red
+    "flp_psi": "#F9A825",                # flowline amber
+    "flow_press_psi": "#EF6C00",
+    "sep_p_psi": "#F57C00",              # separator orange
+    "pumping_pressure_psi": "#E65100",   # pumping deep orange
+    "pump_intake_pressure_psi": "#D84315",
+    "pump_discharge_pressure_psi": "#8E0000",
+    "pi_psi": "#D84315",
+    "pd_psi": "#8E0000",
+    "ct_pressure_psi": "#AD1457",
+    "mpfm_press_psig": "#8E24AA",
+    "dp_mbar": "#5E35B1",
+
+    # Fluid quality / properties
+    "bsw_pct": "#8E44AD",
+    "wlr_s_pct": "#7B1FA2",
+    "salinity_kppm": "#8D6E63",
+    "oil_api": "#6D4C41",
+    "gas_sg": "#546E7A",
+    "gor_s_scf_stb": "#EC407A",
+    "gvf_a_pct": "#7CB342",
+    "h2s_ppm": "#B71C1C",
+    "co2_mole_pct": "#455A64",
+
+    # Choke / temperatures / device telemetry
+    "choke_pct": "#C49A44",
+    "choke_size_64": "#C49A44",
+    "choke_ambiguous": "#C49A44",
+    "choke_unified": "#C49A44",
+    "flow_temp_c": "#FBC02D",
+    "mpfm_temp_f": "#FFB300",
+    "pump_freq_hz": "#3F6E8A",
+    "motor_current_amp": "#AD1457",
+    "ama_current_amp": "#AD1457",
+    "tm_f": "#F57F17",
+    "ti_f": "#F9A825",
+    "vx": "#5C6BC0",
+    "vy": "#26A69A",
+    "vz": "#AB47BC",
+
+    # CT / cumulative values
+    "oil_cum_bbl": "#558B2F",
+    "water_cum_bbl": "#1565C0",
+    "motor_ama_amp": "#AD1457",
+    "motor_temp_f": "#F57F17",
+    "motor_temp_c": "#F57F17",
+    "ctu_wellhead_pressure_psi": "#C62828",
+    "ctu_circulation_pressure_psi": "#E65100",
+    "ctu_fluid_rate_bpm": "#1976D2",
+    "ctu_n2_rate_scfm": "#7E57C2",
+    "ctu_fluid_total_bbl": "#1565C0",
+    "ctu_n2_total_scf": "#5E35B1",
+    "ctu_reel_depth_ft": "#00897B",
+    "ct_depth_m": "#00897B",
+    "ct_running_speed_ftmin": "#5C6BC0",
+    "ct_pipe_weight_lbf": "#607D8B",
 }
 
 WELL_COLORS = [
-    "#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e",
-    "#17becf", "#8c564b", "#e377c2", "#bcbd22", "#7f7f7f",
+    "#2F6D8A", "#C62828", "#2E7D32", "#7E57C2", "#F57C00",
+    "#00ACC1", "#8D6E63", "#AD1457", "#7CB342", "#546E7A",
+    "#C49A44", "#00897B",
 ]
 
 def feature_color(feature_name: str, fallback_index: int = 0) -> str:
@@ -324,10 +358,98 @@ def chart_title_from_data(df, custom_title: str = "") -> str:
 
 
 st.set_page_config(
-    page_title="TMU Production Test Dashboard",
-    page_icon="📈",
+    page_title="TMU Production Intelligence",
+    page_icon="🛢️",
     layout="wide",
 )
+
+APP_UI_BUILD_ID = "v70-final-ocr-gas-balance-ui-20260624"
+
+UI_THEME_PRESETS = {
+    "Petroleum Dark": {
+        "app_bg": "#0B1219",
+        "app_bg_2": "#111C26",
+        "sidebar_bg": "#101B25",
+        "panel_bg": "#16232E",
+        "panel_bg_2": "#1B2B37",
+        "input_bg": "#1D2E3B",
+        "border": "#304758",
+        "accent": "#2F6D8A",
+        "accent_hover": "#3F86A8",
+        "gold": "#C8A96B",
+        "gold_soft": "#E2C98E",
+        "text": "#E9F0F4",
+        "text_muted": "#A8B8C4",
+        "success": "#4CAF78",
+        "warning": "#F59E0B",
+        "danger": "#E05B55",
+        "chart_paper": "#FFFFFF",
+        "chart_plot": "#F7F9FC",
+        "chart_text": "#17212B",
+        "chart_grid": "#DCE4EA",
+        "chart_grid_soft": "#EAF0F4",
+        "chart_legend": "rgba(255,255,255,0.94)",
+    },
+    "Field Report Light": {
+        "app_bg": "#F3F6F8",
+        "app_bg_2": "#FFFFFF",
+        "sidebar_bg": "#EAF0F4",
+        "panel_bg": "#FFFFFF",
+        "panel_bg_2": "#F7FAFC",
+        "input_bg": "#FFFFFF",
+        "border": "#CBD7E0",
+        "accent": "#285D78",
+        "accent_hover": "#347896",
+        "gold": "#A98036",
+        "gold_soft": "#C8A96B",
+        "text": "#15232E",
+        "text_muted": "#5F7280",
+        "success": "#2E7D5B",
+        "warning": "#C97900",
+        "danger": "#B93A34",
+        "chart_paper": "#FFFFFF",
+        "chart_plot": "#FAFBFC",
+        "chart_text": "#17212B",
+        "chart_grid": "#DCE4EA",
+        "chart_grid_soft": "#EEF2F5",
+        "chart_legend": "rgba(255,255,255,0.96)",
+    },
+    "Night Shift": {
+        "app_bg": "#05090D",
+        "app_bg_2": "#0A1118",
+        "sidebar_bg": "#081018",
+        "panel_bg": "#101B24",
+        "panel_bg_2": "#14222D",
+        "input_bg": "#132531",
+        "border": "#284657",
+        "accent": "#21A6C7",
+        "accent_hover": "#35BEDF",
+        "gold": "#D5AE5A",
+        "gold_soft": "#F0CE80",
+        "text": "#ECF7FA",
+        "text_muted": "#91ABB7",
+        "success": "#3DDC97",
+        "warning": "#FFB020",
+        "danger": "#FF6B62",
+        "chart_paper": "#0D1720",
+        "chart_plot": "#101D27",
+        "chart_text": "#E9F4F8",
+        "chart_grid": "#2B414F",
+        "chart_grid_soft": "#223540",
+        "chart_legend": "rgba(13,23,32,0.94)",
+    },
+}
+
+if "ui_theme" not in st.session_state:
+    st.session_state["ui_theme"] = "Petroleum Dark"
+ACTIVE_THEME_NAME = st.session_state.get("ui_theme", "Petroleum Dark")
+ACTIVE_THEME = UI_THEME_PRESETS.get(ACTIVE_THEME_NAME, UI_THEME_PRESETS["Petroleum Dark"])
+CHART_PAPER_BG = ACTIVE_THEME["chart_paper"]
+CHART_PLOT_BG = ACTIVE_THEME["chart_plot"]
+CHART_TEXT = ACTIVE_THEME["chart_text"]
+CHART_GRID = ACTIVE_THEME["chart_grid"]
+CHART_GRID_SOFT = ACTIVE_THEME["chart_grid_soft"]
+CHART_LEGEND_BG = ACTIVE_THEME["chart_legend"]
 
 MIN_DATE_ALLOWED = pd.Timestamp("1900-01-01").date()
 MAX_DATE_ALLOWED = pd.Timestamp("2100-12-31").date()
@@ -623,83 +745,145 @@ def chart_separator_positions(df):
 
 
 st.markdown(
-    """
+    f"""
     <style>
-    /* Force readable UI text even when browser/app is in dark mode */
-    .stApp {
-        background-color: #ffffff !important;
-        color: #111827 !important;
-    }
-    .block-container {
-        padding-top: 1.2rem;
-        padding-left: 2.2rem;
-        padding-right: 2.2rem;
-        max-width: 100%;
-        background-color: #ffffff !important;
-        color: #111827 !important;
-    }
-    section[data-testid="stSidebar"] {
-        background-color: #f8fafc !important;
-        color: #111827 !important;
-    }
-    section[data-testid="stSidebar"] * {
-        color: #111827 !important;
-    }
-    h1, h2, h3, h4, h5, h6 {
-        color: #0f172a !important;
-        font-weight: 800 !important;
-        letter-spacing: 0.01em;
-    }
-    h1 {
-        font-size: 2.4rem !important;
-    }
-    h2 {
-        font-size: 1.65rem !important;
-    }
-    h3 {
-        font-size: 1.35rem !important;
-    }
-    p, label, span, div, .stMarkdown, .stCaption {
-        color: #111827 !important;
-    }
-    div[data-testid="stMetricValue"] {
-        font-size: 1.85rem !important;
-        font-weight: 850 !important;
-        color: #0f172a !important;
-    }
-    div[data-testid="stMetricLabel"] {
-        font-size: 1.05rem !important;
-        font-weight: 750 !important;
-        color: #334155 !important;
-    }
-    div[data-baseweb="select"] *, div[data-baseweb="input"] *, textarea {
-        color: #111827 !important;
-    }
-    button {
-        font-weight: 700 !important;
-    }
+    :root {{
+        --petro-bg: {ACTIVE_THEME['app_bg']};
+        --petro-bg-2: {ACTIVE_THEME['app_bg_2']};
+        --petro-sidebar: {ACTIVE_THEME['sidebar_bg']};
+        --petro-panel: {ACTIVE_THEME['panel_bg']};
+        --petro-panel-2: {ACTIVE_THEME['panel_bg_2']};
+        --petro-input: {ACTIVE_THEME['input_bg']};
+        --petro-border: {ACTIVE_THEME['border']};
+        --petro-accent: {ACTIVE_THEME['accent']};
+        --petro-accent-hover: {ACTIVE_THEME['accent_hover']};
+        --petro-gold: {ACTIVE_THEME['gold']};
+        --petro-gold-soft: {ACTIVE_THEME['gold_soft']};
+        --petro-text: {ACTIVE_THEME['text']};
+        --petro-muted: {ACTIVE_THEME['text_muted']};
+        --petro-success: {ACTIVE_THEME['success']};
+        --petro-warning: {ACTIVE_THEME['warning']};
+        --petro-danger: {ACTIVE_THEME['danger']};
+    }}
+    html, body, [class*="css"] {{ font-family: Inter, "Segoe UI", Roboto, Arial, sans-serif; }}
+    .stApp {{
+        background: radial-gradient(circle at 88% 2%, color-mix(in srgb, var(--petro-accent) 16%, transparent), transparent 28rem), linear-gradient(145deg, var(--petro-bg) 0%, var(--petro-bg-2) 100%) !important;
+        color: var(--petro-text) !important;
+    }}
+    .block-container {{ padding-top:1.1rem; padding-left:clamp(1rem,2.4vw,2.8rem); padding-right:clamp(1rem,2.4vw,2.8rem); padding-bottom:3rem; max-width:100%; }}
+    section[data-testid="stSidebar"] {{ background:linear-gradient(180deg,color-mix(in srgb,var(--petro-sidebar) 94%,black) 0%,var(--petro-sidebar) 100%) !important; border-right:1px solid var(--petro-border); box-shadow:10px 0 30px rgba(0,0,0,.18); }}
+    section[data-testid="stSidebar"] > div {{ padding-top:.75rem; }}
+    h1,h2,h3,h4,h5,h6,p,label,.stMarkdown,.stCaption {{ color:var(--petro-text) !important; }}
+    h1,h2,h3,h4,h5,h6 {{ letter-spacing:.01em; }}
+    .stCaption, small {{ color:var(--petro-muted) !important; }}
+    .petro-hero {{ position:relative; overflow:hidden; border:1px solid var(--petro-border); border-radius:20px; padding:1.35rem 1.55rem 1.25rem; margin:0 0 1.05rem; background:linear-gradient(120deg,color-mix(in srgb,var(--petro-panel) 96%,black),var(--petro-panel-2)); box-shadow:0 18px 55px rgba(0,0,0,.20); }}
+    .petro-hero::after {{ content:""; position:absolute; width:18rem; height:18rem; right:-6rem; top:-8rem; border:1px solid color-mix(in srgb,var(--petro-gold) 42%,transparent); border-radius:50%; box-shadow:0 0 0 2.1rem color-mix(in srgb,var(--petro-gold) 5%,transparent),0 0 0 4.3rem color-mix(in srgb,var(--petro-accent) 5%,transparent); }}
+    .petro-hero-row {{ display:flex; gap:1rem; align-items:center; position:relative; z-index:2; }}
+    .petro-mark {{ width:3.4rem; height:3.4rem; flex:0 0 3.4rem; border-radius:15px; display:flex; align-items:center; justify-content:center; font-size:1.75rem; background:linear-gradient(145deg,var(--petro-accent),color-mix(in srgb,var(--petro-accent) 60%,black)); border:1px solid color-mix(in srgb,var(--petro-gold) 60%,transparent); box-shadow:0 10px 24px rgba(0,0,0,.28); }}
+    .petro-title {{ margin:0; font-size:clamp(1.65rem,3vw,2.65rem); line-height:1.05; font-weight:850; letter-spacing:-.025em; color:var(--petro-text); }}
+    .petro-subtitle {{ margin-top:.42rem; color:var(--petro-muted); font-size:1rem; }}
+    .petro-pills {{ display:flex; flex-wrap:wrap; gap:.45rem; margin-top:.85rem; position:relative; z-index:2; }}
+    .petro-pill {{ padding:.32rem .62rem; border-radius:999px; border:1px solid var(--petro-border); background:color-mix(in srgb,var(--petro-panel-2) 86%,transparent); color:var(--petro-text); font-size:.78rem; font-weight:700; }}
+    .petro-pill.gold {{ border-color:color-mix(in srgb,var(--petro-gold) 65%,var(--petro-border)); color:var(--petro-gold-soft); }}
+    .petro-section-title {{ margin:1.1rem 0 .65rem; padding:.66rem .85rem; border-left:4px solid var(--petro-gold); border-radius:10px; background:linear-gradient(90deg,color-mix(in srgb,var(--petro-panel) 92%,transparent),transparent); color:var(--petro-text); font-size:1.05rem; font-weight:800; letter-spacing:.015em; }}
+    div[data-testid="stMetric"] {{ min-height:116px; padding:.95rem 1rem .85rem; border-radius:15px; border:1px solid var(--petro-border); border-top:3px solid var(--petro-accent); background:linear-gradient(145deg,var(--petro-panel),var(--petro-panel-2)); box-shadow:0 10px 24px rgba(0,0,0,.16); }}
+    div[data-testid="stMetricValue"] {{ font-size:clamp(1.45rem,2.1vw,2rem) !important; font-weight:850 !important; color:var(--petro-text) !important; }}
+    div[data-testid="stMetricLabel"] {{ font-size:.92rem !important; font-weight:750 !important; color:var(--petro-muted) !important; }}
+    div[data-testid="stExpander"] {{ border:1px solid var(--petro-border) !important; border-radius:13px !important; background:color-mix(in srgb,var(--petro-panel) 92%,transparent) !important; overflow:hidden; box-shadow:0 7px 18px rgba(0,0,0,.10); }}
+    div[data-testid="stExpander"] details summary {{ border-left:3px solid var(--petro-gold); font-weight:760; }}
+    div[data-baseweb="select"] > div,div[data-baseweb="input"] > div,div[data-baseweb="base-input"] > div,textarea,input {{ background-color:var(--petro-input) !important; color:var(--petro-text) !important; border-color:var(--petro-border) !important; border-radius:9px !important; }}
+    div[data-baseweb="select"] *,div[data-baseweb="input"] *,textarea,input {{ color:var(--petro-text) !important; }}
+    div[data-baseweb="popover"],div[role="listbox"],ul[role="listbox"] {{ background:var(--petro-panel-2) !important; color:var(--petro-text) !important; border-color:var(--petro-border) !important; }}
+    li[role="option"],div[role="option"] {{ color:var(--petro-text) !important; }}
+    li[role="option"]:hover,div[role="option"]:hover {{ background:color-mix(in srgb,var(--petro-accent) 22%,var(--petro-panel-2)) !important; }}
+    span[data-baseweb="tag"] {{ background:color-mix(in srgb,var(--petro-accent) 45%,var(--petro-panel-2)) !important; color:#fff !important; }}
+    input:focus,textarea:focus {{ border-color:var(--petro-accent) !important; box-shadow:0 0 0 2px color-mix(in srgb,var(--petro-accent) 28%,transparent) !important; }}
+    div[data-testid="stFileUploaderDropzone"] {{ border:1.5px dashed color-mix(in srgb,var(--petro-accent) 76%,var(--petro-border)) !important; background:color-mix(in srgb,var(--petro-input) 88%,transparent) !important; border-radius:13px !important; }}
+    .stButton > button,.stDownloadButton > button {{ min-height:2.65rem; border-radius:10px !important; border:1px solid color-mix(in srgb,var(--petro-accent) 72%,white 8%) !important; background:linear-gradient(145deg,var(--petro-accent),color-mix(in srgb,var(--petro-accent) 72%,black)) !important; color:#fff !important; font-weight:780 !important; box-shadow:0 8px 20px rgba(0,0,0,.18); transition:transform .14s ease,filter .14s ease; }}
+    .stButton > button:hover,.stDownloadButton > button:hover {{ transform:translateY(-1px); filter:brightness(1.08); }}
+    div[data-testid="stDataFrame"],div[data-testid="stTable"] {{ border-radius:12px; overflow:hidden; border:1px solid var(--petro-border); }}
+    div[data-testid="stAlert"] {{ border-radius:12px; border:1px solid var(--petro-border); }}
+    [data-testid="stTabs"] button {{ color:var(--petro-muted) !important; font-weight:720; }}
+    [data-testid="stTabs"] button[aria-selected="true"] {{ color:var(--petro-gold-soft) !important; border-bottom-color:var(--petro-gold) !important; }}
+    hr {{ border-color:var(--petro-border) !important; }}
+    @media (max-width:900px) {{ .block-container {{ padding-left:.8rem; padding-right:.8rem; }} .petro-hero {{ padding:1.05rem; border-radius:15px; }} .petro-mark {{ width:2.9rem; height:2.9rem; flex-basis:2.9rem; }} div[data-testid="stMetric"] {{ min-height:98px; padding:.75rem; }} }}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-st.title("TMU Production Test Dashboard")
-st.caption(
-    "Upload Excel / CSV / Word / PDF files, WhatsApp exported ZIPs, CTU images, or paste WhatsApp reports. "
-    "Clean data, split tests by well/time gap, compare wells/tests, and export clear production-test plots."
+st.markdown(
+    f"""
+    <div class="petro-hero">
+      <div class="petro-hero-row">
+        <div class="petro-mark">🛢️</div>
+        <div>
+          <div class="petro-title">TMU Production Test Intelligence</div>
+          <div class="petro-subtitle">Field-ready production testing, device telemetry, WhatsApp ingestion, quality control, and engineering reporting.</div>
+        </div>
+      </div>
+      <div class="petro-pills">
+        <span class="petro-pill gold">Petroleum Engineering Workspace</span>
+        <span class="petro-pill">Excel • CSV • PDF • DOCX • ZIP</span>
+        <span class="petro-pill">WhatsApp • CTU/HMI OCR</span>
+        <span class="petro-pill">Parser {PARSER_BUILD_ID}</span>
+        <span class="petro-pill">UI {APP_UI_BUILD_ID}</span>
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
 
-with st.sidebar:
-    st.header("Dashboard controls")
-    st.caption("Open only the section you need.")
+def render_section_title(title: str, subtitle: str = "") -> None:
+    extra = f'<div style="font-size:.82rem;font-weight:500;color:var(--petro-muted);margin-top:.18rem">{subtitle}</div>' if subtitle else ""
+    st.markdown(f'<div class="petro-section-title">{title}{extra}</div>', unsafe_allow_html=True)
 
-with st.sidebar.expander("1. Data input", expanded=True):
-    uploaded_files = st.file_uploader(
-        "Upload one or many files",
-        type=["xlsx", "xls", "csv", "txt", "docx", "pdf", "zip", "jpg", "jpeg", "png"],
-        accept_multiple_files=True,
-        help="Upload normal test files or a WhatsApp exported ZIP. ZIP can contain _chat.txt, Excel/PDF/DOCX/CSV attachments, and CTU screen images.",
+
+with st.sidebar:
+    st.markdown("### 🛢️ Control Center")
+    st.caption("Configure ingestion, engineering units, visualization, and reporting.")
+    st.selectbox(
+        "Interface theme",
+        list(UI_THEME_PRESETS.keys()),
+        key="ui_theme",
+        help="Petroleum Dark is optimized for daily engineering work. Field Report Light is ideal for office reviews. Night Shift uses a dark plotting canvas.",
     )
+    st.caption(f"UI build: {APP_UI_BUILD_ID}")
+
+with st.sidebar.expander("1. Data Sources", expanded=True):
+    st.caption("Bring field data from spreadsheets, reports, exported chats, device files, or images.")
+    uploaded_files = st.file_uploader(
+        "Upload test files, reports, device exports, or WhatsApp ZIPs",
+        type=["xlsx", "xls", "csv", "txt", "docx", "pdf", "zip", "jpg", "jpeg", "png", "webp"],
+        accept_multiple_files=True,
+        help="Upload normal test files or a WhatsApp exported ZIP. Directly uploaded images are OCR-processed automatically; the OCR switch controls images inside ZIP files.",
+        key="general_data_uploader_v70",
+    )
+    uploaded_ocr_images = st.file_uploader(
+        "Upload CTU/HMI screen photos directly",
+        type=["jpg", "jpeg", "png", "webp"],
+        accept_multiple_files=True,
+        help="Use this dedicated uploader for field photos like the CTU ALL DATA screens. The display is rectified, OCR values are extracted, and every field remains editable in the OCR Review before plotting.",
+        key="direct_ctu_image_uploader_v70",
+    )
+    # Combine and deduplicate general files and dedicated OCR images.
+    _combined_uploads = list(uploaded_files or []) + list(uploaded_ocr_images or [])
+    _seen_uploads = set()
+    uploaded_files = []
+    for _upload in _combined_uploads:
+        _identity = (str(getattr(_upload, "name", "")), int(getattr(_upload, "size", 0) or 0), str(getattr(_upload, "file_id", "") or ""))
+        if _identity in _seen_uploads:
+            continue
+        _seen_uploads.add(_identity)
+        uploaded_files.append(_upload)
+    direct_image_preview_map = {}
+    for _upload in uploaded_files:
+        if Path(str(getattr(_upload, "name", ""))).suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
+            try:
+                direct_image_preview_map[str(_upload.name)] = _upload.getvalue()
+            except Exception:
+                pass
+
     whatsapp_text = st.text_area(
         "Or paste one or many TMU WhatsApp messages",
         height=180,
@@ -719,7 +903,8 @@ Salinity = 35K PPM of NaCl
 Pumping P= 849 Psi""",
     )
 
-with st.sidebar.expander("2. Processing options", expanded=False):
+with st.sidebar.expander("2. Ingestion & Processing", expanded=False):
+    st.caption("Control test segmentation, OCR workload, and robust parsing behavior.")
     keep_same_well_one_test = st.checkbox(
         "Keep same well as one test regardless of time gap",
         value=False,
@@ -736,9 +921,9 @@ with st.sidebar.expander("2. Processing options", expanded=False):
     )
     effective_test_gap_hours = 1_000_000.0 if keep_same_well_one_test else float(test_gap_hours)
     enable_ctu_ocr = st.checkbox(
-        "Process CTU/HMI images with OCR",
+        "Process images contained inside WhatsApp ZIPs",
         value=False,
-        help="Turn ON only when you need CTU/HMI screen readings. Keeping OCR off makes large WhatsApp ZIP uploads much faster.",
+        help="Directly uploaded CTU/HMI images are always OCR-processed. Turn this on only when a ZIP also contains screen images; keeping it off makes large ZIP uploads faster.",
     )
     max_ocr_images = st.number_input(
         "CTU/HMI image OCR limit per ZIP (0 = no limit)",
@@ -811,8 +996,11 @@ if uploaded_files:
                         text=f"Reading {upload_order + 1}/{len(uploaded_files)}: {f.name}",
                     )
                 file_bytes = f.getvalue()
+                _suffix = Path(str(f.name)).suffix.lower()
+                _is_direct_image = _suffix in {".jpg", ".jpeg", ".png", ".webp"}
+                _parse_images_for_file = bool(enable_ctu_ocr) or _is_direct_image
                 parsed_tables = cached_load_uploaded_file(
-                    f.name, file_bytes, bool(enable_ctu_ocr), int(max_ocr_images), PARSER_BUILD_ID
+                    f.name, file_bytes, _parse_images_for_file, int(max_ocr_images), PARSER_BUILD_ID
                 )
                 if parsed_tables:
                     for table_order, table in enumerate(parsed_tables):
@@ -855,7 +1043,7 @@ if errors:
     st.warning("Some files/messages were skipped or could not be parsed:\n\n" + "\n".join(f"- {e}" for e in errors))
 
 if not frames:
-    st.info("Upload files or paste a WhatsApp TMU message to start.")
+    st.info("Start by uploading field files or pasting one or more WhatsApp TMU reports in the Data Sources panel.")
     st.stop()
 
 # Concatenation and duplicate merging are cached in session state as well as
@@ -891,6 +1079,30 @@ else:
 if rows_merged:
     st.caption(f"Merged {rows_merged:,} repeated row(s) with the same well and date/time, keeping the most complete values.")
 
+# Parser-level quality review. Impossible physical values are excluded from
+# plotted canonical columns but retained in Rejected Values for audit.
+_quality_mask = pd.Series(False, index=data.index)
+if "review_required" in data.columns:
+    _quality_mask |= data["review_required"].fillna(False).astype(bool)
+if "data_quality_note" in data.columns:
+    _quality_mask |= data["data_quality_note"].fillna("").astype(str).str.strip().ne("")
+if _quality_mask.any():
+    with st.expander(f"⚠️ Data Quality Review ({int(_quality_mask.sum()):,} row(s))", expanded=False):
+        _quality_columns = [
+            "source", "sheet", "source_row", "well", "datetime",
+            "data_quality_note", "rejected_values", "note",
+        ]
+        _quality_columns = [column for column in _quality_columns if column in data.columns]
+        _quality_data = data.loc[_quality_mask, _quality_columns].copy()
+        st.dataframe(_quality_data, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download quality review CSV",
+            data=_quality_data.to_csv(index=False).encode("utf-8-sig"),
+            file_name="tmu_data_quality_review.csv",
+            mime="text/csv",
+            key="download_data_quality_review_v69",
+        )
+
 # Raw choke source columns are preserved. A user-selectable unified curve is
 # created later, after the safe parsing/mapping steps, so changing the display
 # unit never changes the original uploaded values.
@@ -920,18 +1132,42 @@ except Exception:
 
 ocr_mask = data.get("source_type", pd.Series([], dtype=str)).astype(str).str.contains("ocr", case=False, na=False) if "source_type" in data.columns else pd.Series([False] * len(data), index=data.index)
 if ocr_mask.any():
-    with st.expander("CTU / HMI image OCR review", expanded=True):
-        ocr_cols = [
-            "image_file", "datetime", "well", "test_id", "link_status",
-            "ocr_fields_found", "ocr_confidence",
+    with st.expander("CTU / HMI OCR Review & Approval", expanded=True):
+        st.markdown(
+            "Review OCR values before engineering use. Low-confidence fields remain editable, "
+            "and OCR rows are excluded from confirmed status until you approve them."
+        )
+
+        ocr_numeric_cols = [
             "ctu_weight_lbf", "ctu_lt_weight_lbf", "ctu_wellhead_pressure_psi",
             "ctu_circulation_pressure_psi", "ctu_reel_depth_ft", "ctu_reel_speed_ftmin",
             "ctu_fluid_rate_bpm", "ctu_n2_rate_scfm", "ctu_fluid_total_bbl", "ctu_n2_total_scf",
-            "caption_text",
         ]
-        ocr_cols = [c for c in ocr_cols if c in data.columns]
+        ocr_meta_cols = [
+            "image_file", "datetime", "well", "test_id", "link_status",
+            "ocr_fields_found", "ocr_confidence", "screen_rectified",
+            "screen_detection_score", "ocr_low_confidence_fields", "caption_text",
+        ]
+        ocr_cols = [c for c in ocr_meta_cols + ocr_numeric_cols if c in data.columns]
         review_df = data.loc[ocr_mask, ocr_cols].copy()
         review_df.insert(0, "row_id", review_df.index.astype(int))
+        review_df.insert(1, "Approve OCR", False)
+
+        # Preview directly uploaded field photos. ZIP-contained images still appear
+        # by filename and can be reviewed after extraction outside the application.
+        preview_names = [
+            str(name) for name in review_df.get("image_file", pd.Series(dtype=str)).dropna().astype(str).unique()
+            if str(name) in direct_image_preview_map
+        ]
+        if preview_names:
+            selected_preview = st.selectbox(
+                "Image preview", preview_names, key="ocr_image_preview_v70"
+            )
+            st.image(
+                direct_image_preview_map[selected_preview],
+                caption=f"OCR source: {selected_preview}",
+                use_container_width=True,
+            )
 
         confirmed_test_options = []
         if "test_id" in data.columns:
@@ -948,31 +1184,61 @@ if ocr_mask.any():
 
         column_config = {
             "row_id": st.column_config.NumberColumn("Row", disabled=True),
+            "Approve OCR": st.column_config.CheckboxColumn(
+                "Approve OCR", help="Approve only after checking the image and all extracted fields."
+            ),
+            "ocr_confidence": st.column_config.ProgressColumn(
+                "Overall confidence", min_value=0.0, max_value=1.0, format="%.0f%%"
+            ),
         }
         if well_options:
             column_config["well"] = st.column_config.SelectboxColumn("Well", options=well_options)
         if confirmed_test_options:
-            column_config["test_id"] = st.column_config.SelectboxColumn("Test ID", options=["Unlinked_OCR_or_Unknown_Well"] + confirmed_test_options)
+            column_config["test_id"] = st.column_config.SelectboxColumn(
+                "Test ID", options=["Unlinked_OCR_or_Unknown_Well"] + confirmed_test_options
+            )
+        for col in ocr_numeric_cols:
+            if col in review_df.columns:
+                column_config[col] = st.column_config.NumberColumn(
+                    column_label(col), format="%.3f"
+                )
 
+        editable_columns = {"Approve OCR", "datetime", "well", "test_id", *ocr_numeric_cols}
         edited_review = st.data_editor(
             review_df,
             use_container_width=True,
-            height=260,
-            key="ctu_ocr_review_editor",
+            height=min(520, 150 + 42 * max(1, len(review_df))),
+            key="ctu_ocr_review_editor_v70",
             column_config=column_config,
-            disabled=[c for c in review_df.columns if c not in {"well", "test_id"}],
+            disabled=[c for c in review_df.columns if c not in editable_columns],
         )
+
         for _, erow in edited_review.iterrows():
             rid = int(erow.get("row_id"))
-            if rid in data.index:
-                for col in ["well", "test_id"]:
-                    if col in edited_review.columns and col in data.columns:
-                        data.at[rid, col] = erow.get(col)
-                well_ok = str(data.at[rid, "well"]).strip().lower() not in ["", "unknown", "nan"] if "well" in data.columns else False
-                tid_ok = str(data.at[rid, "test_id"]).strip() and not str(data.at[rid, "test_id"]).startswith("Unlinked") if "test_id" in data.columns else False
-                if well_ok and tid_ok:
-                    data.at[rid, "link_status"] = "ocr_manual_reviewed"
-                    data.at[rid, "review_required"] = False
+            if rid not in data.index:
+                continue
+            for col in ["datetime", "well", "test_id", *ocr_numeric_cols]:
+                if col in edited_review.columns and col in data.columns:
+                    data.at[rid, col] = erow.get(col)
+            approved = bool(erow.get("Approve OCR", False))
+            well_ok = str(data.at[rid, "well"]).strip().lower() not in ["", "unknown", "nan"] if "well" in data.columns else False
+            if approved:
+                data.at[rid, "link_status"] = "ocr_manually_verified"
+                data.at[rid, "review_required"] = not well_ok
+                data.at[rid, "ocr_status"] = "manually_verified"
+                if "data_quality_note" in data.columns:
+                    _existing_note = str(data.at[rid, "data_quality_note"] or "").strip(" ;")
+                    data.at[rid, "data_quality_note"] = (
+                        f"{_existing_note}; OCR values manually verified" if _existing_note
+                        else "OCR values manually verified"
+                    )
+
+        unapproved = ocr_mask & data.get("review_required", pd.Series(True, index=data.index)).fillna(True).astype(bool)
+        if unapproved.any():
+            st.info(
+                f"{int(unapproved.sum())} OCR row(s) still require review. They remain visible for editing "
+                "but are clearly flagged in Data Quality Review."
+            )
 
 
 
@@ -1358,8 +1624,9 @@ def convert_intervals_for_plot(operation_intervals, df, x_axis_mode):
 # ---------------------------------------------------------------------------
 # Display-unit conversion (v58)
 # ---------------------------------------------------------------------------
-units_sidebar_section = st.sidebar.expander("3. Units and choke", expanded=False)
+units_sidebar_section = st.sidebar.expander("3. Engineering Units & Choke", expanded=False)
 with units_sidebar_section:
+    st.caption("Choose reporting units and interpret choke opening versus choke size.")
     pressure_display_unit = st.selectbox(
         "Pressure unit", ["psi", "bar"], index=0, key="pressure_display_unit_v58",
         help="Changes plot/table display only. Uploaded source values remain unchanged.",
@@ -1619,7 +1886,8 @@ with st.expander("Detected columns from uploaded files", expanded=False):
         )
 
 # Sidebar filters
-with st.sidebar.expander("4. Time and timeline", expanded=False):
+with st.sidebar.expander("4. Timeline & Test Segmentation", expanded=False):
+    st.caption("Configure calendar time, elapsed time, compressed gaps, and reporting ranges.")
     time_filter_mode = st.selectbox(
         "Time range control",
         ["Slider", "Manual calendar/time"],
@@ -1694,7 +1962,8 @@ with st.sidebar.expander("4. Time and timeline", expanded=False):
     trace_grouping = "Auto"
 
 
-with st.sidebar.expander("5. Wells and features", expanded=True):
+with st.sidebar.expander("5. Well & Signal Selection", expanded=True):
+    st.caption("Select the wells, test streams, and measured parameters to review.")
 
     # Prefer recent wells/tests with actual numeric readings, not alphabetical chat history.
     def _has_any_plot_numeric(_df):
@@ -1796,7 +2065,8 @@ with st.sidebar.expander("5. Wells and features", expanded=True):
         key=f"chart_header_{abs(hash(data_title_signature))}_{len(data)}",
     )
 
-with st.sidebar.expander("6. Chart appearance", expanded=False):
+with st.sidebar.expander("6. Visualization Studio", expanded=False):
+    st.caption("Semantic colors are fixed by engineering meaning: oil green, water blue, gas cyan, pressure red/orange, choke gold, and quality properties purple/brown.")
     custom_y_ranges = {}
     with st.expander("Y-axis scale per graph", expanded=False):
         use_custom_y_scale = st.checkbox(
@@ -1978,7 +2248,8 @@ with st.sidebar.expander("6. Chart appearance", expanded=False):
 
     show_internal_names = False
 
-with st.sidebar.expander("7. Events and notes", expanded=False):
+with st.sidebar.expander("7. Operations & Events", expanded=False):
+    st.caption("Add field events, operational intervals, and report annotations.")
 
     auto_hide_crowded_notes = st.checkbox(
         "Auto hide some notes when too crowded",
@@ -2303,13 +2574,19 @@ for i in st.session_state.get("operation_intervals_table", []):
 
 plot_intervals = convert_intervals_for_plot(operation_intervals, filtered, x_axis_mode)
 
-# Header KPIs
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Detected rows", f"{len(data):,}")
-c2.metric("Filtered rows", f"{len(filtered):,}")
+# Engineering snapshot KPIs
+render_section_title(
+    "Engineering Snapshot",
+    "Live summary of the parsed dataset and the rows currently feeding the visualization.",
+)
+quality_count = int(_quality_mask.sum()) if "_quality_mask" in globals() else 0
+c1, c2, c3, c4, c5, c6 = st.columns(6)
+c1.metric("Detected readings", f"{len(data):,}")
+c2.metric("Active readings", f"{len(filtered):,}")
 c3.metric("Wells", f"{data['well'].nunique() if 'well' in data.columns else 0:,}")
-c4.metric("Tests", f"{data['test_id'].nunique() if 'test_id' in data.columns else 0:,}")
-c5.metric("Numeric features", f"{len(numeric_cols):,}")
+c4.metric("Test periods", f"{data['test_id'].nunique() if 'test_id' in data.columns else 0:,}")
+c5.metric("Signals", f"{len(numeric_cols):,}")
+c6.metric("Quality alerts", f"{quality_count:,}")
 
 with st.expander("Detected data preview", expanded=False):
     st.caption("Detected data = cleaned rows pulled from uploads before your well/time/feature filters.")
@@ -2321,7 +2598,10 @@ with st.expander("Detected data preview", expanded=False):
     st.dataframe(display_detected, use_container_width=True, height=260)
 
 if selected_features and not filtered.empty:
-    st.subheader("Interactive plot")
+    render_section_title(
+        "Production Test Visualization",
+        "Interactive engineering charts using the selected wells, test periods, signals, units, and event annotations.",
+    )
     series_count_for_hint = filtered["series_label"].dropna().astype(str).nunique() if "series_label" in filtered.columns else 1
     if x_axis_mode == "Real calendar time":
         axis_tick_settings = x_axis_tick_kwargs(x_axis_scale)
@@ -2530,7 +2810,7 @@ if selected_features and not filtered.empty:
                     showarrow=False,
                     xanchor="center",
                     yanchor="bottom",
-                    bgcolor="rgba(255,255,255,0.98)",
+                    bgcolor=CHART_LEGEND_BG,
                     bordercolor=note_col,
                     borderwidth=1.4,
                     font=dict(size=interval_font_size, color=note_col),
@@ -2587,7 +2867,7 @@ if selected_features and not filtered.empty:
                     yanchor="bottom",
                     textangle=text_angle,
                     font=dict(size=event_font_size, color=note_col),
-                    bgcolor="rgba(255,255,255,0.98)",
+                    bgcolor=CHART_LEGEND_BG,
                     bordercolor=note_col,
                     borderwidth=1.4,
                 )
@@ -2834,7 +3114,7 @@ if selected_features and not filtered.empty:
                                 mode=line_mode + ("+text" if value_label_mode != "Off" else ""),
                                 text=text,
                                 textposition=textposition,
-                                textfont=dict(size=10 if chart_view_mode == "Mobile-friendly" else 12, color=color, family="Arial, sans-serif"),
+                                textfont=dict(size=10 if chart_view_mode == "Mobile-friendly" else 12, color=color, family="Segoe UI, Arial, sans-serif"),
                                 cliponaxis=False,
                                 name=trace_name,
                                 legendgroup=trace_name,
@@ -2849,23 +3129,23 @@ if selected_features and not filtered.empty:
             fig.update_layout(
                 height=850 if chart_view_mode != "Mobile-friendly" else 680,
                 width=None if chart_view_mode == "Mobile-friendly" else 1700,
-                title=dict(text=chart_title_from_data(df, custom_chart_title), font=dict(size=28, color="#0f172a", family="Arial Black, Arial, sans-serif")),
+                title=dict(text=chart_title_from_data(df, custom_chart_title), font=dict(size=28, color=CHART_TEXT, family="Segoe UI Semibold, Arial, sans-serif")),
                 xaxis_title=x_axis_title,
                 hovermode="x unified",
                 margin=dict(l=85, r=90, t=185, b=80),
-                plot_bgcolor="white",
-                paper_bgcolor="white",
-                font=dict(color="#111827", size=15),
-                legend=dict(font=dict(size=15, color="#111827"), bgcolor="rgba(255,255,255,0.90)", bordercolor="#e5e7eb", borderwidth=1),
+                plot_bgcolor=CHART_PLOT_BG,
+                paper_bgcolor=CHART_PAPER_BG,
+                font=dict(color=CHART_TEXT, size=15),
+                legend=dict(font=dict(size=15, color=CHART_TEXT), bgcolor=CHART_LEGEND_BG, bordercolor=CHART_GRID, borderwidth=1),
                 title_x=0.5,
                 title_xanchor="center",
             )
-            fig.update_xaxes(showgrid=True, gridcolor="#dddddd", zeroline=False, tickfont=dict(size=14, color="#111827"), **axis_tick_settings)
+            fig.update_xaxes(showgrid=True, gridcolor=CHART_GRID, zeroline=False, tickfont=dict(size=14, color=CHART_TEXT), **axis_tick_settings)
             fig.update_yaxes(
                 title_text=column_label(left_feature),
                 secondary_y=False,
                 showgrid=True,
-                gridcolor="#eeeeee",
+                gridcolor=CHART_GRID_SOFT,
                 zeroline=False,
                 range=custom_y_ranges.get(left_feature),
             )
@@ -2917,7 +3197,7 @@ if selected_features and not filtered.empty:
                                 mode=line_mode + ("+text" if value_label_mode != "Off" else ""),
                                 text=text,
                                 textposition=textposition,
-                                textfont=dict(size=10 if chart_view_mode == "Mobile-friendly" else 12, color=color, family="Arial, sans-serif"),
+                                textfont=dict(size=10 if chart_view_mode == "Mobile-friendly" else 12, color=color, family="Segoe UI, Arial, sans-serif"),
                                 cliponaxis=False,
                                 name=f"{series_label}",
                                 legendgroup=str(series_label),
@@ -2945,18 +3225,18 @@ if selected_features and not filtered.empty:
             panel_height = 330 if mobile_view else (440 if wide_view else 380)
             layout_kwargs = dict(
                 height=max(620, panel_height * len(features)),
-                title=dict(text=chart_title_from_data(df, custom_chart_title), font=dict(size=26 if mobile_view else 30, color="#0f172a", family="Arial Black, Arial, sans-serif")),
+                title=dict(text=chart_title_from_data(df, custom_chart_title), font=dict(size=26 if mobile_view else 30, color=CHART_TEXT, family="Segoe UI Semibold, Arial, sans-serif")),
                 hovermode="x unified",
                 margin=dict(l=85, r=50, t=185, b=80),
                 uniformtext_minsize=8,
                 uniformtext_mode="hide",
-                plot_bgcolor="white",
-                paper_bgcolor="white",
-                font=dict(color="#111827", size=15),
+                plot_bgcolor=CHART_PLOT_BG,
+                paper_bgcolor=CHART_PAPER_BG,
+                font=dict(color=CHART_TEXT, size=15),
                 legend=dict(
-                    font=dict(size=17, color="#111827"),
-                    bgcolor="rgba(255,255,255,0.90)",
-                    bordercolor="#e5e7eb",
+                    font=dict(size=17, color=CHART_TEXT),
+                    bgcolor=CHART_LEGEND_BG,
+                    bordercolor=CHART_GRID,
                     borderwidth=1.4,
                 ),
                 showlegend=show_chart_legend,
@@ -2972,9 +3252,9 @@ if selected_features and not filtered.empty:
                     y=1.02,
                     xanchor="left",
                     x=0,
-                    font=dict(size=12, color="#111827"),
-                    bgcolor="rgba(255,255,255,0.90)",
-                    bordercolor="#e5e7eb",
+                    font=dict(size=12, color=CHART_TEXT),
+                    bgcolor=CHART_LEGEND_BG,
+                    bordercolor=CHART_GRID,
                     borderwidth=1.4,
                 )
             fig.update_layout(**layout_kwargs)
@@ -2984,12 +3264,12 @@ if selected_features and not filtered.empty:
                     row=r,
                     col=1,
                     showgrid=True,
-                    gridcolor="#dddddd",
+                    gridcolor=CHART_GRID,
                     zeroline=False,
                     showticklabels=True,
-                    tickfont=dict(size=11 if chart_view_mode == "Mobile-friendly" else 15, color="#111827"),
+                    tickfont=dict(size=11 if chart_view_mode == "Mobile-friendly" else 15, color=CHART_TEXT),
                     title_text=x_axis_title if r == len(features) else "",
-                    title_font=dict(size=16 if chart_view_mode == "Mobile-friendly" else 20, color="#111827"),
+                    title_font=dict(size=16 if chart_view_mode == "Mobile-friendly" else 20, color=CHART_TEXT),
                     automargin=True,
                     **axis_tick_settings,
                 )
@@ -2997,16 +3277,16 @@ if selected_features and not filtered.empty:
                     row=r,
                     col=1,
                     showgrid=True,
-                    gridcolor="#eeeeee",
+                    gridcolor=CHART_GRID_SOFT,
                     zeroline=False,
-                    title_font=dict(size=14 if chart_view_mode == "Mobile-friendly" else 17, color="#111827"),
-                    tickfont=dict(size=11 if chart_view_mode == "Mobile-friendly" else 14, color="#111827"),
+                    title_font=dict(size=14 if chart_view_mode == "Mobile-friendly" else 17, color=CHART_TEXT),
+                    tickfont=dict(size=11 if chart_view_mode == "Mobile-friendly" else 14, color=CHART_TEXT),
                     automargin=True,
                 )
 
             # Subplot titles are stored as annotations.
             for annotation in fig.layout.annotations:
-                annotation.font = dict(size=21, color="#111827")
+                annotation.font = dict(size=21, color=CHART_TEXT)
             fig = add_manual_events_to_plotly(fig, features)
             return fig
 
@@ -3041,18 +3321,18 @@ if selected_features and not filtered.empty:
         fig.update_layout(
             height=850,
             width=1700,
-            title=dict(text=chart_title_from_data(df, custom_chart_title), font=dict(size=30, color="#0f172a", family="Arial Black, Arial, sans-serif")),
+            title=dict(text=chart_title_from_data(df, custom_chart_title), font=dict(size=30, color=CHART_TEXT, family="Segoe UI Semibold, Arial, sans-serif")),
             yaxis_title=y_title,
             xaxis_title=x_axis_title,
             hovermode="x unified",
             margin=dict(l=85, r=50, t=185, b=80),
-            plot_bgcolor="white",
-            paper_bgcolor="white",
-            font=dict(color="#111827", size=15),
+            plot_bgcolor=CHART_PLOT_BG,
+            paper_bgcolor=CHART_PAPER_BG,
+            font=dict(color=CHART_TEXT, size=15),
             legend=dict(
-                font=dict(size=17, color="#111827"),
-                bgcolor="rgba(255,255,255,0.90)",
-                bordercolor="#e5e7eb",
+                font=dict(size=17, color=CHART_TEXT),
+                bgcolor=CHART_LEGEND_BG,
+                bordercolor=CHART_GRID,
                 borderwidth=1.4,
             ),
             title_x=0.5,
@@ -3060,22 +3340,22 @@ if selected_features and not filtered.empty:
         )
         fig.update_xaxes(
             showgrid=True,
-            gridcolor="#dddddd",
+            gridcolor=CHART_GRID,
             zeroline=False,
-            title_font=dict(size=20, color="#111827"),
-            tickfont=dict(size=15, color="#374151"),
+            title_font=dict(size=20, color=CHART_TEXT),
+            tickfont=dict(size=15, color=CHART_TEXT),
             **axis_tick_settings,
         )
         fig.update_yaxes(
             showgrid=True,
-            gridcolor="#eeeeee",
+            gridcolor=CHART_GRID_SOFT,
             zeroline=False,
-            title_font=dict(size=20, color="#111827"),
-            tickfont=dict(size=15, color="#374151"),
+            title_font=dict(size=20, color=CHART_TEXT),
+            tickfont=dict(size=15, color=CHART_TEXT),
         )
         if manual_events:
             for event in manual_events:
-                fig.add_vline(x=event["datetime"], line_dash="dash", line_color="#111827", line_width=2, opacity=0.75)
+                fig.add_vline(x=event["datetime"], line_dash="dash", line_color=CHART_TEXT, line_width=2, opacity=0.75)
                 fig.add_annotation(
                     x=event["datetime"],
                     y=1,
@@ -3085,9 +3365,9 @@ if selected_features and not filtered.empty:
                     showarrow=False,
                     xanchor="left",
                     yanchor="top",
-                    font=dict(size=13, color="#111827"),
-                    bgcolor="rgba(255,255,255,0.85)",
-                    bordercolor="#111827",
+                    font=dict(size=13, color=CHART_TEXT),
+                    bgcolor=CHART_LEGEND_BG,
+                    bordercolor=CHART_TEXT,
                     borderwidth=1.4,
                 )
         return fig
@@ -3125,7 +3405,7 @@ if selected_features and not filtered.empty:
                             mode=line_mode + ("+text" if value_label_mode != "Off" else ""),
                             text=text,
                             textposition=textposition,
-                            textfont=dict(size=9 if chart_view_mode == "Mobile-friendly" else 11, color=color, family="Arial, sans-serif"),
+                            textfont=dict(size=9 if chart_view_mode == "Mobile-friendly" else 11, color=color, family="Segoe UI, Arial, sans-serif"),
                             cliponaxis=False,
                             name=trace_name,
                             legendgroup=trace_name,
@@ -3141,23 +3421,23 @@ if selected_features and not filtered.empty:
         fig.update_layout(
             height=820 if chart_view_mode != "Mobile-friendly" else 640,
             width=None if chart_view_mode == "Mobile-friendly" else 1700,
-            title=dict(text=chart_title_from_data(df, custom_chart_title) + suffix, font=dict(size=26, color="#0f172a", family="Arial Black, Arial, sans-serif")),
+            title=dict(text=chart_title_from_data(df, custom_chart_title) + suffix, font=dict(size=26, color=CHART_TEXT, family="Segoe UI Semibold, Arial, sans-serif")),
             xaxis_title=x_axis_title,
             hovermode="x unified",
             margin=dict(l=85, r=95, t=185, b=80),
-            plot_bgcolor="white",
-            paper_bgcolor="white",
-            font=dict(color="#111827", size=15),
-            legend=dict(font=dict(size=13, color="#111827"), bgcolor="rgba(255,255,255,0.90)", bordercolor="#e5e7eb", borderwidth=1),
+            plot_bgcolor=CHART_PLOT_BG,
+            paper_bgcolor=CHART_PAPER_BG,
+            font=dict(color=CHART_TEXT, size=15),
+            legend=dict(font=dict(size=13, color=CHART_TEXT), bgcolor=CHART_LEGEND_BG, bordercolor=CHART_GRID, borderwidth=1),
             title_x=0.5,
             title_xanchor="center",
         )
-        fig.update_xaxes(showgrid=True, gridcolor="#dddddd", zeroline=False, tickfont=dict(size=13, color="#111827"), **axis_tick_settings)
+        fig.update_xaxes(showgrid=True, gridcolor=CHART_GRID, zeroline=False, tickfont=dict(size=13, color=CHART_TEXT), **axis_tick_settings)
         fig.update_yaxes(
             title_text=" / ".join(column_label(f) for f in left_features[:3]),
             secondary_y=False,
             showgrid=True,
-            gridcolor="#eeeeee",
+            gridcolor=CHART_GRID_SOFT,
             zeroline=False,
         )
         fig.update_yaxes(
@@ -3198,7 +3478,7 @@ if selected_features and not filtered.empty:
             display_filtered = display_filtered.rename(columns={c: column_label(c) for c in display_filtered.columns})
         st.dataframe(display_filtered, use_container_width=True, height=280)
 
-    st.subheader("Chart downloads")
+    render_section_title("Engineering Report Exports", "Prepare publication-ready PNG, PDF, and filtered-data outputs using the active chart configuration.")
     st.caption("Exports are generated only when you press a prepare button. This prevents Streamlit Cloud from crashing when charts are large.")
 
     def chart_label_indices_for_export(g, feature):
@@ -3218,6 +3498,39 @@ if selected_features and not filtered.empty:
                 idxs.update({0, n - 1})
         return {i for i in idxs if 0 <= i < n}
 
+    def apply_matplotlib_petro_style(fig_obj, ax_obj=None):
+        """Apply the active engineering theme to PNG/PDF exports."""
+        fig_obj.patch.set_facecolor(CHART_PAPER_BG)
+        if ax_obj is None:
+            axes = list(getattr(fig_obj, "axes", []))
+        elif isinstance(ax_obj, (list, tuple, np.ndarray)):
+            axes = list(np.asarray(ax_obj).ravel())
+        else:
+            axes = [ax_obj]
+        for axis in axes:
+            try:
+                axis.set_facecolor(CHART_PLOT_BG)
+                axis.grid(True, color=CHART_GRID, linewidth=0.75, alpha=0.75)
+                axis.tick_params(axis="both", colors=CHART_TEXT, labelcolor=CHART_TEXT)
+                axis.xaxis.label.set_color(CHART_TEXT)
+                axis.yaxis.label.set_color(CHART_TEXT)
+                axis.title.set_color(CHART_TEXT)
+                for spine in axis.spines.values():
+                    spine.set_color(CHART_GRID)
+                legend = axis.get_legend()
+                if legend is not None:
+                    legend.get_frame().set_facecolor(CHART_PAPER_BG)
+                    legend.get_frame().set_edgecolor(CHART_GRID)
+                    for legend_text in legend.get_texts():
+                        legend_text.set_color(CHART_TEXT)
+            except Exception:
+                pass
+        for figure_text in getattr(fig_obj, "texts", []):
+            try:
+                figure_text.set_color(CHART_TEXT)
+            except Exception:
+                pass
+
     def human_readable_pdf_bytes(df, features):
         """Create a multi-page PDF: one large chart per feature, suitable for human reading/printing."""
         import matplotlib.pyplot as plt
@@ -3232,6 +3545,7 @@ if selected_features and not filtered.empty:
         with PdfPages(output) as pdf:
             for feature in features:
                 fig_m, ax = plt.subplots(figsize=(18.5, 11.0), dpi=180)
+                apply_matplotlib_petro_style(fig_m, ax)
                 title = f"{chart_title_from_data(df, custom_chart_title)}\n{column_label(feature)}"
                 ax.set_title(title, fontsize=22, fontweight="bold", pad=18)
 
@@ -3325,6 +3639,7 @@ if selected_features and not filtered.empty:
                 if len(series_values) > 1:
                     ax.legend(fontsize=12, loc="best")
 
+                apply_matplotlib_petro_style(fig_m, ax)
                 fig_m.tight_layout(rect=[0.02, 0.02, 0.98, 0.94])
                 pdf.savefig(fig_m)
                 plt.close(fig_m)
@@ -3345,6 +3660,7 @@ if selected_features and not filtered.empty:
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
             for feature in features:
                 fig_m, ax = plt.subplots(figsize=(17.5, 9.8), dpi=190)
+                apply_matplotlib_petro_style(fig_m, ax)
                 ax.set_title(f"{chart_title_from_data(df, custom_chart_title)}\n{column_label(feature)}", fontsize=24, fontweight="bold", pad=18)
 
                 for wi, series_label in enumerate(series_values):
@@ -3423,13 +3739,13 @@ if selected_features and not filtered.empty:
                             fontweight="bold",
                             ha="center",
                             va="center",
-                            color="#111827",
+                            color=CHART_TEXT,
                             bbox=dict(boxstyle="round,pad=0.22", fc="white", ec="#92400e", alpha=0.95),
                         )
 
                 if plot_events:
                     for event in plot_events:
-                        ax.axvline(event["plot_x"], color="#111827", linestyle="--", linewidth=1.8, alpha=0.75)
+                        ax.axvline(event["plot_x"], color=CHART_TEXT, linestyle="--", linewidth=1.8, alpha=0.75)
                         ax.text(
                             event["plot_x"],
                             0.98,
@@ -3439,7 +3755,7 @@ if selected_features and not filtered.empty:
                             va="top",
                             ha="right",
                             fontsize=11,
-                            color="#111827",
+                            color=CHART_TEXT,
                             bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="#111827", alpha=0.75),
                         )
                 ax.grid(True, which="major", alpha=0.28)
@@ -3468,6 +3784,7 @@ if selected_features and not filtered.empty:
                 if len(series_values) > 1:
                     ax.legend(fontsize=12, loc="best")
 
+                apply_matplotlib_petro_style(fig_m, ax)
                 fig_m.tight_layout(rect=[0.02, 0.02, 0.98, 0.94])
 
                 png_buffer = io.BytesIO()
@@ -3637,6 +3954,7 @@ if selected_features and not filtered.empty:
             height_in = max(8.0, 5.6 * n_features)
             title_fs = 25
         fig_m, axes = plt.subplots(n_features, 1, figsize=(width_in, height_in), dpi=240, squeeze=False)
+        apply_matplotlib_petro_style(fig_m, axes)
         axes = axes.flatten()
         fig_m.suptitle(chart_title_from_data(df, custom_chart_title), fontsize=title_fs, fontweight="bold", y=0.995)
 
@@ -3711,6 +4029,7 @@ if selected_features and not filtered.empty:
                 ax.legend(fontsize=11, loc="best")
 
         axes[-1].set_xlabel(x_axis_title_from_mode(x_axis_mode), fontsize=14, fontweight="bold")
+        apply_matplotlib_petro_style(fig_m, axes)
         fig_m.tight_layout(rect=[0.02, 0.02, 0.98, 0.975])
 
         output = io.BytesIO()
@@ -3737,6 +4056,7 @@ if selected_features and not filtered.empty:
             width_in = 18.0 if chart_view_mode == "Mobile-friendly" else 20.0
             height_in = 9.5 if chart_view_mode == "Mobile-friendly" else 10.5
             fig_m, ax = plt.subplots(figsize=(width_in, height_in), dpi=220)
+            apply_matplotlib_petro_style(fig_m, ax)
             ax.set_title(f"{chart_title_from_data(df, custom_chart_title)}\n{column_label(feature)}", fontsize=22, fontweight="bold", pad=18)
 
             for wi, series_label in enumerate(series_values):
@@ -3804,6 +4124,7 @@ if selected_features and not filtered.empty:
             if len(series_values) > 1:
                 ax.legend(fontsize=11, loc="best")
 
+            apply_matplotlib_petro_style(fig_m, ax)
             fig_m.tight_layout(rect=[0.02, 0.02, 0.98, 0.94])
             output = io.BytesIO()
             fig_m.savefig(output, format="png", dpi=260, bbox_inches="tight")
