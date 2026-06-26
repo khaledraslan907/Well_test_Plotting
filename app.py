@@ -21,7 +21,7 @@ import streamlit as st
 try:
     import tmu_parser as _tmu_parser
 except Exception as _parser_import_error:
-    st.set_page_config(page_title="TMU Production Test Analysis", page_icon="📈", layout="wide")
+    st.set_page_config(page_title="Production Test Analysis & Visualization", page_icon="📈", layout="wide")
     st.error("Could not import tmu_parser.py. Make sure app.py and tmu_parser.py are in the same folder and were both updated from the same ZIP package.")
     st.code("""
 Required files in the same folder:
@@ -43,7 +43,7 @@ _missing_required = [
     if not hasattr(_tmu_parser, name)
 ]
 if _missing_required:
-    st.set_page_config(page_title="TMU Production Test Analysis", page_icon="📈", layout="wide")
+    st.set_page_config(page_title="Production Test Analysis & Visualization", page_icon="📈", layout="wide")
     st.error("Your tmu_parser.py is older than app.py. Update tmu_parser.py from the latest package.")
     st.code("Missing parser functions: " + ", ".join(_missing_required))
     st.stop()
@@ -288,6 +288,10 @@ FEATURE_COLORS = {
     "mpfm_temp_f": "#FFB300",
     "pump_freq_hz": "#3F6E8A",
     "motor_current_amp": "#AD1457",
+    "stroke_length_in": "#00897B",
+    "stroke_rate_spm": "#3949AB",
+    "peak_load_lbf": "#C62828",
+    "minimum_load_lbf": "#EF6C00",
     "ama_current_amp": "#AD1457",
     "tm_f": "#F57F17",
     "ti_f": "#F9A825",
@@ -358,12 +362,12 @@ def chart_title_from_data(df, custom_title: str = "") -> str:
 
 
 st.set_page_config(
-    page_title="TMU Production Test Analysis",
+    page_title="Production Test Analysis & Visualization",
     page_icon="📈",
     layout="wide",
 )
 
-APP_UI_BUILD_ID = "v71-simple-light-dark-ui-20260626"
+APP_UI_BUILD_ID = "v72-clear-dark-srp-parser-ui-20260626"
 
 UI_THEME_PRESETS = {
     "Light": {
@@ -399,33 +403,33 @@ UI_THEME_PRESETS = {
     },
     "Dark": {
         "color_scheme": "dark",
-        "app_bg": "#07111A",
-        "app_bg_2": "#0A1721",
-        "sidebar_bg": "#09151E",
-        "panel_bg": "#101E29",
-        "panel_bg_2": "#142531",
-        "input_bg": "#0D1A24",
-        "border": "#294250",
-        "border_strong": "#3C5B6B",
-        "accent": "#48AFC9",
-        "accent_hover": "#67C3D8",
-        "accent_soft": "#153541",
+        "app_bg": "#08141D",
+        "app_bg_2": "#0C1C27",
+        "sidebar_bg": "#091720",
+        "panel_bg": "#10232F",
+        "panel_bg_2": "#142A37",
+        "input_bg": "#0D202B",
+        "border": "#365361",
+        "border_strong": "#587483",
+        "accent": "#55B8D0",
+        "accent_hover": "#78CCE0",
+        "accent_soft": "#173B48",
         "gold": "#D1AA63",
         "gold_soft": "#E2C27E",
-        "text": "#EDF4F7",
+        "text": "#EAF3F7",
         "text_strong": "#FFFFFF",
-        "text_muted": "#A8BBC5",
+        "text_muted": "#B7C8D0",
         "success": "#55C58A",
         "warning": "#F2B75D",
         "danger": "#F2766E",
-        "grid": "rgba(133, 188, 208, 0.045)",
-        "glow": "rgba(46, 151, 184, 0.17)",
+        "grid": "rgba(139, 194, 214, 0.035)",
+        "glow": "rgba(61, 166, 198, 0.13)",
         "shadow": "rgba(0, 0, 0, 0.34)",
-        "chart_paper": "#0B1822",
-        "chart_plot": "#0E1D28",
+        "chart_paper": "#0C1B25",
+        "chart_plot": "#10232F",
         "chart_text": "#EAF2F5",
-        "chart_grid": "#304754",
-        "chart_grid_soft": "#223743",
+        "chart_grid": "#3A5360",
+        "chart_grid_soft": "#263E4B",
         "chart_legend": "rgba(11,24,34,0.96)",
     },
 }
@@ -789,6 +793,12 @@ st.markdown(
     [data-testid="stHeaderActionElements"] button {{
         color: var(--petro-text) !important;
     }}
+    header[data-testid="stHeader"] button svg,
+    [data-testid="stToolbar"] button svg,
+    [data-testid="stHeaderActionElements"] button svg {{
+        color: var(--petro-text) !important;
+        fill: var(--petro-text) !important;
+    }}
 
     .block-container {{
         padding-top: 1.1rem;
@@ -826,20 +836,9 @@ st.markdown(
         padding: 1.25rem 1.45rem;
         margin: 0 0 1rem;
         background: linear-gradient(135deg, var(--petro-panel) 0%, var(--petro-panel-2) 100%);
-        box-shadow: 0 14px 36px var(--petro-shadow);
+        box-shadow: 0 8px 24px color-mix(in srgb, var(--petro-shadow) 70%, transparent);
     }}
-    .petro-hero::after {{
-        content: "";
-        position: absolute;
-        right: -2rem;
-        bottom: -4.5rem;
-        width: 18rem;
-        height: 9rem;
-        border-top: 1px solid color-mix(in srgb, var(--petro-accent) 28%, transparent);
-        border-radius: 50%;
-        transform: rotate(-8deg);
-        opacity: .8;
-    }}
+    .petro-hero::after {{ display: none; }}
     .petro-hero-row {{
         display: flex;
         gap: 1rem;
@@ -866,11 +865,18 @@ st.markdown(
     .petro-chart-icon .point {{ fill: var(--petro-gold-soft); stroke: #FFFFFF; stroke-width: 1.1; }}
     .petro-title {{
         margin: 0;
-        font-size: clamp(1.58rem, 3vw, 2.45rem);
-        line-height: 1.08;
-        font-weight: 820;
-        letter-spacing: -.025em;
-        color: var(--petro-text-strong);
+        font-family: Aptos, "Segoe UI", Arial, sans-serif;
+        font-size: clamp(1.55rem, 2.55vw, 2.25rem);
+        line-height: 1.12;
+        font-weight: 760;
+        letter-spacing: -.018em;
+        color: var(--petro-text-strong) !important;
+        text-shadow: none !important;
+        -webkit-text-stroke: 0 transparent !important;
+        filter: none !important;
+        font-synthesis: none;
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
     }}
     .petro-subtitle {{
         margin-top: .45rem;
@@ -914,19 +920,26 @@ st.markdown(
         color: var(--petro-muted) !important;
     }}
 
-    div[data-testid="stExpander"] {{
+    [data-testid="stExpander"],
+    [data-testid="stExpander"] details {{
         border: 1px solid var(--petro-border) !important;
         border-radius: 12px !important;
-        background: color-mix(in srgb, var(--petro-panel) 96%, transparent) !important;
+        background: var(--petro-panel) !important;
         overflow: hidden;
-        box-shadow: 0 6px 18px color-mix(in srgb, var(--petro-shadow) 70%, transparent);
+        box-shadow: 0 6px 18px color-mix(in srgb, var(--petro-shadow) 58%, transparent);
     }}
-    div[data-testid="stExpander"] details summary {{
+    [data-testid="stExpander"] details summary {{
         border-left: 3px solid var(--petro-gold);
+        background: var(--petro-panel-2) !important;
         color: var(--petro-text-strong) !important;
         font-weight: 730;
     }}
-    div[data-testid="stExpander"] details summary svg {{ fill: var(--petro-text) !important; }}
+    [data-testid="stExpander"] details summary:hover {{
+        background: color-mix(in srgb, var(--petro-panel-2) 88%, var(--petro-accent-soft)) !important;
+    }}
+    [data-testid="stExpander"] details summary *,
+    [data-testid="stExpander"] details summary p {{ color: var(--petro-text-strong) !important; }}
+    [data-testid="stExpander"] details summary svg {{ fill: var(--petro-text-strong) !important; color: var(--petro-text-strong) !important; }}
 
     div[data-baseweb="select"] > div,
     div[data-baseweb="input"] > div,
@@ -984,20 +997,34 @@ st.markdown(
         border-radius: 7px;
     }}
 
-    div[data-testid="stFileUploaderDropzone"] {{
-        border: 1.5px dashed color-mix(in srgb, var(--petro-accent) 72%, var(--petro-border)) !important;
-        background: color-mix(in srgb, var(--petro-input) 94%, var(--petro-panel)) !important;
+    [data-testid="stFileUploader"],
+    [data-testid="stFileUploader"] section,
+    [data-testid="stFileUploaderDropzone"],
+    [data-testid="stFileUploaderDropzone"] > div {{
+        background: var(--petro-input) !important;
+        color: var(--petro-text) !important;
+    }}
+    [data-testid="stFileUploaderDropzone"] {{
+        border: 1.5px dashed color-mix(in srgb, var(--petro-accent) 76%, var(--petro-border)) !important;
         border-radius: 11px !important;
     }}
-    div[data-testid="stFileUploaderDropzone"] * {{ color: var(--petro-text) !important; }}
-    div[data-testid="stFileUploaderDropzone"] small {{ color: var(--petro-muted) !important; }}
-    div[data-testid="stFileUploaderDropzone"] button {{
+    [data-testid="stFileUploaderDropzone"] *,
+    [data-testid="stFileUploaderDropzoneInstructions"] *,
+    [data-testid="stFileUploader"] small {{ color: var(--petro-text) !important; }}
+    [data-testid="stFileUploader"] small,
+    [data-testid="stFileUploaderDropzoneInstructions"] small {{ color: var(--petro-muted) !important; opacity: 1 !important; }}
+    [data-testid="stFileUploaderDropzone"] svg {{ color: var(--petro-accent) !important; fill: var(--petro-accent) !important; }}
+    [data-testid="stFileUploaderDropzone"] button,
+    [data-testid="stFileUploaderDropzone"] button:disabled {{
         background: var(--petro-panel-2) !important;
         color: var(--petro-text-strong) !important;
         border: 1px solid var(--petro-border-strong) !important;
         box-shadow: none !important;
+        opacity: 1 !important;
     }}
-    button:disabled {{ opacity: .72 !important; }}
+    [data-testid="stFileUploaderDropzone"] button *,
+    [data-testid="stFileUploaderDropzone"] button:disabled * {{ color: var(--petro-text-strong) !important; opacity: 1 !important; }}
+    button:disabled {{ opacity: .82 !important; }}
 
     .stButton > button, .stDownloadButton > button {{
         min-height: 2.55rem;
@@ -1068,8 +1095,8 @@ st.markdown(
           </svg>
         </div>
         <div>
-          <div class="petro-title">TMU Production Test Analysis &amp; Visualization</div>
-          <div class="petro-subtitle">Interactive well-test plotting, engineering diagnostics, data validation, operational events, and field-ready reporting.</div>
+          <div class="petro-title">Production Test Analysis &amp; Visualization</div>
+          <div class="petro-subtitle">Interactive well-test plotting, engineering diagnostics and operational events.</div>
         </div>
       </div>
     </div>
@@ -1330,18 +1357,29 @@ if "review_required" in data.columns:
 if "data_quality_note" in data.columns:
     _quality_mask |= data["data_quality_note"].fillna("").astype(str).str.strip().ne("")
 if _quality_mask.any():
-    with st.expander(f"⚠️ Data Quality Review ({int(_quality_mask.sum()):,} row(s))", expanded=False):
+    with st.expander(f"⚠️ Engineering Data Checks ({int(_quality_mask.sum()):,} row(s))", expanded=False):
+        st.caption(
+            "These are automatic engineering consistency checks—not a statement that the whole file is bad. "
+            "A row appears here only when a value is outside a physical range, a balance does not close, "
+            "or the parser corrected/withheld a source value. Original values remain available in Rejected Values for audit."
+        )
         _quality_columns = [
             "source", "sheet", "source_row", "well", "datetime",
             "data_quality_note", "rejected_values", "note",
         ]
         _quality_columns = [column for column in _quality_columns if column in data.columns]
         _quality_data = data.loc[_quality_mask, _quality_columns].copy()
+        _quality_data = _quality_data.rename(columns={
+            "data_quality_note": "Engineering Check",
+            "rejected_values": "Original / Withheld Values",
+            "source_row": "Source Row",
+            "datetime": "Date / Time",
+        })
         st.dataframe(_quality_data, use_container_width=True, hide_index=True)
         st.download_button(
-            "Download quality review CSV",
+            "Download engineering checks CSV",
             data=_quality_data.to_csv(index=False).encode("utf-8-sig"),
-            file_name="tmu_data_quality_review.csv",
+            file_name="production_test_engineering_checks.csv",
             mime="text/csv",
             key="download_data_quality_review_v69",
         )
@@ -1480,7 +1518,7 @@ if ocr_mask.any():
         if unapproved.any():
             st.info(
                 f"{int(unapproved.sum())} OCR row(s) still require review. They remain visible for editing "
-                "but are clearly flagged in Data Quality Review."
+                "but are clearly flagged in Engineering Data Checks."
             )
 
 
@@ -2829,7 +2867,7 @@ c2.metric("Active readings", f"{len(filtered):,}")
 c3.metric("Wells", f"{data['well'].nunique() if 'well' in data.columns else 0:,}")
 c4.metric("Test periods", f"{data['test_id'].nunique() if 'test_id' in data.columns else 0:,}")
 c5.metric("Signals", f"{len(numeric_cols):,}")
-c6.metric("Quality alerts", f"{quality_count:,}")
+c6.metric("Engineering checks", f"{quality_count:,}")
 
 with st.expander("Detected data preview", expanded=False):
     st.caption("Detected data = cleaned rows pulled from uploads before your well/time/feature filters.")
