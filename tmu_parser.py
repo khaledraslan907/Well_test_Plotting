@@ -35,7 +35,8 @@ import tmu_parser_legacy as legacy
 warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning, module=r"tmu_parser_legacy")
 
 PARSER_BUILD_ID_V66 = "v66-unified-robust-ingestion-20260622"
-PARSER_BUILD_ID = PARSER_BUILD_ID_V66
+PARSER_BUILD_ID_V67 = "v67-cumulative-excel-time-sequence-fix-20260623"
+PARSER_BUILD_ID = PARSER_BUILD_ID_V67
 
 # ---------------------------------------------------------------------------
 # Stable schema and labels
@@ -1251,7 +1252,7 @@ def _parse_xlsx(data: bytes, name: str) -> List[pd.DataFrame]:
 
     # Decide by workbook structure, not file size. Standard TMU reports are
     # handled by the mature fast parser; one-sheet simple DateTime/device tables
-    # use the deterministic v66 parser. This avoids scanning enormous formatted
+    # use the deterministic v67 parser. This avoids scanning enormous formatted
     # tails while still accepting new device/export templates.
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as _probe:
@@ -1583,10 +1584,20 @@ def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: 
     fallback = legacy.load_tabular_file(
         UploadedBytes(data, name), parse_images=parse_images, max_ocr_images=max_ocr_images
     )
-    normalized = [_postprocess_table(table) for table in fallback]
-    normalized = [table for table in normalized if is_valid_timeseries(table)]
-    if normalized:
-        return _deduplicate_table_interpretations(normalized)
+    normalized = [
+        table.copy() if (hasattr(legacy, "is_usable_ocr_table") and legacy.is_usable_ocr_table(table))
+        else _postprocess_table(table)
+        for table in fallback
+    ]
+    valid_timeseries = [table for table in normalized if is_valid_timeseries(table)]
+    valid_ocr = [
+        table for table in normalized
+        if not is_valid_timeseries(table)
+        and hasattr(legacy, "is_usable_ocr_table")
+        and legacy.is_usable_ocr_table(table)
+    ]
+    if valid_timeseries or valid_ocr:
+        return _deduplicate_table_interpretations(valid_timeseries) + valid_ocr
     raise RuntimeError(
         "no usable time-series table detected. The file may be blank, or it has no valid date/time plus numeric readings."
     )
@@ -1741,3 +1752,1537 @@ for _name in [
 ]:
     if hasattr(legacy, _name) and _name not in globals():
         globals()[_name] = getattr(legacy, _name)
+
+
+# ---------------------------------------------------------------------------
+# v67 - preserve source calendar dates; filenames are metadata, not timestamps
+# ---------------------------------------------------------------------------
+def _align_dates_to_source_name(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep parsed calendar dates unchanged.
+
+    Earlier releases tried to force dates to the date embedded in a filename.
+    That is unsafe for multi-day tests and dashboard exports (whose filename
+    date is the export/download date).  Date/time repair is now performed from
+    the actual Date and Time columns before this stage.
+    """
+    return df.copy() if df is not None else df
+
+# =============================================================================
+# v68 - corpus-driven robust ingestion, validation and engine reconciliation
+# =============================================================================
+# This layer is intentionally appended so it overrides older implementations at
+# runtime while preserving the mature OCR/PDF/WhatsApp-ZIP functions above.
+PARSER_BUILD_ID_V68 = "v68-corpus-driven-robust-ingestion-20260623"
+PARSER_BUILD_ID = PARSER_BUILD_ID_V68
+
+COLUMN_LABELS.update({
+    "n2_rate_mmscfd": "N₂ Rate (MMSCF/D)",
+    "gas_chart_reading": "Gas Chart Reading",
+    "dp1_psi": "DP1 (psi)",
+    "dp2_psi": "DP2 (psi)",
+    "parse_confidence": "Parse Confidence",
+    "rejected_values": "Rejected Values",
+})
+BASE_NON_PLOT_COLS.update({"parse_confidence", "rejected_values", "parser_engine"})
+CANONICAL_NUMERIC_FIELDS.update({
+    "n2_rate_mmscfd", "gas_chart_reading", "dp1_psi", "dp2_psi",
+})
+
+# Keep references to pre-v68 implementations for fallbacks.
+_extract_number_before_v68 = extract_number
+_extract_tabular_number_before_v68 = extract_tabular_number
+_canonical_header_before_v68 = canonical_header
+_convert_numeric_before_v68 = _convert_numeric
+_postprocess_before_v68 = _postprocess_table
+_parse_candidate_before_v68 = _parse_candidate
+_parse_xlsx_before_v68 = _parse_xlsx
+_parse_delimited_before_v68 = _parse_delimited
+_split_messages_before_v68 = split_messages
+_parse_tmu_message_before_v68 = parse_tmu_message
+_parse_many_tmu_messages_before_v68 = parse_many_tmu_messages
+_parse_whatsapp_before_v68 = parse_whatsapp_plain_or_export_text
+_merge_duplicates_before_v68 = merge_duplicate_test_rows_v53
+
+
+# ---------------------------------------------------------------------------
+# Locale-aware numeric parsing
+# ---------------------------------------------------------------------------
+_NUMERIC_CANDIDATE_V68 = re.compile(
+    r"(?<![A-Za-z0-9])\(?[−–—+\-]?\s*(?:\d[\d\s,.'’]*|\.\d+)(?:[eE][+\-]?\d+)?\)?"
+)
+
+
+def _normalize_numeric_token_v68(token: object) -> Optional[float]:
+    text = safe_text(token)
+    if not text:
+        return None
+    text = text.replace("−", "-").replace("–", "-").replace("—", "-")
+    negative_parentheses = text.strip().startswith("(") and text.strip().endswith(")")
+    text = text.strip().strip("() ")
+    text = re.sub(r"[\s'’]", "", text)
+    if not text:
+        return None
+
+    # Separate exponent before normalizing decimal/thousands punctuation.
+    exponent = ""
+    exp_match = re.search(r"([eE][+\-]?\d+)$", text)
+    if exp_match:
+        exponent = exp_match.group(1)
+        text = text[: exp_match.start()]
+
+    comma_count = text.count(",")
+    dot_count = text.count(".")
+    if comma_count and dot_count:
+        # Whichever punctuation appears last is the decimal separator.
+        if text.rfind(",") > text.rfind("."):
+            text = text.replace(".", "").replace(",", ".")
+        else:
+            text = text.replace(",", "")
+    elif comma_count:
+        parts = text.split(",")
+        if comma_count == 1:
+            left, right = parts
+            left_digits = left.lstrip("+-")
+            # 0,445 and 12,5 are decimal; 1,234 is normally a thousands group.
+            decimal_comma = (
+                len(right) != 3
+                or left_digits in {"0", ""}
+                or (len(left_digits) > 3 and len(right) <= 3)
+            )
+            text = left + ("." if decimal_comma else "") + right
+        elif all(len(part) == 3 for part in parts[1:]):
+            text = "".join(parts)
+        else:
+            text = "".join(parts[:-1]) + "." + parts[-1]
+    elif dot_count > 1:
+        parts = text.split(".")
+        if all(len(part) == 3 for part in parts[1:]):
+            text = "".join(parts)
+        else:
+            text = "".join(parts[:-1]) + "." + parts[-1]
+
+    text += exponent
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        return None
+    if negative_parentheses:
+        value = -abs(value)
+    return value if math.isfinite(value) else None
+
+
+def extract_number(value: object) -> float:
+    """Parse engineering numbers including scientific and locale notation.
+
+    Examples accepted: ``9.827E-2``, ``0,445``, ``1,234.5``, ``1.234,5`` and
+    ``(12.5)``. Text statuses such as ``Low gas`` remain missing.
+    """
+    if value is None or isinstance(value, bool):
+        return np.nan
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        number = float(value)
+        return number if math.isfinite(number) else np.nan
+    text = safe_text(value)
+    if not text or normalize_text(text) in {
+        "n/a", "na", "nil", "none", "not available", "low gas", "trace gas",
+        "no reading", "not measured",
+    }:
+        return np.nan
+    match = _NUMERIC_CANDIDATE_V68.search(text)
+    if not match:
+        return np.nan
+    number = _normalize_numeric_token_v68(match.group(0))
+    return np.nan if number is None else float(number)
+
+
+def extract_tabular_number(value: object) -> float:
+    """Strict numeric parser that rejects operational prose in measurement cells."""
+    if value is None or isinstance(value, bool):
+        return np.nan
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        number = float(value)
+        return number if math.isfinite(number) else np.nan
+    text = safe_text(value)
+    if not text or normalize_text(text) in {
+        "n/a", "na", "nil", "none", "not available", "low gas", "trace gas",
+        "no reading", "not measured",
+    }:
+        return np.nan
+    match = _NUMERIC_CANDIDATE_V68.search(text)
+    if not match:
+        return np.nan
+    remainder = (text[: match.start()] + " " + text[match.end() :]).lower()
+    remainder = remainder.replace("°", " ")
+    remainder = re.sub(r"[()\[\]{}'\".,;:+*/_\-]+", " ", remainder)
+    words = [word for word in re.findall(r"[a-z]+", remainder) if word]
+    allowed = {
+        "psi", "psig", "psia", "bar", "kpa", "mpa", "bbl", "bpd", "stb",
+        "d", "day", "mmscf", "mmscfd", "mscf", "mscfd", "scf", "scfd",
+        "scfm", "ppm", "kppm", "nacl", "mole", "mol", "hz", "amp", "amps",
+        "a", "c", "f", "deg", "in", "inch", "inches", "api", "percent",
+        "pct", "mm", "cm", "m", "ft", "min", "hr", "hours", "factor",
+        "air", "kg", "lbf", "lb", "rpm", "v", "volt", "volts",
+    }
+    if any(word not in allowed for word in words):
+        return np.nan
+    number = _normalize_numeric_token_v68(match.group(0))
+    return np.nan if number is None else float(number)
+
+
+def clean_tabular_numeric_series(series: pd.Series) -> pd.Series:
+    return series.map(extract_tabular_number).astype("float64")
+
+
+def clean_numeric_series(series: pd.Series) -> pd.Series:
+    if series is None:
+        return pd.Series(dtype="float64")
+    return series.map(extract_number).astype("float64")
+
+
+# ---------------------------------------------------------------------------
+# Header aliases and unit conversions
+# ---------------------------------------------------------------------------
+def canonical_header(header: object) -> HeaderInfo:
+    raw = safe_text(header)
+    h = normalize_text(raw)
+    h = re.sub(r"^(?:raw|source|original|detected)\s*[: -]\s*", "", h)
+    if not h:
+        return HeaderInfo(None, raw_label=raw)
+    if h in {"time text", "timetext", "display time"}:
+        return HeaderInfo("time", raw_label=raw)
+
+    # Fields that need more context than the older generic aliases.
+    if re.search(r"\bn\s*2\b|\bnitrogen\b", h) and re.search(r"rate|mmscf|scfm|scf", h):
+        if "scfm" in h or re.search(r"scf\s*/\s*(?:min|m)", h):
+            return HeaderInfo("n2_rate_scfm", "scfm", raw)
+        return HeaderInfo("n2_rate_mmscfd", _gas_rate_unit(h), raw)
+    if re.search(r"\b(?:dp|delta p)\s*1\b|differential pressure\s*1", h):
+        return HeaderInfo("dp1_psi", _pressure_unit(h), raw)
+    if re.search(r"\b(?:dp|delta p)\s*2\b|differential pressure\s*2", h):
+        return HeaderInfo("dp2_psi", _pressure_unit(h), raw)
+    if re.search(r"chart\s*(?:reading|rdg)|orifice chart", h):
+        return HeaderInfo("gas_chart_reading", "", raw)
+    if re.search(r"total\s*(?:liquid|fluid)\s*rate", h):
+        return HeaderInfo("gross_rate_bpd", _liquid_rate_unit(h), raw)
+    if re.fullmatch(r"frequency(?: hz)?", h):
+        return HeaderInfo("pump_freq_hz", "Hz", raw)
+
+    return _canonical_header_before_v68(raw)
+
+
+def _convert_numeric(values: pd.Series, info: HeaderInfo) -> pd.Series:
+    if info.canonical in {"n2_rate_mmscfd"}:
+        out = clean_tabular_numeric_series(values)
+        if info.unit == "scfd":
+            out /= 1_000_000.0
+        elif info.unit == "mscfd":
+            out /= 1_000.0
+        return out
+    if info.canonical in {"dp1_psi", "dp2_psi"}:
+        out = clean_tabular_numeric_series(values)
+        if info.unit == "bar":
+            out *= 14.5037738
+        elif info.unit == "kpa":
+            out *= 0.145037738
+        elif info.unit == "mpa":
+            out *= 145.037738
+        return out
+    return _convert_numeric_before_v68(values, info)
+
+
+# ---------------------------------------------------------------------------
+# Date/time parsing: explicit dates are authoritative; note rows never roll time
+# ---------------------------------------------------------------------------
+def _time_fraction(value: object) -> float:
+    if value is None or _is_missing(value):
+        return np.nan
+    if isinstance(value, pd.Timestamp):
+        value = value.to_pydatetime()
+    if isinstance(value, datetime):
+        value = value.time()
+    if isinstance(value, time):
+        seconds = value.hour * 3600 + value.minute * 60 + value.second + value.microsecond / 1e6
+        return seconds / 86400.0
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        number = float(value)
+        if not math.isfinite(number):
+            return np.nan
+        fraction = number % 1.0
+        if fraction > 0.999999 or fraction < 0.000001:
+            fraction = 0.0
+        seconds = int(round(fraction * 86400)) % 86400
+        # Snap Excel floating artefacts such as 17:29:59.999 to a minute.
+        minute_seconds = int(round(seconds / 60.0)) * 60
+        if abs(seconds - minute_seconds) <= 2:
+            seconds = minute_seconds % 86400
+        return seconds / 86400.0
+
+    text = safe_text(value)
+    if not text:
+        return np.nan
+    parsed = pd.to_datetime(text, errors="coerce", dayfirst=True)
+    if pd.notna(parsed):
+        parsed = pd.Timestamp(parsed)
+        return (parsed.hour * 3600 + parsed.minute * 60 + parsed.second) / 86400.0
+    match = re.search(r"\b(\d{1,2})[:.](\d{2})(?::(\d{2}))?\s*(am|pm)?\b", text, flags=re.I)
+    if not match:
+        return np.nan
+    hour, minute = int(match.group(1)), int(match.group(2))
+    second = int(match.group(3) or 0)
+    ampm = (match.group(4) or "").lower()
+    if ampm == "pm" and hour < 12:
+        hour += 12
+    if ampm == "am" and hour == 12:
+        hour = 0
+    if hour > 23 or minute > 59 or second > 59:
+        return np.nan
+    return (hour * 3600 + minute * 60 + second) / 86400.0
+
+
+def _date_only_with_base_v68(value: object, date_base: str = "1899-12-30") -> Optional[date]:
+    if value is None or _is_missing(value):
+        return None
+    if isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, bool):
+        number = float(value)
+        if math.isfinite(number) and 0 <= number <= 80000:
+            try:
+                return (pd.Timestamp(date_base) + pd.to_timedelta(number, unit="D")).date()
+            except Exception:
+                return None
+    return _date_only(value)
+
+
+def _xlsx_date_base_v68(zf: zipfile.ZipFile) -> str:
+    try:
+        root = ET.fromstring(zf.read("xl/workbook.xml"))
+        workbook_pr = root.find(f"{{{_XLSX_NS}}}workbookPr")
+        if workbook_pr is not None and str(workbook_pr.attrib.get("date1904", "0")).lower() in {"1", "true"}:
+            return "1904-01-01"
+    except Exception:
+        pass
+    return "1899-12-30"
+
+
+def _repair_date_time_sequence_v68(
+    date_values: Sequence[object],
+    time_values: Sequence[object],
+    measurement_mask: Optional[Sequence[bool]] = None,
+    source_date_hint: Optional[date] = None,
+    date_base: str = "1899-12-30",
+) -> pd.Series:
+    dates: List[Optional[date]] = [_date_only_with_base_v68(value, date_base) for value in date_values]
+    fractions: List[float] = [_time_fraction(value) for value in time_values]
+    is_measurement = list(measurement_mask) if measurement_mask is not None else [True] * len(dates)
+    if len(is_measurement) != len(dates):
+        is_measurement = [True] * len(dates)
+
+    # Repair only isolated date typos surrounded by equal dates on measurement rows.
+    for pos in range(1, len(dates) - 1):
+        if not is_measurement[pos]:
+            continue
+        prev_d, cur_d, next_d = dates[pos - 1], dates[pos], dates[pos + 1]
+        if prev_d is not None and next_d is not None and prev_d == next_d and cur_d not in {None, prev_d}:
+            dates[pos] = prev_d
+
+    # Supply dates only when missing. Never replace a valid explicit date with filename metadata.
+    next_explicit: List[Optional[date]] = [None] * len(dates)
+    following: Optional[date] = None
+    for pos in range(len(dates) - 1, -1, -1):
+        if dates[pos] is not None:
+            following = dates[pos]
+        next_explicit[pos] = following
+
+    output: List[pd.Timestamp] = []
+    inferred_date: Optional[date] = source_date_hint
+    previous_clock: Optional[float] = None
+    previous_explicit: Optional[date] = None
+
+    for pos, (explicit_date, fraction) in enumerate(zip(dates, fractions)):
+        if not math.isfinite(fraction):
+            output.append(pd.NaT)
+            continue
+        clock_seconds = int(round(fraction * 86400)) % 86400
+        clock_fraction = clock_seconds / 86400.0
+
+        if explicit_date is not None:
+            base_date = explicit_date
+            if previous_explicit is not None and explicit_date > previous_explicit:
+                inferred_date = explicit_date
+            elif inferred_date is None:
+                inferred_date = explicit_date
+            elif previous_explicit == explicit_date and inferred_date > explicit_date:
+                # The Date column is being copied down after an inferred midnight.
+                # Keep the inferred day until the explicit Date finally advances.
+                base_date = inferred_date
+        else:
+            base_date = inferred_date or next_explicit[pos] or source_date_hint
+            if base_date is None:
+                output.append(pd.NaT)
+                continue
+
+        if is_measurement[pos]:
+            # Infer midnight only when the Date cell is missing or failed to advance.
+            if previous_clock is not None and previous_clock - clock_fraction > 0.25:
+                same_or_missing_date = explicit_date is None or previous_explicit is None or explicit_date <= previous_explicit
+                if same_or_missing_date:
+                    candidate = (inferred_date or base_date) + timedelta(days=1)
+                    if explicit_date is None or candidate > explicit_date:
+                        base_date = candidate
+                        inferred_date = candidate
+            if explicit_date is not None and (previous_explicit is None or explicit_date >= previous_explicit):
+                # Explicit calendar advance wins over any inferred rollover.
+                if previous_explicit is None or explicit_date > previous_explicit:
+                    base_date = explicit_date
+                    inferred_date = explicit_date
+            previous_clock = clock_fraction
+            if explicit_date is not None:
+                previous_explicit = explicit_date
+            elif inferred_date is None:
+                inferred_date = base_date
+        # Note/event rows are combined for audit but never update rollover state.
+        current = pd.Timestamp(datetime.combine(base_date, time.min) + timedelta(seconds=clock_seconds))
+        output.append(current)
+
+    return pd.Series(output, dtype="datetime64[ns]")
+
+
+def combine_date_time(
+    date_series: pd.Series,
+    time_series: pd.Series,
+    measurement_mask: Optional[Sequence[bool]] = None,
+    source_date_hint: Optional[date] = None,
+    date_base: str = "1899-12-30",
+) -> pd.Series:
+    combined = _repair_date_time_sequence_v68(
+        date_series.tolist(), time_series.tolist(), measurement_mask=measurement_mask,
+        source_date_hint=source_date_hint, date_base=date_base,
+    )
+    combined.index = date_series.index
+    return combined
+
+
+# ---------------------------------------------------------------------------
+# Quality checks and physically impossible-value rejection
+# ---------------------------------------------------------------------------
+_NONNEGATIVE_FIELDS_V68 = {
+    "gas_rate_mmscfd", "gas_formation_mmscfd", "n2_rate_mmscfd", "n2_rate_scfm",
+    "gross_rate_bpd", "oil_rate_stbd", "water_rate_bpd", "oil_cum_bbl",
+    "water_cum_bbl", "gor_scf_bbl", "h2s_ppm", "co2_mole_pct", "salinity_kppm",
+    "motor_ama_amp", "pump_freq_hz", "ct_depth_m", "ct_running_speed_ftmin",
+    "orifice_size_in", "oil_meter_increment_bbl",
+}
+_RANGE_RULES_V68: Dict[str, Tuple[float, float]] = {
+    "bsw_pct": (0.0, 100.0),
+    "choke_pct": (0.0, 100.0),
+    "co2_mole_pct": (0.0, 100.0),
+    "gas_sg": (0.05, 5.0),
+    "oil_api": (-10.0, 100.0),
+    "pump_freq_hz": (0.0, 200.0),
+    "motor_ama_amp": (0.0, 5000.0),
+    "salinity_kppm": (0.0, 500.0),
+    "orifice_size_in": (0.0, 20.0),
+    "choke_size_64": (0.0, 512.0),
+    "motor_temp_f": (-100.0, 1200.0),
+    "motor_temp_c": (-100.0, 650.0),
+    "gas_temp_f": (-100.0, 1000.0),
+    "gas_temp_c": (-100.0, 550.0),
+    "oil_temp_f": (-100.0, 1000.0),
+    "oil_temp_c": (-100.0, 550.0),
+}
+
+
+def _append_quality_note_v68(out: pd.DataFrame, mask: pd.Series, message: str) -> None:
+    if not mask.any():
+        return
+    current = out.loc[mask, "data_quality_note"].fillna("").astype(str)
+    out.loc[mask, "data_quality_note"] = [append_note(value, message) for value in current]
+    out.loc[mask, "review_required"] = True
+
+
+def _apply_sanity_rules_v68(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if "data_quality_note" not in out.columns:
+        out["data_quality_note"] = ""
+    if "review_required" not in out.columns:
+        out["review_required"] = False
+    if "rejected_values" not in out.columns:
+        out["rejected_values"] = ""
+
+    for field in sorted(_NONNEGATIVE_FIELDS_V68):
+        if field not in out.columns:
+            continue
+        values = pd.to_numeric(out[field], errors="coerce")
+        tiny_negative = values.notna() & (values < 0) & (values.abs() <= 1e-6)
+        if tiny_negative.any():
+            out.loc[tiny_negative, field] = 0.0
+            values = pd.to_numeric(out[field], errors="coerce")
+        invalid = values.notna() & (values < -1e-6)
+        if invalid.any():
+            for idx in out.index[invalid]:
+                out.at[idx, "rejected_values"] = append_note(
+                    out.at[idx, "rejected_values"], f"{field}={values.loc[idx]:g}"
+                )
+            out.loc[invalid, field] = np.nan
+            _append_quality_note_v68(out, invalid, f"Rejected negative {column_label(field)}")
+
+    for field, (minimum, maximum) in _RANGE_RULES_V68.items():
+        if field not in out.columns:
+            continue
+        values = pd.to_numeric(out[field], errors="coerce")
+        invalid = values.notna() & ((values < minimum) | (values > maximum))
+        if invalid.any():
+            for idx in out.index[invalid]:
+                out.at[idx, "rejected_values"] = append_note(
+                    out.at[idx, "rejected_values"], f"{field}={values.loc[idx]:g}"
+                )
+            out.loc[invalid, field] = np.nan
+            _append_quality_note_v68(
+                out, invalid,
+                f"Rejected {column_label(field)} outside {minimum:g}–{maximum:g}",
+            )
+
+    # Consistency checks are warnings only; source values remain untouched.
+    if {"gross_rate_bpd", "oil_rate_stbd", "water_rate_bpd"}.issubset(out.columns):
+        gross = pd.to_numeric(out["gross_rate_bpd"], errors="coerce")
+        oil = pd.to_numeric(out["oil_rate_stbd"], errors="coerce")
+        water = pd.to_numeric(out["water_rate_bpd"], errors="coerce")
+        valid = gross.notna() & oil.notna() & water.notna()
+        tolerance = np.maximum(10.0, 0.15 * np.maximum(gross.abs(), 1.0))
+        mismatch = valid & ((gross - (oil + water)).abs() > tolerance)
+        _append_quality_note_v68(out, mismatch, "Gross rate differs materially from oil + water")
+        oil_gt_gross = gross.notna() & oil.notna() & (oil > gross + np.maximum(5.0, gross.abs() * 0.05))
+        _append_quality_note_v68(out, oil_gt_gross, "Oil rate exceeds gross rate")
+
+    if {"gas_rate_mmscfd", "gas_formation_mmscfd"}.issubset(out.columns):
+        total = pd.to_numeric(out["gas_rate_mmscfd"], errors="coerce")
+        formation = pd.to_numeric(out["gas_formation_mmscfd"], errors="coerce")
+        bad = total.notna() & formation.notna() & (formation > total + 1e-9)
+        _append_quality_note_v68(out, bad, "Formation gas exceeds total gas")
+
+    return out
+
+
+def _canonical_numeric_columns_v68(df: pd.DataFrame) -> List[str]:
+    return [
+        col for col in df.columns
+        if col not in BASE_NON_PLOT_COLS
+        and not str(col).startswith("raw__")
+        and col != "gas_rate_status"
+        and pd.to_numeric(df[col], errors="coerce").notna().any()
+    ]
+
+
+def _table_quality_v68(df: pd.DataFrame) -> float:
+    if df is None or df.empty or "datetime" not in df.columns:
+        return -1e9
+    dt = pd.to_datetime(df["datetime"], errors="coerce")
+    valid_dt = int(dt.notna().sum())
+    if valid_dt == 0:
+        return -1e9
+    numeric_cols = _canonical_numeric_columns_v68(df)
+    if not numeric_cols:
+        return -1e9
+    numeric_counts = df[numeric_cols].apply(pd.to_numeric, errors="coerce").notna().sum(axis=1)
+    coverage = float((numeric_counts > 0).mean())
+    median_fields = float(numeric_counts.median()) if len(numeric_counts) else 0.0
+    duplicate_ratio = float(dt.duplicated().mean())
+    score = valid_dt + len(numeric_cols) * 8 + coverage * 50 + min(median_fields, 12) * 5
+    score -= duplicate_ratio * 40
+    sheet_name = safe_text(df.get("sheet", pd.Series([""])).iloc[0]) if len(df) else ""
+    if re.search(r"(?:^|\b)(form|cover|summary|cmsf|shrinkage)(?:\b|$)", sheet_name, flags=re.I):
+        score -= 120
+    if "note" in df.columns:
+        errors = df["note"].astype(str).str.contains(r"#REF!|#DIV/0!|#VALUE!|#N/A", regex=True, na=False)
+        score -= float(errors.mean()) * 40
+    return float(score)
+
+
+# ---------------------------------------------------------------------------
+# Deterministic table parser with measurement-row-aware time repair
+# ---------------------------------------------------------------------------
+def _parse_candidate(
+    raw: pd.DataFrame,
+    candidate: HeaderCandidate,
+    *,
+    source_name: str,
+    sheet_name: str,
+    default_well: str,
+) -> pd.DataFrame:
+    data = raw.iloc[candidate.start_pos + candidate.height :].copy().reset_index(drop=False)
+    if data.empty:
+        return pd.DataFrame()
+    source_rows = data["index"].tolist()
+    data = data.drop(columns=["index"])
+    infos = candidate.infos
+    canonical = [info.canonical for info in infos]
+
+    output = pd.DataFrame(index=data.index)
+    output["source"] = source_name
+    output["sheet"] = sheet_name
+    output["parser_engine"] = "v68_sparse_xml"
+    output["source_row"] = source_rows
+    output["source_priority"] = _source_priority(source_name)
+    output["source_group"] = source_name + "::" + sheet_name
+
+    if "source_meta" in canonical:
+        idx = canonical.index("source_meta")
+        values = data.iloc[:, idx].map(safe_text)
+        output["source"] = values.where(values.ne(""), source_name)
+    if "sheet_meta" in canonical:
+        idx = canonical.index("sheet_meta")
+        values = data.iloc[:, idx].map(safe_text)
+        output["sheet"] = values.where(values.ne(""), sheet_name)
+    if "source_type_meta" in canonical:
+        output["source_type"] = data.iloc[:, canonical.index("source_type_meta")].map(safe_text)
+    if "note_meta" in canonical:
+        output["note"] = data.iloc[:, canonical.index("note_meta")].map(safe_text)
+    if "gas_rate_status_meta" in canonical:
+        output["gas_rate_status"] = data.iloc[:, canonical.index("gas_rate_status_meta")].map(safe_text)
+
+    if "well" in canonical:
+        well_values = data.iloc[:, canonical.index("well")].map(clean_well_name_value)
+        output["well"] = well_values.where(well_values.ne("Unknown"), default_well)
+    else:
+        output["well"] = default_well
+
+    occupied = {
+        idx for idx, key in enumerate(canonical)
+        if key in {"date", "time", "datetime", "well", "source_meta", "sheet_meta", "source_type_meta", "note_meta", "gas_rate_status_meta"}
+    }
+    recognized_fields: List[str] = []
+    for col, info in enumerate(infos):
+        key = info.canonical
+        if key in {None, "date", "time", "datetime", "well", "source_meta", "sheet_meta", "source_type_meta", "note_meta", "gas_rate_status_meta"}:
+            continue
+        occupied.add(col)
+        recognized_fields.append(key)
+        converted = _convert_numeric(data.iloc[:, col], info)
+        if key in output.columns:
+            output[key] = pd.to_numeric(output[key], errors="coerce").combine_first(converted)
+        else:
+            output[key] = converted
+
+    canonical_row_counts = pd.Series(0, index=data.index, dtype=int)
+    for key in sorted(set(recognized_fields)):
+        if key in output.columns:
+            canonical_row_counts += pd.to_numeric(output[key], errors="coerce").notna().astype(int)
+
+    # A lone calculated zero (commonly Gross Rate before the test starts) is not
+    # enough to create a measurement row. Accept rows with two measurements, a
+    # strong pressure/device/gas anchor, or a non-zero production rate.
+    strong_fields = {
+        "whp_psi", "flp_psi", "sep_p_psi", "pumping_pressure_psi",
+        "pump_intake_pressure_psi", "pump_discharge_pressure_psi",
+        "motor_ama_amp", "pump_freq_hz", "motor_temp_f", "motor_temp_c",
+        "gas_rate_mmscfd", "gas_formation_mmscfd", "n2_rate_mmscfd",
+        "n2_rate_scfm", "ct_pressure_psi", "ct_depth_m",
+    }
+    strong_present = pd.Series(False, index=data.index, dtype=bool)
+    for key in strong_fields:
+        if key in output.columns:
+            strong_present |= pd.to_numeric(output[key], errors="coerce").notna()
+    nonzero_rate = pd.Series(False, index=data.index, dtype=bool)
+    for key in {"gross_rate_bpd", "oil_rate_stbd", "water_rate_bpd"}:
+        if key in output.columns:
+            values = pd.to_numeric(output[key], errors="coerce")
+            nonzero_rate |= values.notna() & values.abs().gt(1e-12)
+    measurement_mask = canonical_row_counts.ge(2) | strong_present | nonzero_rate
+
+    # Date/time is parsed only after identifying real measurement rows, so note
+    # timestamps cannot trigger midnight rollover.
+    source_date_hint = _date_from_name(source_name)
+    date_base = str(raw.attrs.get("excel_date_base", "1899-12-30"))
+    if "datetime" in canonical:
+        idx = canonical.index("datetime")
+        dt_values = [_safe_datetime_scalar(value) for value in data.iloc[:, idx]]
+        dt = pd.Series(dt_values, index=data.index, dtype="datetime64[ns]")
+    elif "date" in canonical and "time" in canonical:
+        date_idx, time_idx = canonical.index("date"), canonical.index("time")
+        dt = combine_date_time(
+            data.iloc[:, date_idx], data.iloc[:, time_idx],
+            measurement_mask=measurement_mask.tolist(), source_date_hint=source_date_hint,
+            date_base=date_base,
+        )
+    elif "time" in canonical and source_date_hint is not None:
+        time_idx = canonical.index("time")
+        date_values = pd.Series([source_date_hint] * len(data), index=data.index)
+        dt = combine_date_time(
+            date_values, data.iloc[:, time_idx], measurement_mask=measurement_mask.tolist(),
+            source_date_hint=source_date_hint, date_base=date_base,
+        )
+    else:
+        return pd.DataFrame()
+    output["datetime"] = dt
+
+    # Preserve unknown channels only for compact/simple exports.
+    unique_recognized = len(set(recognized_fields))
+    if unique_recognized <= 12:
+        for col, raw_key in _generic_numeric_columns(data, candidate.headers, occupied).items():
+            output[raw_key] = clean_tabular_numeric_series(data.iloc[:, col])
+            COLUMN_LABELS.setdefault(raw_key, safe_text(candidate.headers[col]) or raw_key)
+
+    # Notes are collected only from non-mapped text cells on measurement rows;
+    # formula errors and repeated headers are ignored.
+    notes = output.get("note", pd.Series("", index=output.index, dtype=object)).fillna("").astype(object)
+    for col in range(data.shape[1]):
+        if col in occupied or canonical[col] in {"date", "time", "datetime", "well"}:
+            continue
+        values = data.iloc[:, col].map(safe_text)
+        values = values.where(~values.str.contains(r"#REF!|#DIV/0!|#VALUE!|#N/A", regex=True, na=False), "")
+        values = values.where(~values.str.fullmatch(r"[-+]?\d+(?:[.,]\d+)?(?:[eE][-+]?\d+)?", na=False), "")
+        values = values.where(measurement_mask, "")
+        if values.str.len().gt(3).any():
+            notes = pd.Series([append_note(a, b) for a, b in zip(notes, values)], index=notes.index)
+    output["note"] = notes
+
+    # A row is useful only when it has a timestamp and a recognized engineering
+    # measurement. Generic hidden/formula columns alone cannot create rows.
+    useful = output["datetime"].notna() & measurement_mask
+    output = output.loc[useful].copy()
+    if output.empty:
+        return output
+
+    if "motor_temp_f" in output.columns:
+        values = pd.to_numeric(output["motor_temp_f"], errors="coerce")
+        infer_unit = any(info.canonical == "motor_temp_f" and info.unit == "infer" for info in infos)
+        if infer_unit and values.notna().any() and values.median() < 180:
+            output["motor_temp_c"] = values
+            output.drop(columns=["motor_temp_f"], inplace=True)
+
+    output["date"] = output["datetime"].dt.date
+    output["time_text"] = output["datetime"].dt.strftime("%H:%M")
+    output["test_unit"] = sheet_name
+    return _postprocess_table(output)
+
+
+def _postprocess_table(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty or "datetime" not in df.columns:
+        return pd.DataFrame()
+    out = df.copy()
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce").dt.round("s")
+    out = out.loc[out["datetime"].notna()].copy()
+    if out.empty:
+        return out
+    if "well" not in out.columns:
+        out["well"] = "Unknown"
+    out["well"] = out["well"].map(clean_well_name_value)
+
+    for col in list(out.columns):
+        if col in BASE_NON_PLOT_COLS or col == "gas_rate_status":
+            continue
+        numeric = pd.to_numeric(out[col], errors="coerce")
+        if numeric.notna().any():
+            out[col] = numeric.astype("float64")
+
+    if "choke_pct" in out.columns:
+        values = pd.to_numeric(out["choke_pct"], errors="coerce")
+        out["choke_pct"] = values.where(~((values > 0) & (values <= 1.0)), values * 100.0)
+    if "choke_size_64" in out.columns:
+        values = pd.to_numeric(out["choke_size_64"], errors="coerce")
+        inch = values.notna() & (values > 0) & (values <= 2.0)
+        out["choke_size_64"] = values.where(~inch, values * 64.0)
+    if "salinity_kppm" in out.columns:
+        values = pd.to_numeric(out["salinity_kppm"], errors="coerce")
+        out["salinity_kppm"] = values.where(values.abs() <= 1000, values / 1000.0)
+
+    # Remove the known temporary compatibility copy of intake pressure.
+    if "pumping_pressure_psi" in out.columns and "pump_intake_pressure_psi" in out.columns:
+        pump = pd.to_numeric(out["pumping_pressure_psi"], errors="coerce")
+        intake = pd.to_numeric(out["pump_intake_pressure_psi"], errors="coerce")
+        source = out.get("source", pd.Series("", index=out.index)).astype(str)
+        compatibility = source.str.contains(r"legacy|compatible|temporary", case=False, regex=True, na=False)
+        copied = pump.notna() & intake.notna() & np.isclose(pump, intake, rtol=1e-9, atol=1e-9) & compatibility
+        out.loc[copied, "pumping_pressure_psi"] = np.nan
+        if pd.to_numeric(out["pumping_pressure_psi"], errors="coerce").notna().sum() == 0:
+            out.drop(columns=["pumping_pressure_psi"], inplace=True)
+
+    for col, default in {
+        "source": "Unknown source", "sheet": "Data", "note": "", "test_unit": "Data",
+        "source_type": "tabular", "link_status": "source_confirmed", "parser_engine": "v68",
+    }.items():
+        if col not in out.columns:
+            out[col] = default
+    out = _apply_sanity_rules_v68(out)
+    out["date"] = out["datetime"].dt.date
+    out["time_text"] = out["datetime"].dt.strftime("%H:%M")
+    numeric_cols = _canonical_numeric_columns_v68(out)
+    if numeric_cols:
+        counts = out[numeric_cols].apply(pd.to_numeric, errors="coerce").notna().sum(axis=1)
+        out["parse_confidence"] = np.minimum(1.0, 0.45 + counts / max(2.0, min(10.0, len(numeric_cols))))
+    else:
+        out["parse_confidence"] = 0.0
+    return out.sort_values(["well", "datetime", "source", "sheet"], kind="stable").reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Multi-engine Excel parsing and conservative reconciliation
+# ---------------------------------------------------------------------------
+def _merge_engine_complements_v68(primary: pd.DataFrame, secondary: pd.DataFrame) -> pd.DataFrame:
+    if primary is None or primary.empty:
+        return secondary
+    if secondary is None or secondary.empty:
+        return primary
+    left = primary.copy()
+    right = secondary.copy()
+    left["_key"] = pd.to_datetime(left["datetime"], errors="coerce").dt.round("min")
+    right["_key"] = pd.to_datetime(right["datetime"], errors="coerce").dt.round("min")
+    overlap = set(left["_key"].dropna()) & set(right["_key"].dropna())
+    denominator = max(1, min(left["_key"].notna().sum(), right["_key"].notna().sum()))
+    if len(overlap) / denominator < 0.60:
+        return primary
+    right_by_key = right.sort_values("_key").drop_duplicates("_key", keep="last").set_index("_key")
+    for idx in left.index:
+        key = left.at[idx, "_key"]
+        if pd.isna(key) or key not in right_by_key.index:
+            continue
+        source_row = right_by_key.loc[key]
+        if isinstance(source_row, pd.DataFrame):
+            source_row = source_row.iloc[-1]
+        for col in right.columns:
+            if col == "_key" or col.startswith("_"):
+                continue
+            if col not in left.columns:
+                left[col] = np.nan if col not in BASE_NON_PLOT_COLS else ""
+            if col == "note":
+                left.at[idx, col] = append_note(left.at[idx, col], source_row.get(col))
+            elif _is_missing(left.at[idx, col]) and not _is_missing(source_row.get(col)):
+                left.at[idx, col] = source_row.get(col)
+    return _postprocess_table(left.drop(columns=["_key"], errors="ignore"))
+
+
+def _choose_engine_table_v68(candidates: Sequence[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    valid = [table for table in candidates if is_valid_timeseries(table)]
+    if not valid:
+        return None
+    ranked = sorted(valid, key=lambda table: (_table_quality_v68(table), len(table), len(_canonical_numeric_columns_v68(table))), reverse=True)
+    primary = ranked[0]
+    for secondary in ranked[1:]:
+        primary = _merge_engine_complements_v68(primary, secondary)
+    return primary
+
+
+def _parse_xlsx(data: bytes, name: str) -> List[pd.DataFrame]:
+    deterministic: List[pd.DataFrame] = []
+    legacy_tables: List[pd.DataFrame] = []
+    diagnostics: List[str] = []
+    simple_table = False
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            shared = _read_shared_strings(zf)
+            sheet_paths = _workbook_sheet_paths(zf)
+            workbook_date_base = _xlsx_date_base_v68(zf)
+            simple_table = _xlsx_simple_table_signature(zf, sheet_paths, shared)
+            for sheet_name, sheet_path in sheet_paths:
+                try:
+                    raw = _read_sheet_sparse(
+                        zf, sheet_path, shared, max_rows=50000, max_cols=1024,
+                        max_nonempty_cells=1_000_000,
+                    )
+                except Exception as exc:
+                    diagnostics.append(f"{sheet_name} sparse read: {exc}")
+                    continue
+                if raw.empty:
+                    continue
+                raw.attrs["excel_date_base"] = workbook_date_base
+                default_well = _well_from_raw(raw, name, sheet_name)
+                parsed_for_sheet: List[pd.DataFrame] = []
+                for candidate in _find_header_candidates(raw):
+                    try:
+                        table = _parse_candidate(
+                            raw, candidate, source_name=name, sheet_name=sheet_name,
+                            default_well=default_well,
+                        )
+                    except Exception as exc:
+                        diagnostics.append(f"{sheet_name} header row {candidate.start_pos + 1}: {exc}")
+                        continue
+                    if is_valid_timeseries(table):
+                        parsed_for_sheet.append(table)
+                chosen = _choose_engine_table_v68(parsed_for_sheet)
+                if chosen is not None:
+                    deterministic.append(chosen)
+    except Exception as exc:
+        diagnostics.append(f"xlsx sparse engine: {exc}")
+
+    # The legacy engine remains valuable for rare templates, old .xlsx quirks,
+    # PDF-derived tables and OCR-linked fields. It is now a secondary engine,
+    # never the sole decision maker when the deterministic parser succeeds.
+    deterministic_good = any(
+        len(table) >= 3
+        and len(_canonical_numeric_columns_v68(table)) >= 2
+        and _table_quality_v68(table) >= 80
+        for table in deterministic
+    )
+    if not deterministic_good:
+        try:
+            raw_legacy = legacy.load_tabular_file(UploadedBytes(data, name), parse_images=False, max_ocr_images=0)
+            for table in raw_legacy:
+                normalized = _postprocess_table(table)
+                if is_valid_timeseries(normalized):
+                    normalized["parser_engine"] = "legacy"
+                    legacy_tables.append(normalized)
+        except Exception as exc:
+            diagnostics.append(f"legacy engine: {exc}")
+
+    # Group by well/sheet and reconcile the best interpretations.
+    all_tables = deterministic + legacy_tables
+    if not all_tables:
+        detail = "; ".join(diagnostics[:8])
+        raise RuntimeError(
+            "no usable time-series table detected. The workbook was read safely, but no table "
+            f"contained a valid date/time plus engineering readings. {detail}".strip()
+        )
+
+    grouped: Dict[Tuple[str, str], List[pd.DataFrame]] = {}
+    for table in all_tables:
+        well = _well_key(table["well"].iloc[0]) if "well" in table.columns and len(table) else ""
+        sheet = normalize_text(table["sheet"].iloc[0]) if "sheet" in table.columns and len(table) else "data"
+        grouped.setdefault((well, sheet), []).append(table)
+
+    selected: List[pd.DataFrame] = []
+    for (_well, sheet_key), candidates in grouped.items():
+        chosen = _choose_engine_table_v68(candidates)
+        if chosen is None:
+            continue
+        if re.search(r"(?:^|\b)(form|cover|summary|cmsf|shrinkage)(?:\b|$)", sheet_key, flags=re.I):
+            if _table_quality_v68(chosen) < 60:
+                continue
+        selected.append(chosen)
+
+    selected = _deduplicate_table_interpretations(selected)
+    selected.sort(key=lambda table: (_table_quality_v68(table), len(table)), reverse=True)
+    return selected
+
+
+# ---------------------------------------------------------------------------
+# Robust delimited data, including decimal-comma and dashboard re-imports
+# ---------------------------------------------------------------------------
+def _parse_delimited(data: bytes, name: str) -> List[pd.DataFrame]:
+    text, _encoding = _decode_text_bytes(data)
+    if not text.strip():
+        raise RuntimeError("file is blank")
+    separator = _detect_delimiter(text)
+    try:
+        raw = pd.read_csv(
+            io.StringIO(text), sep=separator, header=None, dtype=object,
+            engine="python", keep_default_na=False, na_values=[], on_bad_lines="skip",
+        )
+    except Exception as exc:
+        raise RuntimeError(f"could not read delimited text: {exc}") from exc
+    raw = raw.replace(r"^\s*$", np.nan, regex=True).dropna(axis=0, how="all").dropna(axis=1, how="all")
+    if raw.empty:
+        wa = parse_whatsapp_plain_or_export_text(text, source_name=name)
+        if is_valid_timeseries(wa):
+            return [wa]
+        raise RuntimeError("file is blank")
+    raw.index = range(1, len(raw) + 1)
+    default_well = _well_from_raw(raw, name, "CSV")
+    candidates: List[pd.DataFrame] = []
+    for header in _find_header_candidates(raw):
+        try:
+            table = _parse_candidate(raw, header, source_name=name, sheet_name="CSV", default_well=default_well)
+        except Exception:
+            continue
+        if is_valid_timeseries(table):
+            candidates.append(table)
+    chosen = _choose_engine_table_v68(candidates)
+    if chosen is not None:
+        return [chosen]
+    wa = parse_whatsapp_plain_or_export_text(text, source_name=name)
+    if is_valid_timeseries(wa):
+        return [wa]
+    raise RuntimeError(
+        "no usable time-series table detected. A DateTime column, or Date + Time columns, "
+        "and at least one recognized numeric measurement are required."
+    )
+
+
+# ---------------------------------------------------------------------------
+# WhatsApp parsing with inline labels and explicit choke/gas semantics
+# ---------------------------------------------------------------------------
+_WHATSAPP_LABELS_V68: List[Tuple[str, str]] = [
+    ("total_gas", r"total\s+gas\s+rate"),
+    ("formation_gas", r"formation\s+gas(?:\s+rate)?"),
+    ("gross", r"gross\s+rate"),
+    ("oil", r"(?:oil|cond(?:ensate)?)\s+rate"),
+    ("water", r"water\s+rate"),
+    ("water_cum", r"water\s+cum(?:ulative)?\.?"),
+    ("oil_cum", r"oil\s+cum(?:ulative)?\.?"),
+    ("gas", r"gas\s+rate"),
+    ("pumping", r"(?:pumping\s*p(?:ressure)?|pump\s*p(?:ressure)?)"),
+    ("sep_p", r"(?:sep\.?\s*p\.?|separator\s+pressure)"),
+    ("whp", r"(?:w\.?\s*h\.?\s*p\.?|whp|wellhead\s+pressure)"),
+    ("choke", r"choke"),
+    ("bsw", r"(?:bs\s*&?\s*w|bsw|water\s*cut)"),
+    ("salinity", r"salinity"),
+    ("h2s", r"h\s*2\s*s"),
+    ("co2", r"co\s*2"),
+    ("well", r"well\s*name|well"),
+    ("date", r"date"),
+    ("time", r"time"),
+    ("note", r"note"),
+]
+
+
+def _clean_whatsapp_text_v68(text: object) -> str:
+    value = str(text or "")
+    value = value.replace("\u200e", "").replace("\u200f", "").replace("\ufeff", "")
+    value = value.replace("\xa0", " ").replace("\r\n", "\n").replace("\r", "\n")
+    value = re.sub(r"[*_`~]+", "", value)
+    value = re.sub(r"[ \t]+", " ", value)
+    return value.strip()
+
+
+def _extract_whatsapp_fields_v68(text: str) -> Dict[str, str]:
+    cleaned = _clean_whatsapp_text_v68(text)
+    occurrences: List[Tuple[int, int, str]] = []
+    for key, pattern in _WHATSAPP_LABELS_V68:
+        regex = re.compile(rf"(?im)(?<![A-Za-z0-9])(?:{pattern})(?![A-Za-z0-9])\s*(?:[:=@-]\s*)?")
+        for match in regex.finditer(cleaned):
+            occurrences.append((match.start(), match.end(), key))
+    occurrences.sort(key=lambda item: (item[0], -(item[1] - item[0])))
+
+    # Remove nested/overlapping short matches (e.g. gas rate inside total gas rate).
+    filtered: List[Tuple[int, int, str]] = []
+    for item in occurrences:
+        if filtered and item[0] < filtered[-1][1]:
+            continue
+        filtered.append(item)
+
+    fields: Dict[str, str] = {}
+    for pos, (_start, end, key) in enumerate(filtered):
+        next_start = filtered[pos + 1][0] if pos + 1 < len(filtered) else len(cleaned)
+        value = cleaned[end:next_start]
+        value = re.sub(r"^[\s:=@-]+", "", value)
+        value = re.sub(r"[\n;]+$", "", value).strip()
+        # Avoid swallowing the next report header or generic production-test marker.
+        value = re.split(r"(?im)\n\s*(?:PICO\s*TMU|TMU)\s*[- ]?\d+", value, maxsplit=1)[0].strip()
+        value = re.split(r"(?im)\n\s*production\s+test\s*$", value, maxsplit=1)[0].strip()
+        if value and key not in fields:
+            fields[key] = value
+    return fields
+
+
+def split_messages(text: str) -> List[str]:
+    cleaned = _clean_whatsapp_text_v68(text)
+    if not cleaned:
+        return []
+    header = re.compile(r"(?im)^\s*(?:PICO\s*TMU|TMU)\s*[- ]?\s*\d+\b[^\n]*")
+    starts = [match.start() for match in header.finditer(cleaned)]
+    if len(starts) <= 1:
+        # Multiple reports without repeated TMU header: split on repeated Date labels.
+        date_starts = [
+            match.start() for match in re.finditer(
+                r"(?im)^\s*date\s*(?:[:=@-]\s*)?\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", cleaned
+            )
+        ]
+        if len(date_starts) > 1:
+            starts = date_starts
+    if len(starts) <= 1:
+        return [cleaned]
+    return [
+        cleaned[start : (starts[pos + 1] if pos + 1 < len(starts) else len(cleaned))].strip()
+        for pos, start in enumerate(starts)
+    ]
+
+
+def _parse_choke_text_v68(raw: object, row: Dict[str, object]) -> None:
+    text = safe_text(raw)
+    value = extract_number(text)
+    if pd.isna(value):
+        return
+    normalized = normalize_text(text)
+    fraction_match = re.search(r"([-+]?\d+(?:[.,]\d+)?)\s*/\s*64", text)
+    if fraction_match:
+        parsed = _normalize_numeric_token_v68(fraction_match.group(1))
+        if parsed is not None:
+            row["choke_size_64"] = float(parsed)
+        return
+    if "%" in text or "percent" in normalized or "opening" in normalized:
+        row["choke_pct"] = float(value)
+        return
+    if '"' in text or "inch" in normalized or re.search(r"\bin\b", normalized):
+        row["choke_size_64"] = float(value) * 64.0 if abs(value) <= 2 else float(value)
+        return
+    if 0 < value <= 1:
+        row["choke_pct"] = float(value) * 100.0
+    elif value > 2:
+        row["choke_size_64"] = float(value)
+    else:
+        row["choke_ambiguous"] = float(value)
+
+
+def parse_tmu_message(message: str, source_name: str = "WhatsApp_Text") -> Dict[str, object]:
+    text = _clean_whatsapp_text_v68(message)
+    fields = _extract_whatsapp_fields_v68(text)
+    date_value = _safe_datetime_scalar(fields.get("date", ""))
+    fraction = _time_fraction(fields.get("time", ""))
+    dt = pd.NaT
+    if pd.notna(date_value) and math.isfinite(fraction):
+        dt = pd.Timestamp(date_value).normalize() + pd.to_timedelta(fraction, unit="D")
+
+    well = clean_well_name_value(fields.get("well", ""))
+    if well == "Unknown":
+        well = guess_well_from_name(text)
+    unit_match = re.search(r"(?im)^\s*((?:PICO\s*)?TMU\s*[- ]?\s*\d+)\b", text)
+    test_unit = re.sub(r"\s+", " ", unit_match.group(1)).strip() if unit_match else "WhatsApp"
+
+    row: Dict[str, object] = {
+        "source": source_name,
+        "sheet": "WhatsApp",
+        "source_type": "pasted_whatsapp_text",
+        "parser_engine": "v68_whatsapp",
+        "well": well,
+        "datetime": dt,
+        "note": "",
+        "test_unit": test_unit,
+        "source_priority": _source_priority(source_name),
+        "source_group": source_name,
+    }
+
+    _parse_choke_text_v68(fields.get("choke", ""), row)
+    numeric_map = {
+        "whp": "whp_psi",
+        "sep_p": "sep_p_psi",
+        "gross": "gross_rate_bpd",
+        "oil": "oil_rate_stbd",
+        "water": "water_rate_bpd",
+        "water_cum": "water_cum_bbl",
+        "oil_cum": "oil_cum_bbl",
+        "bsw": "bsw_pct",
+        "salinity": "salinity_kppm",
+        "h2s": "h2s_ppm",
+        "co2": "co2_mole_pct",
+        "pumping": "pumping_pressure_psi",
+    }
+    for raw_key, canonical_key in numeric_map.items():
+        raw_value = fields.get(raw_key, "")
+        number = extract_number(raw_value)
+        if pd.isna(number):
+            continue
+        if canonical_key == "salinity_kppm":
+            norm = normalize_text(raw_value)
+            if "ppm" in norm and "kppm" not in norm and "k ppm" not in norm:
+                number /= 1000.0
+        row[canonical_key] = float(number)
+
+    total_raw = fields.get("total_gas") or fields.get("gas", "")
+    total_value = extract_number(total_raw)
+    if pd.notna(total_value):
+        row["gas_rate_mmscfd"] = float(total_value)
+    else:
+        norm = normalize_text(total_raw)
+        status = None
+        if "low gas" in norm:
+            status = "Low gas"
+        elif "trace gas" in norm:
+            status = "Trace gas"
+        elif re.search(r"\b(?:no|zero|nil)\s+gas\b", norm):
+            status = "No gas"
+        elif norm:
+            status = safe_text(total_raw)
+        if status:
+            row["gas_rate_status"] = status
+            row["note"] = append_note(row.get("note"), f"Gas rate: {status}")
+
+    formation_value = extract_number(fields.get("formation_gas", ""))
+    if pd.notna(formation_value):
+        row["gas_formation_mmscfd"] = float(formation_value)
+    if pd.notna(total_value) and pd.notna(formation_value):
+        derived_n2 = float(total_value) - float(formation_value)
+        if derived_n2 >= -1e-9:
+            row["n2_rate_mmscfd"] = max(0.0, derived_n2)
+
+    note = safe_text(fields.get("note", ""))
+    if note:
+        row["note"] = append_note(row.get("note"), note)
+    if re.search(r"(?im)^\s*production\s+test\s*$", text):
+        row["note"] = append_note(row.get("note"), "Production test")
+    return row
+
+
+def parse_many_tmu_messages(text: str, source_name: str = "WhatsApp_Text") -> pd.DataFrame:
+    rows: List[Dict[str, object]] = []
+    for index, chunk in enumerate(split_messages(text), start=1):
+        row = parse_tmu_message(chunk, source_name=source_name)
+        numeric_count = sum(
+            pd.notna(extract_number(row.get(key)))
+            for key in CANONICAL_NUMERIC_FIELDS if key in row
+        )
+        if pd.notna(row.get("datetime")) and numeric_count >= 1:
+            row["message_index"] = index
+            rows.append(row)
+    if not rows:
+        return pd.DataFrame()
+    return _postprocess_table(pd.DataFrame(rows))
+
+
+def parse_whatsapp_plain_or_export_text(text: str, source_name: str = "WhatsApp_Text") -> pd.DataFrame:
+    direct = parse_many_tmu_messages(text, source_name=source_name)
+    exported = pd.DataFrame()
+    try:
+        exported = legacy.parse_whatsapp_export_text(text, source_name=source_name)
+        exported = _postprocess_table(exported) if exported is not None and not exported.empty else pd.DataFrame()
+    except Exception:
+        exported = pd.DataFrame()
+    chosen = _choose_engine_table_v68([table for table in [direct, exported] if table is not None and not table.empty])
+    return chosen if chosen is not None else pd.DataFrame()
+
+
+# ---------------------------------------------------------------------------
+# Duplicate merge with conflict audit
+# ---------------------------------------------------------------------------
+def merge_duplicate_test_rows_v53(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    out["datetime"] = pd.to_datetime(out.get("datetime"), errors="coerce").dt.round("min")
+    out["well"] = out.get("well", pd.Series("Unknown", index=out.index)).map(clean_well_name_value)
+    out["_well_key"] = out["well"].map(_well_key)
+    out["_minute_key"] = out["datetime"]
+    out["_source_order"] = np.arange(len(out), dtype=int)
+    out["source_priority"] = pd.to_numeric(out.get("source_priority", pd.Series(0, index=out.index)), errors="coerce").fillna(0)
+    if "source" in out.columns:
+        out["source_priority"] += out["source"].map(_source_priority)
+    out["_row_completeness"] = out.apply(_row_completeness, axis=1)
+
+    merged_rows: List[Dict[str, object]] = []
+    valid = out.loc[out["_well_key"].ne("") & out["_minute_key"].notna()].copy()
+    invalid = out.loc[~(out["_well_key"].ne("") & out["_minute_key"].notna())].copy()
+    for _, group in valid.groupby(["_well_key", "_minute_key"], sort=False, dropna=False):
+        ranked = group.sort_values(
+            ["_row_completeness", "source_priority", "_source_order"],
+            ascending=[False, False, False], kind="stable",
+        )
+        base = ranked.iloc[0].to_dict()
+        conflict_notes: List[str] = []
+        for _, row in ranked.iloc[1:].iterrows():
+            for col in out.columns:
+                if col.startswith("_"):
+                    continue
+                incoming = row.get(col)
+                existing = base.get(col)
+                if col in {"note", "data_quality_note", "rejected_values"}:
+                    base[col] = append_note(existing, incoming)
+                elif _is_missing(existing) and not _is_missing(incoming):
+                    base[col] = incoming
+                elif (
+                    col not in BASE_NON_PLOT_COLS and col != "gas_rate_status"
+                    and not _is_missing(existing) and not _is_missing(incoming)
+                ):
+                    a, b = extract_number(existing), extract_number(incoming)
+                    if pd.notna(a) and pd.notna(b):
+                        tolerance = max(1e-9, 0.02 * max(abs(a), abs(b), 1.0))
+                        if abs(a - b) > tolerance:
+                            conflict_notes.append(f"Conflicting {column_label(col)} values: {a:g} vs {b:g}")
+        if conflict_notes:
+            base["data_quality_note"] = append_note(base.get("data_quality_note"), "; ".join(conflict_notes[:6]))
+            base["review_required"] = True
+        base["datetime"] = pd.Timestamp(base["_minute_key"])
+        merged_rows.append(base)
+
+    merged = pd.DataFrame(merged_rows)
+    if not invalid.empty:
+        merged = pd.concat([merged, invalid], ignore_index=True, sort=False)
+    merged.drop(columns=["_well_key", "_minute_key", "_source_order", "_row_completeness"], inplace=True, errors="ignore")
+    return _postprocess_table(merged)
+
+
+# v68 performance override: shortlist likely header rows before expensive scoring.
+def _find_header_candidates(raw: pd.DataFrame) -> List[HeaderCandidate]:
+    if raw is None or raw.empty:
+        return []
+    scan_rows = min(len(raw), 160)
+    likely_starts: set[int] = set()
+    row_tokens: List[str] = []
+    for pos in range(scan_rows):
+        values = [normalize_text(value) for value in raw.iloc[pos].tolist() if safe_text(value)]
+        joined = " | ".join(values)
+        row_tokens.append(joined)
+        has_date = bool(re.search(r"(?:^|\| |\b)(?:date|d/mm|dd/mm|timestamp|datetime)(?:\b| |\|)", joined))
+        has_time = bool(re.search(r"(?:^|\| |\b)(?:time|hh:mm|timestamp|datetime)(?:\b| |\|)", joined))
+        if has_date and has_time:
+            likely_starts.update({max(0, pos - 2), max(0, pos - 1), pos})
+
+    # Date and Time can be on adjacent header rows.
+    for pos in range(max(0, scan_rows - 1)):
+        window = " | ".join(row_tokens[pos : min(scan_rows, pos + 3)])
+        if re.search(r"\b(?:date|d/mm|dd/mm|timestamp|datetime)\b", window) and re.search(r"\b(?:time|hh:mm|timestamp|datetime)\b", window):
+            likely_starts.add(pos)
+
+    if not likely_starts:
+        # Small fallback shortlist, not a full 120 x 3 brute-force scan.
+        likely_starts.update(range(min(scan_rows, 25)))
+
+    candidates: List[HeaderCandidate] = []
+    for start in sorted(likely_starts):
+        for height in (1, 2, 3, 4, 5, 6):
+            if start + height > len(raw):
+                continue
+            candidate = _header_candidate_score(raw, start, height)
+            if candidate.score >= 16:
+                candidates.append(candidate)
+    candidates.sort(key=lambda item: item.score, reverse=True)
+    selected: List[HeaderCandidate] = []
+    for candidate in candidates:
+        if any(abs(candidate.start_pos - previous.start_pos) <= 3 for previous in selected):
+            continue
+        selected.append(candidate)
+        if len(selected) >= 6:
+            break
+    return selected
+
+# v68 canonical unknown-well handling. Unknown OCR/message rows must never merge
+# with each other merely because they share the literal text "UNKNOWN".
+_clean_well_name_value_before_v68 = clean_well_name_value
+
+
+def clean_well_name_value(value: object) -> str:
+    normalized = normalize_text(value)
+    if normalized in {
+        "", "unknown", "unk", "n/a", "na", "none", "not known",
+        "unlinked", "unknown well", "well unknown",
+    }:
+        return "Unknown"
+    result = _clean_well_name_value_before_v68(value)
+    return "Unknown" if normalize_text(result) in {"unknown", "unk", "n/a", "na"} else result
+
+
+def normalize_well_name(value: object) -> str:
+    return clean_well_name_value(value)
+
+
+def _well_key(value: object) -> str:
+    cleaned = clean_well_name_value(value)
+    if cleaned == "Unknown":
+        return ""
+    return re.sub(r"[^A-Z0-9]", "", _normalize_bed_device_alias(cleaned).upper())
+
+# Extend physical checks for OCR totals/rates. Values are kept auditable in
+# rejected_values and the row remains visible in the review panel.
+_NONNEGATIVE_FIELDS_V68.update({
+    "ctu_fluid_rate_bpm", "ctu_n2_rate_scfm", "ctu_fluid_total_bbl",
+    "ctu_n2_total_scf", "ctu_reel_depth_ft",
+})
+
+# Wrap post-processing once more so OCR confidence is not overstated by the
+# number of fields detected.
+_postprocess_table_v68_core = _postprocess_table
+
+
+def _postprocess_table(df: pd.DataFrame) -> pd.DataFrame:
+    out = _postprocess_table_v68_core(df)
+    if out is None or out.empty:
+        return out
+    if "source_type" in out.columns:
+        ocr_mask = out["source_type"].astype(str).str.contains("ocr", case=False, na=False)
+        if ocr_mask.any() and "ocr_confidence" in out.columns:
+            ocr_conf = pd.to_numeric(out.loc[ocr_mask, "ocr_confidence"], errors="coerce").clip(0, 1)
+            out.loc[ocr_mask, "parse_confidence"] = ocr_conf
+    return out
+
+# Correct standalone implementation (avoids recursive dependency between
+# clean_well_name_value and _well_key).
+def clean_well_name_value(value: object) -> str:
+    text = safe_text(value).upper().replace("*", "")
+    text = re.sub(r"\bWELL(?:\s+NAME)?\b\s*[:=-]?", "", text, flags=re.I).strip()
+    if normalize_text(text) in {
+        "", "unknown", "unk", "n/a", "na", "none", "not known",
+        "unlinked", "unknown well", "well unknown",
+    }:
+        return "Unknown"
+    text = _normalize_bed_device_alias(text)
+    text = re.sub(r"\s+", "", text).replace("_", "-")
+    text = re.sub(r"-{2,}", "-", text).strip("-")
+    compound = re.fullmatch(r"([A-Z]\d{1,2})-([A-Z]\d+)-(\d+)", text)
+    if compound:
+        text = f"{compound.group(1)}{compound.group(2)}-{compound.group(3)}"
+    if not re.search(r"[A-Z0-9]", text) or normalize_text(text) in {"unknown", "unk", "na"}:
+        return "Unknown"
+    return text
+
+
+def normalize_well_name(value: object) -> str:
+    return clean_well_name_value(value)
+
+
+def _well_key(value: object) -> str:
+    cleaned = clean_well_name_value(value)
+    if cleaned == "Unknown":
+        return ""
+    return re.sub(r"[^A-Z0-9]", "", _normalize_bed_device_alias(cleaned).upper())
+
+# Metadata that must never appear as selectable engineering curves.
+BASE_NON_PLOT_COLS.update({
+    "chat_datetime", "ocr_fields_found", "ocr_confidence", "ocr_status",
+    "ocr_template", "image_file", "attachment_name", "source_member",
+    "chat_sender", "caption_text", "suggested_well", "suggested_test_id",
+    "suggested_link_reason", "row_id", "image_index", "source_member_index",
+})
+
+# =============================================================================
+# v70 finalization: OCR audit schema + conservative gas-balance reconciliation
+# =============================================================================
+PARSER_BUILD_ID_V70 = "v70-ocr-direct-images-gas-balance-final-20260624"
+PARSER_BUILD_ID = PARSER_BUILD_ID_V70
+
+COLUMN_LABELS.update({
+    "gas_balance_status": "Gas Balance Status",
+    "gas_formation_derived": "Formation Gas Derived",
+    "n2_rate_derived": "N2 Rate Derived",
+    "total_gas_derived": "Total Gas Derived",
+    "ocr_low_confidence_fields": "OCR Low-Confidence Fields",
+    "screen_rectified": "Screen Rectified",
+    "screen_detection_score": "Screen Detection Confidence",
+})
+
+BASE_NON_PLOT_COLS.update({
+    "gas_balance_status", "gas_formation_derived", "n2_rate_derived",
+    "total_gas_derived", "ocr_low_confidence_fields", "ocr_build_id",
+    "screen_rectified", "screen_detection_score", "screen_detection_method",
+    "screen_area_ratio", "screen_aspect_ratio",
+})
+
+
+def _record_reconciled_source_v70(out: pd.DataFrame, index, field: str, old_value, message: str) -> None:
+    if "rejected_values" not in out.columns:
+        out["rejected_values"] = ""
+    if "data_quality_note" not in out.columns:
+        out["data_quality_note"] = ""
+    if "review_required" not in out.columns:
+        out["review_required"] = False
+    if pd.notna(old_value):
+        out.at[index, "rejected_values"] = append_note(
+            out.at[index, "rejected_values"], f"source_{field}={float(old_value):g}"
+        )
+    out.at[index, "data_quality_note"] = append_note(
+        out.at[index, "data_quality_note"], message
+    )
+    out.at[index, "review_required"] = True
+
+
+def _reconcile_gas_balance_v70(df: pd.DataFrame) -> pd.DataFrame:
+    """Reconcile Total Gas, Formation Gas and N2 without producing negatives.
+
+    Engineering identity:
+        Total Gas = Formation Gas + Injected N2
+
+    Rules are conservative:
+    - tiny floating negatives become zero;
+    - a negative Formation Gas from spreadsheet subtraction becomes zero when
+      Total Gas does not exceed N2;
+    - missing one member is derived only when the other two are valid;
+    - conflicting populated values are retained for audit, then replaced by the
+      physically consistent derived value and flagged for review.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    for column in (
+        "gas_rate_mmscfd", "gas_formation_mmscfd", "n2_rate_mmscfd",
+        "gas_balance_status", "gas_formation_derived", "n2_rate_derived",
+        "total_gas_derived",
+    ):
+        if column not in out.columns:
+            if column.endswith("_derived"):
+                out[column] = False
+            elif column == "gas_balance_status":
+                out[column] = ""
+            else:
+                out[column] = np.nan
+
+    total = pd.to_numeric(out["gas_rate_mmscfd"], errors="coerce")
+    formation = pd.to_numeric(out["gas_formation_mmscfd"], errors="coerce")
+    n2 = pd.to_numeric(out["n2_rate_mmscfd"], errors="coerce")
+
+    for idx in out.index:
+        t = total.loc[idx]
+        f = formation.loc[idx]
+        n = n2.loc[idx]
+        status_parts: list[str] = []
+
+        # Treat minute spreadsheet round-off as exact zero.
+        if pd.notna(f) and -1e-6 <= f < 0:
+            out.at[idx, "gas_formation_mmscfd"] = 0.0
+            f = 0.0
+            status_parts.append("tiny negative formation gas normalized to zero")
+
+        # Physically impossible negative source formula.
+        if pd.notna(f) and f < -1e-6:
+            old = f
+            if pd.notna(t) and pd.notna(n):
+                corrected = max(float(t) - float(n), 0.0)
+            else:
+                corrected = 0.0
+            out.at[idx, "gas_formation_mmscfd"] = corrected
+            out.at[idx, "gas_formation_derived"] = True
+            f = corrected
+            _record_reconciled_source_v70(
+                out, idx, "gas_formation_mmscfd", old,
+                "Corrected negative Formation Gas using max(Total Gas - N2, 0)",
+            )
+            status_parts.append("negative formation gas corrected")
+
+        # Derive one missing member from the other two.
+        if pd.isna(f) and pd.notna(t) and pd.notna(n):
+            f = max(float(t) - float(n), 0.0)
+            out.at[idx, "gas_formation_mmscfd"] = f
+            out.at[idx, "gas_formation_derived"] = True
+            status_parts.append("formation gas derived")
+        if pd.isna(n) and pd.notna(t) and pd.notna(f):
+            n = max(float(t) - float(f), 0.0)
+            out.at[idx, "n2_rate_mmscfd"] = n
+            out.at[idx, "n2_rate_derived"] = True
+            status_parts.append("N2 rate derived")
+        if pd.isna(t) and pd.notna(f) and pd.notna(n):
+            t = max(float(f) + float(n), 0.0)
+            out.at[idx, "gas_rate_mmscfd"] = t
+            out.at[idx, "total_gas_derived"] = True
+            status_parts.append("total gas derived")
+
+        # Re-read after derivation.
+        t = pd.to_numeric(pd.Series([out.at[idx, "gas_rate_mmscfd"]]), errors="coerce").iloc[0]
+        f = pd.to_numeric(pd.Series([out.at[idx, "gas_formation_mmscfd"]]), errors="coerce").iloc[0]
+        n = pd.to_numeric(pd.Series([out.at[idx, "n2_rate_mmscfd"]]), errors="coerce").iloc[0]
+
+        if pd.notna(t) and pd.notna(f) and pd.notna(n):
+            expected_formation = max(float(t) - float(n), 0.0)
+            tolerance = max(0.005, 0.03 * max(abs(float(t)), 0.1))
+            imbalance = abs(float(t) - (float(f) + float(n)))
+            if imbalance > tolerance:
+                old = f
+                out.at[idx, "gas_formation_mmscfd"] = expected_formation
+                out.at[idx, "gas_formation_derived"] = True
+                _record_reconciled_source_v70(
+                    out, idx, "gas_formation_mmscfd", old,
+                    "Gas balance conflict corrected so Total Gas = Formation Gas + N2",
+                )
+                status_parts.append("gas balance reconciled")
+            else:
+                status_parts.append("gas balance checked")
+
+        out.at[idx, "gas_balance_status"] = "; ".join(dict.fromkeys(status_parts))
+
+    return out
+
+
+_postprocess_table_v70_base = _postprocess_table
+
+
+def _postprocess_table(df: pd.DataFrame) -> pd.DataFrame:
+    out = _postprocess_table_v70_base(df)
+    if out is None or out.empty:
+        return out
+    out = _reconcile_gas_balance_v70(out)
+    # OCR audit helper columns are metadata, never engineering curves.
+    for column in list(out.columns):
+        if str(column).startswith("ocr_raw__") or str(column).startswith("ocr_conf__") or str(column).startswith("ocr_status__"):
+            BASE_NON_PLOT_COLS.add(str(column))
+    return out
+
+
+# Refresh re-export after the legacy v70 OCR override.
+if hasattr(legacy, "parse_ctu_all_data_screen_image"):
+    parse_ctu_all_data_screen_image = legacy.parse_ctu_all_data_screen_image

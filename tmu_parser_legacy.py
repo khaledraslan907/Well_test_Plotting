@@ -1603,6 +1603,11 @@ def standardize_dataframe(
     if out.empty:
         return pd.DataFrame()
 
+    # v67: repair isolated wrong Date cells and midnight rollover while rows
+    # are still in the original worksheet order.  Sorting first would move an
+    # isolated bad date to the end and make it impossible to recognize.
+    out = _repair_measurement_datetime_sequence_v67(out)
+
     # Remove duplicate readings at the same well/datetime. This also cleans old dashboard-exported CSVs
     # that may contain a duplicated Final Average row with a copied timestamp.
     if "datetime" in out.columns and "well" in out.columns and out["datetime"].notna().any():
@@ -6411,3 +6416,877 @@ def parse_whatsapp_plain_or_export_text(text: str, source_name="WhatsApp_Text") 
             "text_needs_well_review",
         )
     return df
+
+
+def _repair_measurement_datetime_sequence_v67(out: pd.DataFrame) -> pd.DataFrame:
+    """Repair measurement timestamps in original worksheet order.
+
+    Fixes two common field-sheet defects without rewriting valid multi-day data:
+    1. one Date cell differs from equal previous/next Date cells;
+    2. Date is copied down at midnight while Time resets from evening to morning.
+    """
+    if out is None or out.empty or "datetime" not in out.columns:
+        return out
+
+    result = out.copy()
+    if "date" in result.columns:
+        dates = pd.to_datetime(result["date"], errors="coerce").dt.normalize().tolist()
+    else:
+        dates = pd.to_datetime(result["datetime"], errors="coerce").dt.normalize().tolist()
+
+    time_values = []
+    if "time" in result.columns:
+        parsed = parse_time_series(result["time"])
+        time_values = parsed.tolist()
+    else:
+        parsed_dt = pd.to_datetime(result["datetime"], errors="coerce")
+        time_values = [
+            (pd.Timestamp("1900-01-01") + pd.Timedelta(
+                hours=ts.hour, minutes=ts.minute, seconds=ts.second
+            )) if pd.notna(ts) else pd.NaT
+            for ts in parsed_dt
+        ]
+
+    # Correct an isolated calendar-date typo surrounded by equal dates.
+    for pos in range(1, len(dates) - 1):
+        prev_d, cur_d, next_d = dates[pos - 1], dates[pos], dates[pos + 1]
+        if pd.notna(prev_d) and pd.notna(next_d) and prev_d == next_d:
+            if pd.notna(cur_d) and cur_d != prev_d:
+                dates[pos] = prev_d
+
+    repaired = []
+    previous = pd.NaT
+    for d, t in zip(dates, time_values):
+        if pd.isna(d) or pd.isna(t):
+            repaired.append(pd.NaT)
+            continue
+        current = pd.Timestamp(d).normalize() + pd.Timedelta(
+            hours=t.hour, minutes=t.minute, seconds=t.second
+        )
+        if pd.notna(previous):
+            previous = pd.Timestamp(previous)
+            previous_seconds = previous.hour * 3600 + previous.minute * 60 + previous.second
+            current_seconds = current.hour * 3600 + current.minute * 60 + current.second
+            # Infer rollover only for a substantial clock reset and only when
+            # the Date cell failed to advance. Small out-of-order edits remain
+            # untouched and explicit Date advances are always trusted.
+            if current.date() <= previous.date() and previous_seconds - current_seconds > 6 * 3600:
+                while current <= previous:
+                    current += pd.Timedelta(days=1)
+        repaired.append(current)
+        previous = current
+
+    result["datetime"] = pd.to_datetime(repaired, errors="coerce")
+    result["date"] = result["datetime"].dt.floor("D")
+    result["time_text"] = result["datetime"].dt.strftime("%H:%M")
+    return result
+
+
+# =============================================================================
+# v67 - cumulative Excel time / operational-note rollover fix
+# =============================================================================
+PARSER_BUILD_ID_V67 = "v67-cumulative-excel-time-sequence-fix-20260623"
+PARSER_BUILD_ID = PARSER_BUILD_ID_V67
+
+
+def _measurement_row_mask_v67(out: pd.DataFrame) -> pd.Series:
+    """Return rows that contain at least one real engineering measurement.
+
+    Operational notes in TMU sheets often have Date/Time values but no readings.
+    Their clock times may be out of chronological order (for example 10:30,
+    then a note recorded as 04:00).  Those note rows must never drive midnight
+    rollover for the production-test rows that follow.
+    """
+    mask = pd.Series(False, index=out.index, dtype=bool)
+    metadata = set(BASE_NON_PLOT_COLS) | {
+        "source_type", "link_status", "review_required", "message_index",
+        "source_priority", "source_row", "source_group", "data_quality_note",
+        "gas_rate_status", "test_id", "test_sequence",
+    }
+    for col in out.columns:
+        if col in metadata or str(col).startswith("_"):
+            continue
+        numeric = pd.to_numeric(out[col], errors="coerce")
+        if numeric.notna().any():
+            mask |= numeric.notna()
+    return mask
+
+
+def adjust_datetime_rollover(out: pd.DataFrame, parsed_time: Optional[pd.Series]) -> pd.DataFrame:
+    """Repair midnight rollover using measurement rows only.
+
+    The Date column is authoritative when it advances.  A day is added only
+    when consecutive *measurement* rows keep the same Date while clock time
+    moves backwards by a meaningful amount.  Note/event rows are ignored and
+    cannot shift an entire test by one or more days.
+    """
+    if out is None or out.empty or parsed_time is None:
+        return out
+    if "date" not in out.columns or "datetime" not in out.columns:
+        return out
+    if parsed_time.notna().sum() < 2:
+        return out
+
+    result = out.copy()
+    dates = pd.to_datetime(result["date"], errors="coerce")
+    times = parsed_time.reindex(result.index)
+    adjusted = pd.to_datetime(result["datetime"], errors="coerce").copy()
+    measurement_rows = _measurement_row_mask_v67(result)
+
+    day_offset = 0
+    previous_time = None
+    previous_base_date = None
+
+    for idx in result.index:
+        d = dates.loc[idx]
+        t = times.loc[idx]
+        if pd.isna(d) or pd.isna(t):
+            continue
+
+        base_date = pd.Timestamp(d).normalize()
+
+        # Preserve a reasonable datetime for note rows, but do not let their
+        # non-chronological clock entries affect rollover state.
+        if not bool(measurement_rows.loc[idx]):
+            adjusted.loc[idx] = base_date + pd.Timedelta(
+                hours=t.hour, minutes=t.minute, seconds=t.second
+            )
+            continue
+
+        # An explicit Date advance already represents the new calendar day.
+        if previous_base_date is not None and base_date > previous_base_date:
+            day_offset = 0
+        elif previous_base_date is not None and base_date < previous_base_date:
+            # Do not carry a stale offset into a new/repeated table section.
+            day_offset = 0
+
+        current_clock = (t.hour, t.minute, t.second)
+        previous_clock = (
+            (previous_time.hour, previous_time.minute, previous_time.second)
+            if previous_time is not None else None
+        )
+
+        # Only infer midnight when Date did not advance and the time drop is
+        # large enough to be a real rollover, not a small out-of-order edit.
+        if (
+            previous_clock is not None
+            and previous_base_date is not None
+            and base_date == previous_base_date
+        ):
+            previous_seconds = previous_clock[0] * 3600 + previous_clock[1] * 60 + previous_clock[2]
+            current_seconds = current_clock[0] * 3600 + current_clock[1] * 60 + current_clock[2]
+            if previous_seconds - current_seconds > 6 * 3600:
+                day_offset += 1
+
+        adjusted.loc[idx] = base_date + pd.Timedelta(days=day_offset) + pd.Timedelta(
+            hours=t.hour, minutes=t.minute, seconds=t.second
+        )
+        previous_time = t
+        previous_base_date = base_date
+
+    result["datetime"] = pd.to_datetime(adjusted, errors="coerce")
+    result["date"] = result["datetime"].dt.floor("D")
+    result["time_text"] = result["datetime"].dt.strftime("%H:%M")
+    return result
+
+
+def _combine_date_time_v49(date_series, time_series):
+    """Combine Date + Time without double-counting cumulative Excel days.
+
+    Some workbooks store Time as 1.041667, 1.5, 2.020833, etc.  The integer
+    portion is an elapsed/copy artefact while the Date column already advances.
+    When Date is constant, the integer portion can still represent rollover, so
+    it is applied relative to the first numeric time day—not as an absolute day.
+    """
+    dates = parse_date_series(date_series)
+    times = _parse_time_series_v49(time_series)
+
+    raw_day_parts = []
+    for raw in list(time_series):
+        part = None
+        try:
+            if isinstance(raw, (int, float, np.number)) and not isinstance(raw, bool):
+                value = float(raw)
+            elif re.fullmatch(r"[-+]?\d+(?:\.\d+)?", str(raw).strip()):
+                value = float(str(raw).strip())
+            else:
+                value = np.nan
+            if np.isfinite(value) and 0 <= value < 100:
+                part = int(math.floor(value + 1e-9))
+        except Exception:
+            part = None
+        raw_day_parts.append(part)
+
+    valid_dates = pd.to_datetime(dates, errors="coerce").dropna().dt.normalize()
+    date_column_advances = valid_dates.nunique() >= 2
+    baseline_part = next((part for part in raw_day_parts if part is not None), 0)
+
+    combined = []
+    for d, t, raw_part in zip(dates, times, raw_day_parts):
+        if pd.isna(d):
+            combined.append(pd.NaT)
+            continue
+        extra_days = 0
+        if not date_column_advances and raw_part is not None:
+            extra_days = max(0, raw_part - baseline_part)
+        if pd.notna(t):
+            combined.append(
+                pd.Timestamp(d).normalize()
+                + pd.Timedelta(days=extra_days, hours=t.hour, minutes=t.minute, seconds=t.second)
+            )
+        else:
+            combined.append(pd.Timestamp(d).normalize() + pd.Timedelta(days=extra_days))
+    return pd.Series(combined, index=date_series.index, dtype="datetime64[ns]")
+
+# v68 package marker. The unified parser is primary; this module remains the
+# fallback for OCR, PDF, DOCX, WhatsApp ZIP and rare legacy workbook formats.
+PARSER_BUILD_ID_V68 = "v68-corpus-driven-robust-ingestion-20260623"
+PARSER_BUILD_ID = PARSER_BUILD_ID_V68
+
+# =============================================================================
+# v70 final OCR override: rectified CTU/HMI screen OCR + per-field audit data
+# =============================================================================
+# This override is intentionally appended at the end of the legacy module so all
+# older ZIP/image loaders resolve this implementation at runtime.
+
+CTU_OCR_BUILD_ID_V70 = "v70-rectified-screen-consensus-ocr-20260624"
+
+CTU_SCREEN_SIZE_V70 = (1200, 750)
+CTU_VALUE_ROIS_V70 = {
+    # x1, y1, x2, y2 on the rectified 1200 x 750 ALL DATA display.
+    "ctu_weight_lbf": (160, 92, 665, 192),
+    "ctu_lt_weight_lbf": (670, 92, 1170, 192),
+    "ctu_wellhead_pressure_psi": (165, 232, 665, 332),
+    "ctu_circulation_pressure_psi": (670, 232, 1170, 332),
+    "ctu_reel_depth_ft": (165, 357, 665, 458),
+    "ctu_reel_speed_ftmin": (670, 357, 1170, 458),
+    "ctu_fluid_rate_bpm": (165, 480, 665, 572),
+    "ctu_n2_rate_scfm": (670, 480, 1170, 572),
+    "ctu_fluid_total_bbl": (165, 602, 665, 697),
+    "ctu_n2_total_scf": (670, 602, 1170, 697),
+}
+
+CTU_FIELD_RANGES_V70 = {
+    "ctu_weight_lbf": (0.0, 250000.0),
+    "ctu_lt_weight_lbf": (0.0, 5000.0),
+    "ctu_wellhead_pressure_psi": (0.0, 10000.0),
+    "ctu_circulation_pressure_psi": (0.0, 10000.0),
+    "ctu_reel_depth_ft": (0.0, 60000.0),
+    "ctu_reel_speed_ftmin": (-2000.0, 2000.0),
+    "ctu_fluid_rate_bpm": (0.0, 500.0),
+    "ctu_n2_rate_scfm": (0.0, 10000.0),
+    "ctu_fluid_total_bbl": (0.0, 1000000.0),
+    "ctu_n2_total_scf": (0.0, 2000000000.0),
+}
+
+CTU_INTEGER_FIELDS_V70 = {
+    "ctu_weight_lbf", "ctu_lt_weight_lbf", "ctu_n2_rate_scfm", "ctu_n2_total_scf"
+}
+
+CTU_TARGET_ROIS_V70 = {
+    "ctu_weight_lbf": (280, 100, 620, 190),
+    "ctu_lt_weight_lbf": (760, 100, 1140, 190),
+    "ctu_wellhead_pressure_psi": (280, 240, 620, 330),
+    "ctu_circulation_pressure_psi": (760, 240, 1140, 330),
+    "ctu_reel_depth_ft": (280, 365, 620, 455),
+    "ctu_reel_speed_ftmin": (760, 365, 1140, 455),
+    "ctu_fluid_rate_bpm": (280, 490, 620, 570),
+    "ctu_n2_rate_scfm": (760, 490, 1140, 570),
+    "ctu_fluid_total_bbl": (280, 610, 620, 690),
+    "ctu_n2_total_scf": (760, 610, 1140, 690),
+}
+
+
+def _order_quad_points_v70(points):
+    import numpy as _np
+    pts = _np.asarray(points, dtype="float32").reshape(4, 2)
+    total = pts.sum(axis=1)
+    diff = _np.diff(pts, axis=1).reshape(-1)
+    return _np.array([
+        pts[_np.argmin(total)],   # top-left
+        pts[_np.argmin(diff)],    # top-right
+        pts[_np.argmax(total)],   # bottom-right
+        pts[_np.argmax(diff)],    # bottom-left
+    ], dtype="float32")
+
+
+def _rectify_ctu_screen_v70(pil_image):
+    """Find the HMI display rectangle and warp it to a stable 1200 x 750 canvas.
+
+    The old OCR used ROIs relative to the full camera photo. That failed whenever
+    the HMI occupied a different part of the photo. v70 first detects the display
+    quadrilateral, then applies the fixed value-box ROIs to the rectified screen.
+    """
+    try:
+        import cv2
+        import numpy as _np
+    except Exception:
+        return pil_image, {"screen_rectified": False, "screen_detection_score": 0.0}
+
+    rgb = _np.array(pil_image.convert("RGB"))
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    height, width = bgr.shape[:2]
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(gray, 30, 120)
+    edges = cv2.morphologyEx(
+        edges, cv2.MORPH_CLOSE, _np.ones((9, 9), _np.uint8), iterations=2
+    )
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+    candidates = []
+    image_area = float(max(1, width * height))
+    for contour in contours:
+        area_ratio = cv2.contourArea(contour) / image_area
+        if not 0.14 <= area_ratio <= 0.85:
+            continue
+        x, y, w, h = cv2.boundingRect(contour)
+        aspect = w / max(h, 1)
+        if not 1.38 <= aspect <= 1.88:
+            continue
+        perimeter = cv2.arcLength(contour, True)
+        quad = None
+        for epsilon in (0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05):
+            approx = cv2.approxPolyDP(contour, epsilon * perimeter, True)
+            if len(approx) == 4:
+                quad = approx.reshape(4, 2)
+                break
+        if quad is None:
+            continue
+        touches_edge = (
+            x <= 4 or y <= 4 or x + w >= width - 4 or y + h >= height - 4
+        )
+        # ALL DATA displays are close to 1.60:1. The area target is deliberately
+        # soft because some photos contain the inner display and others the bezel.
+        score = abs(aspect - 1.60) + 0.10 * abs(area_ratio - 0.35)
+        if touches_edge:
+            score += 0.50
+        candidates.append((score, quad, area_ratio, aspect))
+
+    if not candidates:
+        # Conservative center crop fallback. It is still safer than applying the
+        # value ROIs directly to the entire camera photograph.
+        x1, x2 = int(width * 0.08), int(width * 0.92)
+        y1, y2 = int(height * 0.08), int(height * 0.92)
+        crop = bgr[y1:y2, x1:x2]
+        crop = cv2.resize(crop, CTU_SCREEN_SIZE_V70, interpolation=cv2.INTER_CUBIC)
+        from PIL import Image as _Image
+        return _Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)), {
+            "screen_rectified": False,
+            "screen_detection_score": 0.0,
+            "screen_detection_method": "center_crop_fallback",
+        }
+
+    candidates.sort(key=lambda item: item[0])
+    score, quad, area_ratio, aspect = candidates[0]
+    ordered = _order_quad_points_v70(quad)
+    target_w, target_h = CTU_SCREEN_SIZE_V70
+    destination = _np.array(
+        [[0, 0], [target_w - 1, 0], [target_w - 1, target_h - 1], [0, target_h - 1]],
+        dtype="float32",
+    )
+    matrix = cv2.getPerspectiveTransform(ordered, destination)
+    warped = cv2.warpPerspective(bgr, matrix, (target_w, target_h))
+    from PIL import Image as _Image
+    return _Image.fromarray(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB)), {
+        "screen_rectified": True,
+        "screen_detection_score": float(max(0.0, 1.0 - min(score, 1.0))),
+        "screen_detection_method": "quadrilateral_perspective",
+        "screen_area_ratio": float(area_ratio),
+        "screen_aspect_ratio": float(aspect),
+    }
+
+
+def _clean_ocr_numeric_text_v70(text):
+    value = str(text or "").strip()
+    if not value or not re.search(r"\d", value):
+        # Do not turn label letters such as I/l/O into fake numbers. Character
+        # repair is used only when the OCR token already contains a real digit.
+        return []
+    value = value.replace(",", ".")
+    value = value.translate(str.maketrans({"O": "0", "o": "0", "I": "1", "l": "1", "|": "1"}))
+    # Keep possible punctuation inside the token but remove OCR decoration.
+    value = re.sub(r"[^0-9.\-+]", "", value)
+    value = re.sub(r"\.{2,}", ".", value)
+    matches = re.findall(r"[-+]?\d+(?:\.\d+)?", value)
+    output = []
+    for match in matches:
+        try:
+            output.append(float(match))
+        except Exception:
+            continue
+    return output
+
+
+def _normalise_ctu_candidate_v70(field, value, raw_text=""):
+    try:
+        number = float(value)
+    except Exception:
+        return []
+    if not np.isfinite(number):
+        return []
+    low, high = CTU_FIELD_RANGES_V70[field]
+    # All displayed CTU values in this template are nonnegative. A minus sign is
+    # commonly a border/line OCR artifact. Reel speed may be negative, so retain it.
+    if field != "ctu_reel_speed_ftmin":
+        number = abs(number)
+
+    candidates = [(number, 0.0)]
+    # Restore a lost decimal only when OCR returned an integer-like token. When a
+    # real decimal point is already present (for example 0.01 reel speed), adding
+    # 0.001/0.0001 alternatives causes the consensus median to collapse to zero.
+    raw_has_decimal = "." in str(raw_text or "")
+    if not raw_has_decimal or not (low <= number <= high):
+        for divisor, penalty in ((10.0, 0.35), (100.0, 0.45), (1000.0, 0.65)):
+            transformed = number / divisor
+            if low <= transformed <= high:
+                candidates.append((transformed, penalty))
+
+    result = []
+    seen = set()
+    for candidate, penalty in candidates:
+        if not low <= candidate <= high:
+            continue
+        rounded_key = round(candidate, 6)
+        if rounded_key in seen:
+            continue
+        seen.add(rounded_key)
+        # Avoid unreasonable decimal-restoration alternatives for integer counters.
+        if field in CTU_INTEGER_FIELDS_V70 and penalty > 0 and abs(candidate - round(candidate)) > 1e-6:
+            continue
+        result.append((float(candidate), float(penalty)))
+    return result
+
+
+def _field_for_ocr_box_v70(left, top, width, height):
+    center_x = float(left) + float(width) / 2.0
+    center_y = float(top) + float(height) / 2.0
+    for field, (x1, y1, x2, y2) in CTU_VALUE_ROIS_V70.items():
+        if x1 <= center_x <= x2 and y1 <= center_y <= y2:
+            return field
+    return None
+
+
+def _full_screen_candidates_v70(rectified_image):
+    try:
+        import cv2
+        import numpy as _np
+        import pytesseract
+    except Exception:
+        return {field: [] for field in CTU_VALUE_ROIS_V70}
+
+    bgr = cv2.cvtColor(_np.array(rectified_image.convert("RGB")), cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray)
+    median = cv2.medianBlur(gray, 3)
+    otsu = cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    variants = {
+        "raw": bgr,
+        "median": median,
+        "otsu": otsu,
+    }
+    output = {field: [] for field in CTU_VALUE_ROIS_V70}
+    for variant_name, image in variants.items():
+        try:
+            data = pytesseract.image_to_data(
+                image,
+                config="--oem 3 --psm 11",
+                output_type=pytesseract.Output.DATAFRAME,
+            )
+        except Exception:
+            continue
+        if data is None or data.empty:
+            continue
+        data = data.dropna(subset=["text"])
+        for _, item in data.iterrows():
+            field = _field_for_ocr_box_v70(
+                item.get("left", 0), item.get("top", 0), item.get("width", 0), item.get("height", 0)
+            )
+            if not field:
+                continue
+            raw_text = str(item.get("text", "") or "")
+            confidence = max(0.0, min(100.0, float(item.get("conf", 0) or 0))) / 100.0
+            for raw_number in _clean_ocr_numeric_text_v70(raw_text):
+                for number, transform_penalty in _normalise_ctu_candidate_v70(field, raw_number, raw_text):
+                    output[field].append({
+                        "value": number,
+                        "confidence": confidence,
+                        "raw_text": raw_text,
+                        "variant": variant_name,
+                        "penalty": transform_penalty,
+                        "targeted": False,
+                    })
+    return output
+
+
+def _refine_leading_counter_digit_v70(processed, text):
+    """Repair a single confused leading digit in a long HMI counter.
+
+    Whole-token OCR can confuse the leading 5 in a seven-segment-like counter
+    with 9 (for example 547799 -> 947799). We locate the numeric token, crop only
+    its first character, and require agreement from at least two independent page
+    segmentation modes before replacing that one digit. The rest of the counter
+    remains exactly as read by the whole-token pass. If agreement is absent, the
+    original text is retained and the field remains review-required.
+    """
+    try:
+        import cv2
+        import pytesseract
+    except Exception:
+        return str(text or ""), False
+
+    original = str(text or "").strip()
+    digits = re.sub(r"\D", "", original)
+    if len(digits) < 4:
+        return original, False
+
+    try:
+        data = pytesseract.image_to_data(
+            processed,
+            config="--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789.",
+            output_type=pytesseract.Output.DICT,
+        )
+    except Exception:
+        return original, False
+
+    best = None
+    for index, token in enumerate(data.get("text", [])):
+        token_text = str(token or "").strip()
+        token_digits = re.sub(r"\D", "", token_text)
+        if len(token_digits) < 4:
+            continue
+        candidate = (
+            len(token_digits),
+            float(data.get("conf", [0])[index] or 0),
+            index,
+            token_digits,
+        )
+        if best is None or candidate[:2] > best[:2]:
+            best = candidate
+    if best is None:
+        return original, False
+
+    _, _, index, token_digits = best
+    try:
+        left = int(data["left"][index])
+        top = int(data["top"][index])
+        width = int(data["width"][index])
+        height = int(data["height"][index])
+    except Exception:
+        return original, False
+    if width <= 0 or height <= 0:
+        return original, False
+
+    cell_width = width / max(len(token_digits), 1)
+    x1 = max(0, int(left - 0.12 * cell_width))
+    x2 = min(processed.shape[1], int(left + 1.18 * cell_width))
+    y1 = max(0, int(top - 0.15 * height))
+    y2 = min(processed.shape[0], int(top + 1.15 * height))
+    first_cell = processed[y1:y2, x1:x2]
+    if first_cell.size == 0:
+        return original, False
+
+    votes = []
+    for psm in (10, 13, 8):
+        try:
+            read = pytesseract.image_to_string(
+                first_cell,
+                config=f"--oem 3 --psm {psm} -c tessedit_char_whitelist=0123456789",
+            ).strip()
+        except Exception:
+            continue
+        match = re.search(r"\d", read)
+        if match:
+            votes.append(match.group(0))
+    if not votes:
+        return original, False
+
+    counts = {digit: votes.count(digit) for digit in set(votes)}
+    voted_digit, vote_count = max(counts.items(), key=lambda item: item[1])
+    if vote_count < 2 or voted_digit == token_digits[0]:
+        return original, False
+
+    refined_digits = voted_digit + token_digits[1:]
+    return refined_digits, True
+
+
+def _targeted_field_candidates_v70(rectified_image, field):
+    """One field-specific OCR pass on the rectified value box."""
+    try:
+        import cv2
+        import numpy as _np
+        import pytesseract
+    except Exception:
+        return []
+
+    bgr = cv2.cvtColor(_np.array(rectified_image.convert("RGB")), cv2.COLOR_RGB2BGR)
+    x1, y1, x2, y2 = CTU_TARGET_ROIS_V70.get(field, CTU_VALUE_ROIS_V70[field])
+    crop = bgr[max(0, y1):min(bgr.shape[0], y2), max(0, x1):min(bgr.shape[1], x2)]
+    if crop.size == 0:
+        return []
+
+    psm = 7
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    # Most large screen digits are best read from the unscaled Otsu image. This
+    # preserves decimal points and avoids changing 6/8 at high interpolation.
+    processed = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+
+    if field == "ctu_lt_weight_lbf":
+        enlarged = cv2.resize(crop, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
+        value_gray = cv2.cvtColor(enlarged, cv2.COLOR_BGR2GRAY)
+        value_gray = cv2.createCLAHE(clipLimit=3.5, tileGridSize=(8, 8)).apply(value_gray)
+        processed = cv2.threshold(value_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        psm = 7
+    elif field == "ctu_circulation_pressure_psi":
+        enlarged = cv2.resize(crop, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
+        blue, green, red = cv2.split(enlarged)
+        blue_score = (blue.astype(_np.int16) * 2 - green.astype(_np.int16) - red.astype(_np.int16)).clip(0)
+        # Keep the normalized blue-channel response grayscale. Otsu thresholding
+        # changed the displayed 1363.61 to 1363.01 on a real field photo by
+        # erasing the lower loop of the digit 6. The grayscale response reads all
+        # three validation screens correctly (2188.97, 1363.61, 1362.09).
+        processed = cv2.normalize(blue_score, None, 0, 255, cv2.NORM_MINMAX).astype(_np.uint8)
+        psm = 7
+    elif field in {"ctu_weight_lbf", "ctu_n2_rate_scfm"}:
+        psm = 6
+    elif field == "ctu_n2_total_scf":
+        psm = 7
+
+    try:
+        text = pytesseract.image_to_string(
+            processed,
+            config=f"--oem 3 --psm {psm} -c tessedit_char_whitelist=-0123456789.",
+        ).strip()
+    except Exception:
+        return []
+
+    output = []
+    if field == "ctu_n2_total_scf" and text:
+        refined_text, changed = _refine_leading_counter_digit_v70(processed, text)
+        if changed:
+            for raw_number in _clean_ocr_numeric_text_v70(refined_text):
+                for number, transform_penalty in _normalise_ctu_candidate_v70(field, raw_number, refined_text):
+                    output.append({
+                        "value": number,
+                        "confidence": 0.97,
+                        "raw_text": f"{text} -> {refined_text} (leading-digit consensus)",
+                        "variant": "targeted_leading_digit_consensus",
+                        "penalty": transform_penalty,
+                        "targeted": True,
+                        "digit_count": len(re.sub(r"\D", "", refined_text)),
+                    })
+
+    for raw_number in _clean_ocr_numeric_text_v70(text):
+        for number, transform_penalty in _normalise_ctu_candidate_v70(field, raw_number, text):
+            digit_count = len(re.sub(r"\D", "", text))
+            output.append({
+                "value": number,
+                "confidence": min(0.94, 0.72 + 0.025 * min(digit_count, 8)) if text else 0.0,
+                "raw_text": text,
+                "variant": f"targeted_psm{psm}",
+                "penalty": transform_penalty,
+                "targeted": True,
+                "digit_count": digit_count,
+            })
+    return output
+
+
+def _values_close_v70(field, left, right):
+    left = float(left)
+    right = float(right)
+    if field in CTU_INTEGER_FIELDS_V70:
+        return abs(left - right) <= 0.5
+    tolerance = max(0.02, 0.003 * max(abs(left), abs(right), 1.0))
+    return abs(left - right) <= tolerance
+
+
+def _select_ctu_candidate_v70(field, candidates):
+    if not candidates:
+        return np.nan, 0.0, "", "missing"
+
+    # A leading-digit correction is accepted only after at least two independent
+    # single-character OCR modes agree. Prefer that audited result over a larger
+    # whole-token consensus that repeats the same glyph confusion.
+    if field == "ctu_n2_total_scf":
+        refined = [
+            item for item in candidates
+            if str(item.get("variant", "")) == "targeted_leading_digit_consensus"
+        ]
+        if refined:
+            best = max(refined, key=lambda item: float(item.get("confidence", 0.0)))
+            return (
+                float(round(float(best["value"]))),
+                min(0.99, float(best.get("confidence", 0.97))),
+                str(best.get("raw_text", ""))[:250],
+                "review_required",
+            )
+
+    groups = []
+    for candidate in sorted(candidates, key=lambda item: float(item.get("value", 0.0))):
+        placed = False
+        for group in groups:
+            center = float(np.median([item["value"] for item in group]))
+            if _values_close_v70(field, center, candidate["value"]):
+                group.append(candidate)
+                placed = True
+                break
+        if not placed:
+            groups.append([candidate])
+
+    ranked = []
+    for group in groups:
+        values = [float(item["value"]) for item in group]
+        base_conf = max(float(item.get("confidence", 0.0)) for item in group)
+        variants = len({str(item.get("variant", "")) for item in group})
+        targeted_bonus = 0.30 if any(item.get("targeted") for item in group) else 0.0
+        penalty = min(float(item.get("penalty", 0.0)) for item in group)
+        digit_count = max(
+            int(item.get("digit_count", len(re.sub(r"\D", "", str(item.get("raw_text", ""))))))
+            for item in group
+        )
+        precision_bonus = 0.0
+        if field in {"ctu_wellhead_pressure_psi", "ctu_circulation_pressure_psi", "ctu_reel_depth_ft", "ctu_reel_speed_ftmin", "ctu_fluid_rate_bpm", "ctu_fluid_total_bbl"}:
+            if any("." in str(item.get("raw_text", "")) and abs(float(item.get("value", 0.0)) - round(float(item.get("value", 0.0)))) > 1e-6 for item in group):
+                precision_bonus = 0.18
+        score = base_conf + 0.30 * min(variants, 4) + targeted_bonus + 0.035 * min(digit_count, 8) + precision_bonus - penalty
+        value = float(np.median(values))
+        if field in CTU_INTEGER_FIELDS_V70 and abs(value - round(value)) < 0.35:
+            value = float(round(value))
+            score += 0.10
+        ranked.append((score, value, group))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    best_score, best_value, best_group = ranked[0]
+    second_score = ranked[1][0] if len(ranked) > 1 else -1.0
+    # A targeted decimal reading is preferred over a truncated integer from the
+    # full-screen pass when both values are nearly identical (e.g. 12098.7 vs
+    # 12098). This preserves the displayed decimal without inventing a new value.
+    if field in {"ctu_wellhead_pressure_psi", "ctu_circulation_pressure_psi", "ctu_reel_depth_ft", "ctu_reel_speed_ftmin", "ctu_fluid_rate_bpm", "ctu_fluid_total_bbl"}:
+        precise_targets = [
+            item for item in candidates
+            if item.get("targeted")
+            and "." in str(item.get("raw_text", ""))
+            and abs(float(item.get("value", 0.0)) - round(float(item.get("value", 0.0)))) > 1e-6
+        ]
+        if precise_targets:
+            precise = max(precise_targets, key=lambda item: (float(item.get("confidence", 0.0)), len(re.sub(r"\D", "", str(item.get("raw_text", ""))))))
+            precise_value = float(precise["value"])
+            if abs(precise_value - best_value) <= max(1.0, 0.01 * max(abs(precise_value), abs(best_value), 1.0)):
+                best_value = precise_value
+                best_group = [precise]
+                best_score = max(best_score, float(precise.get("confidence", 0.0)) + 0.75)
+    confidence = max(0.0, min(1.0, 0.42 + 0.20 * best_score))
+    status = "accepted"
+    best_variants = len({str(item.get("variant", "")) for item in best_group})
+    if confidence < 0.68 or best_variants < 2 or (second_score > 0 and best_score - second_score < 0.15):
+        status = "review_required"
+    if field in CTU_INTEGER_FIELDS_V70:
+        best_value = float(round(best_value))
+    elif field in {"ctu_wellhead_pressure_psi", "ctu_circulation_pressure_psi", "ctu_reel_speed_ftmin", "ctu_fluid_rate_bpm"}:
+        best_value = float(round(best_value, 2))
+    elif field in {"ctu_reel_depth_ft", "ctu_fluid_total_bbl"}:
+        best_value = float(round(best_value, 1))
+    raw = " | ".join(sorted({str(item.get("raw_text", "")) for item in best_group if item.get("raw_text")}))
+    return best_value, confidence, raw[:250], status
+
+
+def parse_ctu_all_data_screen_image(uploaded_file, source_name="Image_OCR") -> pd.DataFrame:
+    """v70 CTU/HMI OCR for direct images and images inside WhatsApp ZIPs.
+
+    It rectifies the display, combines four full-screen OCR passes, performs
+    targeted fallbacks only where required, and exposes per-field confidence/raw
+    text so no uncertain OCR number is silently trusted.
+    """
+    Image, _, _, _ = _try_import_ocr_libs()
+    if Image is None:
+        return pd.DataFrame()
+    try:
+        if hasattr(uploaded_file, "seek"):
+            uploaded_file.seek(0)
+        original = Image.open(uploaded_file).convert("RGB")
+        rectified, screen_meta = _rectify_ctu_screen_v70(original)
+        file_name = getattr(uploaded_file, "name", source_name)
+        dt_from_name = parse_datetime_from_filename(file_name)
+
+        all_candidates = _full_screen_candidates_v70(rectified)
+        # Always reinforce the historically difficult boxes; for all other boxes,
+        # use targeted OCR only when the full-screen candidate set is weak.
+        difficult = {
+            "ctu_lt_weight_lbf", "ctu_circulation_pressure_psi",
+            "ctu_reel_speed_ftmin", "ctu_n2_rate_scfm", "ctu_n2_total_scf",
+        }
+        for field in CTU_VALUE_ROIS_V70:
+            current = all_candidates.get(field, [])
+            best_full_conf = max([float(item.get("confidence", 0.0)) for item in current] or [0.0])
+            if field in difficult or len(current) == 0 or best_full_conf < 0.75:
+                all_candidates[field].extend(_targeted_field_candidates_v70(rectified, field))
+
+        row = {
+            "source": source_name,
+            "sheet": "CTU_Image_OCR",
+            "source_type": "ctu_image_ocr_v70",
+            "ocr_template": "ctu_all_data_rectified_v70",
+            "ocr_build_id": CTU_OCR_BUILD_ID_V70,
+            "image_file": file_name,
+            "well": "Unknown",
+            "link_status": "ocr_manual_link_required",
+            "review_required": True,
+            **screen_meta,
+        }
+        if pd.notna(dt_from_name):
+            row["datetime"] = dt_from_name
+            row["date"] = pd.Timestamp(dt_from_name).floor("D")
+            row["time_text"] = pd.Timestamp(dt_from_name).strftime("%H:%M")
+
+        found = 0
+        confidence_values = []
+        low_confidence_fields = []
+        for field in CTU_VALUE_ROIS_V70:
+            value, confidence, raw_text, status = _select_ctu_candidate_v70(
+                field, all_candidates.get(field, [])
+            )
+            # High-digit cumulative counters are always explicitly reviewed; a
+            # single glyph error can change the value by hundreds of thousands.
+            if field == "ctu_n2_total_scf" and pd.notna(value):
+                status = "review_required"
+            row[f"ocr_raw__{field}"] = raw_text
+            row[f"ocr_conf__{field}"] = confidence
+            row[f"ocr_status__{field}"] = status
+            if pd.notna(value):
+                row[field] = float(value)
+                found += 1
+                confidence_values.append(float(confidence))
+                if status != "accepted":
+                    low_confidence_fields.append(column_label(field))
+
+        row["ocr_fields_found"] = found
+        row["ocr_confidence"] = float(np.mean(confidence_values)) if confidence_values else 0.0
+        row["ocr_low_confidence_fields"] = "; ".join(low_confidence_fields)
+        row["ocr_status"] = (
+            "parsed_review_required" if found >= 3 else "low_confidence_or_not_ctu_screen"
+        )
+        row["data_quality_note"] = append_note(
+            row.get("data_quality_note"),
+            "OCR values require field review before engineering use"
+            + (f"; low confidence: {', '.join(low_confidence_fields)}" if low_confidence_fields else ""),
+        )
+        if found < 3:
+            return pd.DataFrame()
+        return pd.DataFrame([row])
+    except Exception as exc:
+        return pd.DataFrame([{
+            "source": source_name,
+            "sheet": "CTU_Image_OCR",
+            "source_type": "ctu_image_ocr_v70",
+            "image_file": getattr(uploaded_file, "name", source_name),
+            "ocr_status": "ocr_failed",
+            "data_quality_note": f"OCR failed: {exc}",
+            "review_required": True,
+            "well": "Unknown",
+            "link_status": "ocr_manual_link_required",
+        }])
+
+# v70 accepts modern phone image exports as well as JPG/PNG.
+try:
+    IMAGE_SUFFIXES.add("webp")
+except Exception:
+    pass

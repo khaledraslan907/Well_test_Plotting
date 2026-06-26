@@ -21,7 +21,7 @@ import streamlit as st
 try:
     import tmu_parser as _tmu_parser
 except Exception as _parser_import_error:
-    st.set_page_config(page_title="TMU Production Intelligence", page_icon="🛢️", layout="wide")
+    st.set_page_config(page_title="TMU Production Test Analysis", page_icon="📈", layout="wide")
     st.error("Could not import tmu_parser.py. Make sure app.py and tmu_parser.py are in the same folder and were both updated from the same ZIP package.")
     st.code("""
 Required files in the same folder:
@@ -43,7 +43,7 @@ _missing_required = [
     if not hasattr(_tmu_parser, name)
 ]
 if _missing_required:
-    st.set_page_config(page_title="TMU Production Intelligence", page_icon="🛢️", layout="wide")
+    st.set_page_config(page_title="TMU Production Test Analysis", page_icon="📈", layout="wide")
     st.error("Your tmu_parser.py is older than app.py. Update tmu_parser.py from the latest package.")
     st.code("Missing parser functions: " + ", ".join(_missing_required))
     st.stop()
@@ -358,92 +358,82 @@ def chart_title_from_data(df, custom_title: str = "") -> str:
 
 
 st.set_page_config(
-    page_title="TMU Production Intelligence",
-    page_icon="🛢️",
+    page_title="TMU Production Test Analysis",
+    page_icon="📈",
     layout="wide",
 )
 
-APP_UI_BUILD_ID = "v70-final-ocr-gas-balance-ui-20260624"
+APP_UI_BUILD_ID = "v71-simple-light-dark-ui-20260626"
 
 UI_THEME_PRESETS = {
-    "Petroleum Dark": {
-        "app_bg": "#0B1219",
-        "app_bg_2": "#111C26",
-        "sidebar_bg": "#101B25",
-        "panel_bg": "#16232E",
-        "panel_bg_2": "#1B2B37",
-        "input_bg": "#1D2E3B",
-        "border": "#304758",
-        "accent": "#2F6D8A",
-        "accent_hover": "#3F86A8",
-        "gold": "#C8A96B",
-        "gold_soft": "#E2C98E",
-        "text": "#E9F0F4",
-        "text_muted": "#A8B8C4",
-        "success": "#4CAF78",
-        "warning": "#F59E0B",
-        "danger": "#E05B55",
-        "chart_paper": "#FFFFFF",
-        "chart_plot": "#F7F9FC",
-        "chart_text": "#17212B",
-        "chart_grid": "#DCE4EA",
-        "chart_grid_soft": "#EAF0F4",
-        "chart_legend": "rgba(255,255,255,0.94)",
-    },
-    "Field Report Light": {
-        "app_bg": "#F3F6F8",
-        "app_bg_2": "#FFFFFF",
-        "sidebar_bg": "#EAF0F4",
+    "Light": {
+        "color_scheme": "light",
+        "app_bg": "#F4F7FA",
+        "app_bg_2": "#EAF0F5",
+        "sidebar_bg": "#F8FAFC",
         "panel_bg": "#FFFFFF",
-        "panel_bg_2": "#F7FAFC",
+        "panel_bg_2": "#F5F8FA",
         "input_bg": "#FFFFFF",
-        "border": "#CBD7E0",
-        "accent": "#285D78",
-        "accent_hover": "#347896",
-        "gold": "#A98036",
-        "gold_soft": "#C8A96B",
-        "text": "#15232E",
-        "text_muted": "#5F7280",
-        "success": "#2E7D5B",
-        "warning": "#C97900",
-        "danger": "#B93A34",
+        "border": "#CDD9E2",
+        "border_strong": "#AFC1CE",
+        "accent": "#0F627B",
+        "accent_hover": "#147D9A",
+        "accent_soft": "#DCEEF3",
+        "gold": "#A97B32",
+        "gold_soft": "#C69A52",
+        "text": "#10222E",
+        "text_strong": "#081923",
+        "text_muted": "#5C7180",
+        "success": "#287A57",
+        "warning": "#A86100",
+        "danger": "#B73E38",
+        "grid": "rgba(15, 98, 123, 0.035)",
+        "glow": "rgba(47, 141, 168, 0.14)",
+        "shadow": "rgba(22, 46, 60, 0.10)",
         "chart_paper": "#FFFFFF",
-        "chart_plot": "#FAFBFC",
-        "chart_text": "#17212B",
-        "chart_grid": "#DCE4EA",
-        "chart_grid_soft": "#EEF2F5",
+        "chart_plot": "#F8FAFC",
+        "chart_text": "#152631",
+        "chart_grid": "#D9E3EA",
+        "chart_grid_soft": "#ECF1F4",
         "chart_legend": "rgba(255,255,255,0.96)",
     },
-    "Night Shift": {
-        "app_bg": "#05090D",
-        "app_bg_2": "#0A1118",
-        "sidebar_bg": "#081018",
-        "panel_bg": "#101B24",
-        "panel_bg_2": "#14222D",
-        "input_bg": "#132531",
-        "border": "#284657",
-        "accent": "#21A6C7",
-        "accent_hover": "#35BEDF",
-        "gold": "#D5AE5A",
-        "gold_soft": "#F0CE80",
-        "text": "#ECF7FA",
-        "text_muted": "#91ABB7",
-        "success": "#3DDC97",
-        "warning": "#FFB020",
-        "danger": "#FF6B62",
-        "chart_paper": "#0D1720",
-        "chart_plot": "#101D27",
-        "chart_text": "#E9F4F8",
-        "chart_grid": "#2B414F",
-        "chart_grid_soft": "#223540",
-        "chart_legend": "rgba(13,23,32,0.94)",
+    "Dark": {
+        "color_scheme": "dark",
+        "app_bg": "#07111A",
+        "app_bg_2": "#0A1721",
+        "sidebar_bg": "#09151E",
+        "panel_bg": "#101E29",
+        "panel_bg_2": "#142531",
+        "input_bg": "#0D1A24",
+        "border": "#294250",
+        "border_strong": "#3C5B6B",
+        "accent": "#48AFC9",
+        "accent_hover": "#67C3D8",
+        "accent_soft": "#153541",
+        "gold": "#D1AA63",
+        "gold_soft": "#E2C27E",
+        "text": "#EDF4F7",
+        "text_strong": "#FFFFFF",
+        "text_muted": "#A8BBC5",
+        "success": "#55C58A",
+        "warning": "#F2B75D",
+        "danger": "#F2766E",
+        "grid": "rgba(133, 188, 208, 0.045)",
+        "glow": "rgba(46, 151, 184, 0.17)",
+        "shadow": "rgba(0, 0, 0, 0.34)",
+        "chart_paper": "#0B1822",
+        "chart_plot": "#0E1D28",
+        "chart_text": "#EAF2F5",
+        "chart_grid": "#304754",
+        "chart_grid_soft": "#223743",
+        "chart_legend": "rgba(11,24,34,0.96)",
     },
 }
 
-if "ui_theme" not in st.session_state:
-    st.session_state["ui_theme"] = "Petroleum Dark"
-ACTIVE_THEME_NAME = st.session_state.get("ui_theme", "Petroleum Dark")
-ACTIVE_THEME = UI_THEME_PRESETS.get(ACTIVE_THEME_NAME, UI_THEME_PRESETS["Petroleum Dark"])
+if st.session_state.get("ui_theme") not in UI_THEME_PRESETS:
+    st.session_state["ui_theme"] = "Light"
+ACTIVE_THEME_NAME = st.session_state.get("ui_theme", "Light")
+ACTIVE_THEME = UI_THEME_PRESETS.get(ACTIVE_THEME_NAME, UI_THEME_PRESETS["Light"])
 CHART_PAPER_BG = ACTIVE_THEME["chart_paper"]
 CHART_PLOT_BG = ACTIVE_THEME["chart_plot"]
 CHART_TEXT = ACTIVE_THEME["chart_text"]
@@ -748,6 +738,7 @@ st.markdown(
     f"""
     <style>
     :root {{
+        color-scheme: {ACTIVE_THEME['color_scheme']};
         --petro-bg: {ACTIVE_THEME['app_bg']};
         --petro-bg-2: {ACTIVE_THEME['app_bg_2']};
         --petro-sidebar: {ACTIVE_THEME['sidebar_bg']};
@@ -755,79 +746,331 @@ st.markdown(
         --petro-panel-2: {ACTIVE_THEME['panel_bg_2']};
         --petro-input: {ACTIVE_THEME['input_bg']};
         --petro-border: {ACTIVE_THEME['border']};
+        --petro-border-strong: {ACTIVE_THEME['border_strong']};
         --petro-accent: {ACTIVE_THEME['accent']};
         --petro-accent-hover: {ACTIVE_THEME['accent_hover']};
+        --petro-accent-soft: {ACTIVE_THEME['accent_soft']};
         --petro-gold: {ACTIVE_THEME['gold']};
         --petro-gold-soft: {ACTIVE_THEME['gold_soft']};
         --petro-text: {ACTIVE_THEME['text']};
+        --petro-text-strong: {ACTIVE_THEME['text_strong']};
         --petro-muted: {ACTIVE_THEME['text_muted']};
         --petro-success: {ACTIVE_THEME['success']};
         --petro-warning: {ACTIVE_THEME['warning']};
         --petro-danger: {ACTIVE_THEME['danger']};
+        --petro-grid: {ACTIVE_THEME['grid']};
+        --petro-glow: {ACTIVE_THEME['glow']};
+        --petro-shadow: {ACTIVE_THEME['shadow']};
     }}
-    html, body, [class*="css"] {{ font-family: Inter, "Segoe UI", Roboto, Arial, sans-serif; }}
+
+    html, body, [class*="css"] {{
+        font-family: Inter, Aptos, "Segoe UI", Roboto, Arial, sans-serif;
+    }}
+
     .stApp {{
-        background: radial-gradient(circle at 88% 2%, color-mix(in srgb, var(--petro-accent) 16%, transparent), transparent 28rem), linear-gradient(145deg, var(--petro-bg) 0%, var(--petro-bg-2) 100%) !important;
+        color: var(--petro-text) !important;
+        background-color: var(--petro-bg) !important;
+        background-image:
+            radial-gradient(circle at 92% -4%, var(--petro-glow), transparent 31rem),
+            linear-gradient(var(--petro-grid) 1px, transparent 1px),
+            linear-gradient(90deg, var(--petro-grid) 1px, transparent 1px),
+            linear-gradient(155deg, var(--petro-bg) 0%, var(--petro-bg-2) 100%) !important;
+        background-size: auto, 42px 42px, 42px 42px, auto !important;
+        background-attachment: fixed !important;
+    }}
+
+    header[data-testid="stHeader"] {{
+        background: color-mix(in srgb, var(--petro-bg) 92%, transparent) !important;
+        border-bottom: 1px solid color-mix(in srgb, var(--petro-border) 75%, transparent) !important;
+        backdrop-filter: blur(12px);
+    }}
+    header[data-testid="stHeader"] button,
+    [data-testid="stToolbar"] button,
+    [data-testid="stHeaderActionElements"] button {{
         color: var(--petro-text) !important;
     }}
-    .block-container {{ padding-top:1.1rem; padding-left:clamp(1rem,2.4vw,2.8rem); padding-right:clamp(1rem,2.4vw,2.8rem); padding-bottom:3rem; max-width:100%; }}
-    section[data-testid="stSidebar"] {{ background:linear-gradient(180deg,color-mix(in srgb,var(--petro-sidebar) 94%,black) 0%,var(--petro-sidebar) 100%) !important; border-right:1px solid var(--petro-border); box-shadow:10px 0 30px rgba(0,0,0,.18); }}
-    section[data-testid="stSidebar"] > div {{ padding-top:.75rem; }}
-    h1,h2,h3,h4,h5,h6,p,label,.stMarkdown,.stCaption {{ color:var(--petro-text) !important; }}
-    h1,h2,h3,h4,h5,h6 {{ letter-spacing:.01em; }}
-    .stCaption, small {{ color:var(--petro-muted) !important; }}
-    .petro-hero {{ position:relative; overflow:hidden; border:1px solid var(--petro-border); border-radius:20px; padding:1.35rem 1.55rem 1.25rem; margin:0 0 1.05rem; background:linear-gradient(120deg,color-mix(in srgb,var(--petro-panel) 96%,black),var(--petro-panel-2)); box-shadow:0 18px 55px rgba(0,0,0,.20); }}
-    .petro-hero::after {{ content:""; position:absolute; width:18rem; height:18rem; right:-6rem; top:-8rem; border:1px solid color-mix(in srgb,var(--petro-gold) 42%,transparent); border-radius:50%; box-shadow:0 0 0 2.1rem color-mix(in srgb,var(--petro-gold) 5%,transparent),0 0 0 4.3rem color-mix(in srgb,var(--petro-accent) 5%,transparent); }}
-    .petro-hero-row {{ display:flex; gap:1rem; align-items:center; position:relative; z-index:2; }}
-    .petro-mark {{ width:3.4rem; height:3.4rem; flex:0 0 3.4rem; border-radius:15px; display:flex; align-items:center; justify-content:center; font-size:1.75rem; background:linear-gradient(145deg,var(--petro-accent),color-mix(in srgb,var(--petro-accent) 60%,black)); border:1px solid color-mix(in srgb,var(--petro-gold) 60%,transparent); box-shadow:0 10px 24px rgba(0,0,0,.28); }}
-    .petro-title {{ margin:0; font-size:clamp(1.65rem,3vw,2.65rem); line-height:1.05; font-weight:850; letter-spacing:-.025em; color:var(--petro-text); }}
-    .petro-subtitle {{ margin-top:.42rem; color:var(--petro-muted); font-size:1rem; }}
-    .petro-pills {{ display:flex; flex-wrap:wrap; gap:.45rem; margin-top:.85rem; position:relative; z-index:2; }}
-    .petro-pill {{ padding:.32rem .62rem; border-radius:999px; border:1px solid var(--petro-border); background:color-mix(in srgb,var(--petro-panel-2) 86%,transparent); color:var(--petro-text); font-size:.78rem; font-weight:700; }}
-    .petro-pill.gold {{ border-color:color-mix(in srgb,var(--petro-gold) 65%,var(--petro-border)); color:var(--petro-gold-soft); }}
-    .petro-section-title {{ margin:1.1rem 0 .65rem; padding:.66rem .85rem; border-left:4px solid var(--petro-gold); border-radius:10px; background:linear-gradient(90deg,color-mix(in srgb,var(--petro-panel) 92%,transparent),transparent); color:var(--petro-text); font-size:1.05rem; font-weight:800; letter-spacing:.015em; }}
-    div[data-testid="stMetric"] {{ min-height:116px; padding:.95rem 1rem .85rem; border-radius:15px; border:1px solid var(--petro-border); border-top:3px solid var(--petro-accent); background:linear-gradient(145deg,var(--petro-panel),var(--petro-panel-2)); box-shadow:0 10px 24px rgba(0,0,0,.16); }}
-    div[data-testid="stMetricValue"] {{ font-size:clamp(1.45rem,2.1vw,2rem) !important; font-weight:850 !important; color:var(--petro-text) !important; }}
-    div[data-testid="stMetricLabel"] {{ font-size:.92rem !important; font-weight:750 !important; color:var(--petro-muted) !important; }}
-    div[data-testid="stExpander"] {{ border:1px solid var(--petro-border) !important; border-radius:13px !important; background:color-mix(in srgb,var(--petro-panel) 92%,transparent) !important; overflow:hidden; box-shadow:0 7px 18px rgba(0,0,0,.10); }}
-    div[data-testid="stExpander"] details summary {{ border-left:3px solid var(--petro-gold); font-weight:760; }}
-    div[data-baseweb="select"] > div,div[data-baseweb="input"] > div,div[data-baseweb="base-input"] > div,textarea,input {{ background-color:var(--petro-input) !important; color:var(--petro-text) !important; border-color:var(--petro-border) !important; border-radius:9px !important; }}
-    div[data-baseweb="select"] *,div[data-baseweb="input"] *,textarea,input {{ color:var(--petro-text) !important; }}
-    div[data-baseweb="popover"],div[role="listbox"],ul[role="listbox"] {{ background:var(--petro-panel-2) !important; color:var(--petro-text) !important; border-color:var(--petro-border) !important; }}
-    li[role="option"],div[role="option"] {{ color:var(--petro-text) !important; }}
-    li[role="option"]:hover,div[role="option"]:hover {{ background:color-mix(in srgb,var(--petro-accent) 22%,var(--petro-panel-2)) !important; }}
-    span[data-baseweb="tag"] {{ background:color-mix(in srgb,var(--petro-accent) 45%,var(--petro-panel-2)) !important; color:#fff !important; }}
-    input:focus,textarea:focus {{ border-color:var(--petro-accent) !important; box-shadow:0 0 0 2px color-mix(in srgb,var(--petro-accent) 28%,transparent) !important; }}
-    div[data-testid="stFileUploaderDropzone"] {{ border:1.5px dashed color-mix(in srgb,var(--petro-accent) 76%,var(--petro-border)) !important; background:color-mix(in srgb,var(--petro-input) 88%,transparent) !important; border-radius:13px !important; }}
-    .stButton > button,.stDownloadButton > button {{ min-height:2.65rem; border-radius:10px !important; border:1px solid color-mix(in srgb,var(--petro-accent) 72%,white 8%) !important; background:linear-gradient(145deg,var(--petro-accent),color-mix(in srgb,var(--petro-accent) 72%,black)) !important; color:#fff !important; font-weight:780 !important; box-shadow:0 8px 20px rgba(0,0,0,.18); transition:transform .14s ease,filter .14s ease; }}
-    .stButton > button:hover,.stDownloadButton > button:hover {{ transform:translateY(-1px); filter:brightness(1.08); }}
-    div[data-testid="stDataFrame"],div[data-testid="stTable"] {{ border-radius:12px; overflow:hidden; border:1px solid var(--petro-border); }}
-    div[data-testid="stAlert"] {{ border-radius:12px; border:1px solid var(--petro-border); }}
-    [data-testid="stTabs"] button {{ color:var(--petro-muted) !important; font-weight:720; }}
-    [data-testid="stTabs"] button[aria-selected="true"] {{ color:var(--petro-gold-soft) !important; border-bottom-color:var(--petro-gold) !important; }}
-    hr {{ border-color:var(--petro-border) !important; }}
-    @media (max-width:900px) {{ .block-container {{ padding-left:.8rem; padding-right:.8rem; }} .petro-hero {{ padding:1.05rem; border-radius:15px; }} .petro-mark {{ width:2.9rem; height:2.9rem; flex-basis:2.9rem; }} div[data-testid="stMetric"] {{ min-height:98px; padding:.75rem; }} }}
+
+    .block-container {{
+        padding-top: 1.1rem;
+        padding-left: clamp(1rem, 2.4vw, 2.8rem);
+        padding-right: clamp(1rem, 2.4vw, 2.8rem);
+        padding-bottom: 3rem;
+        max-width: 100%;
+    }}
+
+    section[data-testid="stSidebar"] {{
+        background: color-mix(in srgb, var(--petro-sidebar) 97%, transparent) !important;
+        border-right: 1px solid var(--petro-border) !important;
+        box-shadow: 8px 0 28px var(--petro-shadow) !important;
+    }}
+    section[data-testid="stSidebar"] > div {{ padding-top: .7rem; }}
+    section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
+    section[data-testid="stSidebar"] label,
+    section[data-testid="stSidebar"] span {{ color: var(--petro-text) !important; }}
+    section[data-testid="stSidebar"] .stCaption {{ color: var(--petro-muted) !important; }}
+
+    h1, h2, h3, h4, h5, h6, p, label,
+    .stMarkdown, .stCaption, .stText, [data-testid="stWidgetLabel"] {{
+        color: var(--petro-text) !important;
+    }}
+    h1, h2, h3, h4, h5, h6 {{ letter-spacing: .005em; }}
+    .stCaption, small {{ color: var(--petro-muted) !important; }}
+    a {{ color: var(--petro-accent-hover) !important; }}
+
+    .petro-hero {{
+        position: relative;
+        overflow: hidden;
+        border: 1px solid var(--petro-border);
+        border-left: 5px solid var(--petro-accent);
+        border-radius: 16px;
+        padding: 1.25rem 1.45rem;
+        margin: 0 0 1rem;
+        background: linear-gradient(135deg, var(--petro-panel) 0%, var(--petro-panel-2) 100%);
+        box-shadow: 0 14px 36px var(--petro-shadow);
+    }}
+    .petro-hero::after {{
+        content: "";
+        position: absolute;
+        right: -2rem;
+        bottom: -4.5rem;
+        width: 18rem;
+        height: 9rem;
+        border-top: 1px solid color-mix(in srgb, var(--petro-accent) 28%, transparent);
+        border-radius: 50%;
+        transform: rotate(-8deg);
+        opacity: .8;
+    }}
+    .petro-hero-row {{
+        display: flex;
+        gap: 1rem;
+        align-items: center;
+        position: relative;
+        z-index: 2;
+    }}
+    .petro-mark {{
+        width: 3.45rem;
+        height: 3.45rem;
+        flex: 0 0 3.45rem;
+        border-radius: 14px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: var(--petro-text-strong);
+        background: linear-gradient(145deg, var(--petro-accent), color-mix(in srgb, var(--petro-accent) 64%, #07131b));
+        border: 1px solid color-mix(in srgb, var(--petro-accent) 78%, var(--petro-border));
+        box-shadow: 0 9px 22px color-mix(in srgb, var(--petro-accent) 24%, transparent);
+    }}
+    .petro-chart-icon {{ width: 2.15rem; height: 2.15rem; overflow: visible; }}
+    .petro-chart-icon .axis {{ stroke: color-mix(in srgb, white 76%, var(--petro-gold-soft)); stroke-width: 2; fill: none; stroke-linecap: round; }}
+    .petro-chart-icon .trend {{ stroke: #FFFFFF; stroke-width: 3.2; fill: none; stroke-linecap: round; stroke-linejoin: round; }}
+    .petro-chart-icon .point {{ fill: var(--petro-gold-soft); stroke: #FFFFFF; stroke-width: 1.1; }}
+    .petro-title {{
+        margin: 0;
+        font-size: clamp(1.58rem, 3vw, 2.45rem);
+        line-height: 1.08;
+        font-weight: 820;
+        letter-spacing: -.025em;
+        color: var(--petro-text-strong);
+    }}
+    .petro-subtitle {{
+        margin-top: .45rem;
+        max-width: 64rem;
+        color: var(--petro-muted);
+        font-size: .98rem;
+        line-height: 1.55;
+    }}
+
+    .petro-section-title {{
+        margin: 1.05rem 0 .65rem;
+        padding: .68rem .85rem;
+        border: 1px solid color-mix(in srgb, var(--petro-border) 82%, transparent);
+        border-left: 4px solid var(--petro-gold);
+        border-radius: 10px;
+        background: color-mix(in srgb, var(--petro-panel) 92%, transparent);
+        color: var(--petro-text-strong);
+        font-size: 1.03rem;
+        font-weight: 780;
+        letter-spacing: .01em;
+        box-shadow: 0 5px 16px color-mix(in srgb, var(--petro-shadow) 62%, transparent);
+    }}
+
+    div[data-testid="stMetric"] {{
+        min-height: 112px;
+        padding: .92rem 1rem .82rem;
+        border-radius: 13px;
+        border: 1px solid var(--petro-border);
+        border-top: 3px solid var(--petro-accent);
+        background: linear-gradient(145deg, var(--petro-panel), var(--petro-panel-2));
+        box-shadow: 0 8px 22px var(--petro-shadow);
+    }}
+    div[data-testid="stMetricValue"] {{
+        font-size: clamp(1.42rem, 2.1vw, 1.95rem) !important;
+        font-weight: 820 !important;
+        color: var(--petro-text-strong) !important;
+    }}
+    div[data-testid="stMetricLabel"] {{
+        font-size: .9rem !important;
+        font-weight: 700 !important;
+        color: var(--petro-muted) !important;
+    }}
+
+    div[data-testid="stExpander"] {{
+        border: 1px solid var(--petro-border) !important;
+        border-radius: 12px !important;
+        background: color-mix(in srgb, var(--petro-panel) 96%, transparent) !important;
+        overflow: hidden;
+        box-shadow: 0 6px 18px color-mix(in srgb, var(--petro-shadow) 70%, transparent);
+    }}
+    div[data-testid="stExpander"] details summary {{
+        border-left: 3px solid var(--petro-gold);
+        color: var(--petro-text-strong) !important;
+        font-weight: 730;
+    }}
+    div[data-testid="stExpander"] details summary svg {{ fill: var(--petro-text) !important; }}
+
+    div[data-baseweb="select"] > div,
+    div[data-baseweb="input"] > div,
+    div[data-baseweb="base-input"] > div,
+    div[data-baseweb="textarea"] > div,
+    textarea, input {{
+        background-color: var(--petro-input) !important;
+        color: var(--petro-text-strong) !important;
+        border-color: var(--petro-border) !important;
+        border-radius: 8px !important;
+    }}
+    input::placeholder, textarea::placeholder {{ color: var(--petro-muted) !important; opacity: .82 !important; }}
+    div[data-baseweb="select"] *,
+    div[data-baseweb="input"] *,
+    div[data-baseweb="textarea"] *,
+    textarea, input {{ color: var(--petro-text-strong) !important; }}
+    div[data-baseweb="select"] svg,
+    div[data-baseweb="input"] svg {{ fill: var(--petro-muted) !important; }}
+
+    div[data-baseweb="popover"],
+    div[role="listbox"], ul[role="listbox"],
+    div[data-baseweb="menu"] {{
+        background: var(--petro-panel-2) !important;
+        color: var(--petro-text) !important;
+        border-color: var(--petro-border) !important;
+        box-shadow: 0 12px 30px var(--petro-shadow) !important;
+    }}
+    li[role="option"], div[role="option"] {{ color: var(--petro-text) !important; }}
+    li[role="option"]:hover, div[role="option"]:hover,
+    li[aria-selected="true"], div[aria-selected="true"] {{
+        background: color-mix(in srgb, var(--petro-accent) 22%, var(--petro-panel-2)) !important;
+        color: var(--petro-text-strong) !important;
+    }}
+    span[data-baseweb="tag"] {{
+        background: color-mix(in srgb, var(--petro-accent) 38%, var(--petro-panel-2)) !important;
+        color: var(--petro-text-strong) !important;
+    }}
+    input:focus, textarea:focus {{
+        border-color: var(--petro-accent) !important;
+        box-shadow: 0 0 0 2px color-mix(in srgb, var(--petro-accent) 26%, transparent) !important;
+    }}
+
+    [data-testid="stRadio"] label,
+    [data-testid="stCheckbox"] label,
+    [data-testid="stToggle"] label {{ color: var(--petro-text) !important; }}
+    [data-testid="stRadio"] [role="radiogroup"] {{
+        gap: .35rem;
+        padding: .28rem;
+        border: 1px solid var(--petro-border);
+        border-radius: 10px;
+        background: var(--petro-input);
+    }}
+    [data-testid="stRadio"] [role="radiogroup"] > label {{
+        padding: .24rem .45rem;
+        border-radius: 7px;
+    }}
+
+    div[data-testid="stFileUploaderDropzone"] {{
+        border: 1.5px dashed color-mix(in srgb, var(--petro-accent) 72%, var(--petro-border)) !important;
+        background: color-mix(in srgb, var(--petro-input) 94%, var(--petro-panel)) !important;
+        border-radius: 11px !important;
+    }}
+    div[data-testid="stFileUploaderDropzone"] * {{ color: var(--petro-text) !important; }}
+    div[data-testid="stFileUploaderDropzone"] small {{ color: var(--petro-muted) !important; }}
+    div[data-testid="stFileUploaderDropzone"] button {{
+        background: var(--petro-panel-2) !important;
+        color: var(--petro-text-strong) !important;
+        border: 1px solid var(--petro-border-strong) !important;
+        box-shadow: none !important;
+    }}
+    button:disabled {{ opacity: .72 !important; }}
+
+    .stButton > button, .stDownloadButton > button {{
+        min-height: 2.55rem;
+        border-radius: 9px !important;
+        border: 1px solid color-mix(in srgb, var(--petro-accent) 76%, white 8%) !important;
+        background: linear-gradient(145deg, var(--petro-accent), color-mix(in srgb, var(--petro-accent) 72%, #07131b)) !important;
+        color: #FFFFFF !important;
+        font-weight: 730 !important;
+        box-shadow: 0 7px 18px color-mix(in srgb, var(--petro-accent) 20%, transparent);
+        transition: transform .14s ease, filter .14s ease;
+    }}
+    .stButton > button:hover, .stDownloadButton > button:hover {{
+        transform: translateY(-1px);
+        filter: brightness(1.08);
+    }}
+    .stButton > button p, .stDownloadButton > button p {{ color: #FFFFFF !important; }}
+
+    div[data-testid="stDataFrame"], div[data-testid="stTable"] {{
+        border-radius: 11px;
+        overflow: hidden;
+        border: 1px solid var(--petro-border);
+        background: var(--petro-panel);
+    }}
+    div[data-testid="stDataFrame"] * {{ color: var(--petro-text) !important; }}
+
+    div[data-testid="stAlert"] {{
+        border-radius: 10px;
+        border: 1px solid var(--petro-border);
+        background: color-mix(in srgb, var(--petro-panel) 91%, var(--petro-accent-soft)) !important;
+        color: var(--petro-text) !important;
+    }}
+    div[data-testid="stAlert"] * {{ color: var(--petro-text) !important; }}
+
+    [data-testid="stTabs"] button {{ color: var(--petro-muted) !important; font-weight: 680; }}
+    [data-testid="stTabs"] button[aria-selected="true"] {{
+        color: var(--petro-text-strong) !important;
+        border-bottom-color: var(--petro-accent) !important;
+    }}
+    [data-testid="stTabs"] [data-baseweb="tab-border"] {{ background: var(--petro-border) !important; }}
+
+    [data-testid="stProgress"] > div > div {{ background-color: var(--petro-accent) !important; }}
+    hr {{ border-color: var(--petro-border) !important; }}
+
+    @media (max-width: 900px) {{
+        .block-container {{ padding-left: .8rem; padding-right: .8rem; }}
+        .petro-hero {{ padding: 1rem; border-radius: 13px; }}
+        .petro-mark {{ width: 3rem; height: 3rem; flex-basis: 3rem; }}
+        .petro-chart-icon {{ width: 1.9rem; height: 1.9rem; }}
+        div[data-testid="stMetric"] {{ min-height: 96px; padding: .72rem; }}
+    }}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 st.markdown(
-    f"""
+    """
     <div class="petro-hero">
       <div class="petro-hero-row">
-        <div class="petro-mark">🛢️</div>
-        <div>
-          <div class="petro-title">TMU Production Test Intelligence</div>
-          <div class="petro-subtitle">Field-ready production testing, device telemetry, WhatsApp ingestion, quality control, and engineering reporting.</div>
+        <div class="petro-mark" aria-hidden="true">
+          <svg class="petro-chart-icon" viewBox="0 0 48 48" role="img" aria-label="Production trend chart">
+            <path class="axis" d="M8 8v32h32" />
+            <path class="trend" d="M11 34l8-9 7 4 11-15" />
+            <circle class="point" cx="11" cy="34" r="2.6" />
+            <circle class="point" cx="19" cy="25" r="2.6" />
+            <circle class="point" cx="26" cy="29" r="2.6" />
+            <circle class="point" cx="37" cy="14" r="2.6" />
+          </svg>
         </div>
-      </div>
-      <div class="petro-pills">
-        <span class="petro-pill gold">Petroleum Engineering Workspace</span>
-        <span class="petro-pill">Excel • CSV • PDF • DOCX • ZIP</span>
-        <span class="petro-pill">WhatsApp • CTU/HMI OCR</span>
-        <span class="petro-pill">Parser {PARSER_BUILD_ID}</span>
-        <span class="petro-pill">UI {APP_UI_BUILD_ID}</span>
+        <div>
+          <div class="petro-title">TMU Production Test Analysis &amp; Visualization</div>
+          <div class="petro-subtitle">Interactive well-test plotting, engineering diagnostics, data validation, operational events, and field-ready reporting.</div>
+        </div>
       </div>
     </div>
     """,
@@ -840,15 +1083,15 @@ def render_section_title(title: str, subtitle: str = "") -> None:
 
 
 with st.sidebar:
-    st.markdown("### 🛢️ Control Center")
-    st.caption("Configure ingestion, engineering units, visualization, and reporting.")
-    st.selectbox(
-        "Interface theme",
-        list(UI_THEME_PRESETS.keys()),
+    st.markdown("### 📊 Analysis Controls")
+    st.caption("Configure data ingestion, engineering units, plots, events, and reports.")
+    st.radio(
+        "Theme",
+        ["Light", "Dark"],
+        horizontal=True,
         key="ui_theme",
-        help="Petroleum Dark is optimized for daily engineering work. Field Report Light is ideal for office reviews. Night Shift uses a dark plotting canvas.",
+        help="Light is optimized for office review and printed reports. Dark is optimized for screen-based engineering analysis.",
     )
-    st.caption(f"UI build: {APP_UI_BUILD_ID}")
 
 with st.sidebar.expander("1. Data Sources", expanded=True):
     st.caption("Bring field data from spreadsheets, reports, exported chats, device files, or images.")
