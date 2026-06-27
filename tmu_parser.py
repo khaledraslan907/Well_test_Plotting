@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Stable v77 parser facade.
+"""Stable v79 parser facade.
 
 Historical capabilities remain available through ``tmu_parser_compat`` while a
 clean adaptive engine independently interprets Excel/CSV tables.  The facade
@@ -15,7 +15,7 @@ import math
 import re
 import zipfile
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Mapping, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -23,7 +23,7 @@ import pandas as pd
 import tmu_parser_compat as compat
 import smart_tabular_v75 as smart
 
-PARSER_BUILD_ID = "v77-complete-test-smart-segmentation-ocr-20260627"
+PARSER_BUILD_ID = "v79-direct-whatsapp-zip-parser-20260627"
 
 COLUMN_LABELS: Dict[str, str] = dict(getattr(compat, "COLUMN_LABELS", {}))
 COLUMN_LABELS.update(smart.FIELD_LABELS)
@@ -429,36 +429,227 @@ def _credible_smart_tables(tables: List[pd.DataFrame]) -> bool:
     return True
 
 
+
+
+_WHATSAPP_CHAT_BASENAMES = {
+    "_chat.txt", "chat.txt", "whatsapp chat.txt", "whatsapp_chat.txt",
+}
+
+
+def _decode_text_payload(data: bytes) -> str:
+    """Decode WhatsApp/text exports without silently dropping the whole file."""
+    if not data:
+        return ""
+    for encoding in ("utf-8-sig", "utf-8", "utf-16", "utf-16-le", "utf-16-be", "cp1256", "latin-1"):
+        try:
+            text = data.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+        # Reject an obviously wrong UTF-16 decode of an ASCII/UTF-8 file.
+        if text and text.count("\x00") <= max(2, len(text) // 100):
+            return text.replace("\ufeff", "")
+    return data.decode("utf-8", errors="replace").replace("\ufeff", "")
+
+
+def _looks_like_whatsapp_export_text(text: str, member_name: str = "") -> bool:
+    base = Path(member_name).name.lower().strip()
+    if base in _WHATSAPP_CHAT_BASENAMES or "whatsapp chat" in base:
+        return True
+    sample = (text or "")[:12000]
+    # Android bracket format: [12/06/2026, 09:05:04] Sender: body
+    if re.search(r"(?m)^\s*[\u200e\u200f]?\[\d{1,2}[/-]\d{1,2}[/-]\d{2,4},\s*\d{1,2}:\d{2}", sample):
+        return True
+    # iOS/plain format: 12/06/2026, 09:05 - Sender: body
+    if re.search(r"(?m)^\s*[\u200e\u200f]?\d{1,2}[/-]\d{1,2}[/-]\d{2,4},\s*\d{1,2}:\d{2}.*?\s-\s", sample):
+        return True
+    return False
+
+
+def _parse_whatsapp_text_payload(data: bytes, source_name: str, member_name: str) -> pd.DataFrame:
+    """Parse a WhatsApp export directly, independent of the generic TXT loader.
+
+    ZIP parsing previously sent ``_chat.txt`` through the recursive generic file
+    loader and swallowed any exception.  That made text-only WhatsApp exports
+    appear empty even though the chat contained valid PICO/TMU reports.  This
+    routine deliberately tries the mature export parser and the robust block
+    parser, then keeps the strongest non-empty interpretation.
+    """
+    text = _decode_text_payload(data)
+    if not text.strip() or not _looks_like_whatsapp_export_text(text, member_name):
+        return pd.DataFrame()
+
+    candidates: List[pd.DataFrame] = []
+    parsers = [
+        getattr(compat, "parse_whatsapp_plain_or_export_text", None),
+        getattr(compat, "parse_many_tmu_messages", None),
+    ]
+    legacy = getattr(compat, "legacy", None)
+    if legacy is not None:
+        parsers.extend([
+            getattr(legacy, "parse_whatsapp_export_text", None),
+            getattr(legacy, "parse_whatsapp_plain_or_export_text", None),
+        ])
+
+    for parser in parsers:
+        if parser is None:
+            continue
+        try:
+            frame = parser(text, source_name=source_name)
+        except TypeError:
+            try:
+                frame = parser(text, source_name)
+            except Exception:
+                continue
+        except Exception:
+            continue
+        if frame is None or frame.empty:
+            continue
+        frame = _safe_postprocess(frame)
+        if frame.empty:
+            continue
+        frame["attachment_name"] = Path(member_name).name
+        frame["source_member"] = member_name
+        frame["source_type"] = frame.get("source_type", "whatsapp_export_text")
+        candidates.append(frame)
+
+    if not candidates:
+        return pd.DataFrame()
+
+    # Prefer the interpretation with the most unique, timestamped engineering
+    # readings.  Duplicate quoted/edited messages should not win merely because
+    # they inflate row count.
+    ranked = []
+    for frame in candidates:
+        candidate_dedupe_cols = [
+            c for c in ("well", "datetime", "gross_rate_bpd", "oil_rate_stbd",
+                        "water_rate_bpd", "whp_psi", "pumping_pressure_psi")
+            if c in frame.columns
+        ]
+        unique_rows = (
+            frame.drop_duplicates(subset=candidate_dedupe_cols, keep="last")
+            if candidate_dedupe_cols else frame
+        )
+        numeric_fields = sum(
+            pd.to_numeric(unique_rows[c], errors="coerce").notna().sum()
+            for c in _numeric_columns(unique_rows)
+        )
+        ranked.append((len(unique_rows), numeric_fields, frame))
+    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    result = ranked[0][2].copy()
+    dedupe_cols = [c for c in ("well", "datetime", "gross_rate_bpd", "oil_rate_stbd", "water_rate_bpd", "whp_psi", "pumping_pressure_psi") if c in result.columns]
+    if dedupe_cols:
+        result = result.drop_duplicates(subset=dedupe_cols, keep="last")
+    return assign_test_ids(result.reset_index(drop=True))
+
+
+def _zip_member_is_chat_text(member_name: str, payload: bytes) -> bool:
+    if Path(member_name).suffix.lower() != ".txt":
+        return False
+    return _looks_like_whatsapp_export_text(_decode_text_payload(payload), member_name)
+
 def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: int = 1000) -> List[pd.DataFrame]:
     data, name = _bytes_and_name(uploaded_file)
     suffix = Path(name).suffix.lower()
 
-    # ZIP is recursively handled by this facade so every spreadsheet attachment
-    # benefits from the adaptive engine.
+    # Handle WhatsApp ZIP exports explicitly.  A valid export may contain only
+    # ``_chat.txt`` and an unsupported audio file, so the chat must be parsed
+    # directly rather than delegated to the generic recursive TXT path.
     if suffix == ".zip":
         tables: List[pd.DataFrame] = []
-        with zipfile.ZipFile(io.BytesIO(data)) as zf:
-            for member in zf.namelist():
-                if member.endswith("/") or member.startswith("__MACOSX/"):
+        diagnostics: List[str] = []
+        chat_members_found = 0
+        chat_members_parsed = 0
+        image_count = 0
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(data))
+        except (zipfile.BadZipFile, OSError) as exc:
+            raise RuntimeError(f"The uploaded ZIP archive is invalid or damaged: {exc}") from exc
+
+        with zf:
+            members = [
+                m for m in zf.namelist()
+                if not m.endswith("/") and not m.startswith("__MACOSX/")
+            ]
+
+            # Pass 1: parse exported chat files first.  This guarantees that a
+            # text-only WhatsApp export still produces production-test rows.
+            chat_member_names = set()
+            for member in members:
+                member_name = Path(member).name
+                if Path(member_name).suffix.lower() != ".txt":
+                    continue
+                try:
+                    payload = zf.read(member)
+                except Exception as exc:
+                    diagnostics.append(f"{member_name}: could not be read ({exc})")
+                    continue
+                if not _zip_member_is_chat_text(member_name, payload):
+                    continue
+                chat_members_found += 1
+                chat_member_names.add(member)
+                try:
+                    frame = _parse_whatsapp_text_payload(
+                        payload,
+                        source_name=f"{name}:{member_name}",
+                        member_name=member,
+                    )
+                except Exception as exc:
+                    diagnostics.append(f"{member_name}: WhatsApp text parser failed ({exc})")
+                    continue
+                if frame is not None and not frame.empty:
+                    chat_members_parsed += 1
+                    tables.append(frame)
+                else:
+                    diagnostics.append(f"{member_name}: no complete timestamped TMU/PICO readings detected")
+
+            # Pass 2: parse tabular/PDF/image attachments.  Audio, video and
+            # stickers are intentionally ignored and do not make the ZIP fail.
+            supported = {".xlsx", ".xls", ".xlsm", ".csv", ".tsv", ".txt", ".docx", ".pdf", ".jpg", ".jpeg", ".png", ".webp"}
+            image_exts = {".jpg", ".jpeg", ".png", ".webp"}
+            for member in members:
+                if member in chat_member_names:
                     continue
                 member_name = Path(member).name
                 ext = Path(member_name).suffix.lower()
-                if ext not in {".xlsx", ".xls", ".xlsm", ".csv", ".tsv", ".txt", ".docx", ".pdf", ".jpg", ".jpeg", ".png", ".webp"}:
+                if ext not in supported:
                     continue
-                if ext in {".jpg", ".jpeg", ".png", ".webp"} and not parse_images:
-                    continue
+                if ext in image_exts:
+                    if not parse_images:
+                        continue
+                    image_count += 1
+                    if max_ocr_images > 0 and image_count > int(max_ocr_images):
+                        continue
                 try:
-                    sub = load_tabular_file(UploadedBytes(zf.read(member), member_name), parse_images=parse_images, max_ocr_images=max_ocr_images)
-                    for t in sub:
-                        t = t.copy(); t["attachment_name"] = member_name; t["source_member"] = member
-                        tables.append(t)
-                except Exception:
-                    continue
+                    payload = zf.read(member)
+                    sub = load_tabular_file(
+                        UploadedBytes(payload, member_name),
+                        parse_images=parse_images,
+                        max_ocr_images=max_ocr_images,
+                    )
+                    for table in sub:
+                        if table is None or table.empty:
+                            continue
+                        table = table.copy()
+                        table["attachment_name"] = member_name
+                        table["source_member"] = member
+                        tables.append(table)
+                except Exception as exc:
+                    diagnostics.append(f"{member_name}: {exc}")
+
         if tables:
             merged = pd.concat(tables, ignore_index=True, sort=False)
+            merged = _safe_postprocess(merged)
             merged = assign_test_ids(merged)
             return [merged]
-        raise RuntimeError("No usable production-test data was found in the ZIP archive.")
+
+        detail = ""
+        if chat_members_found:
+            detail = f" Found {chat_members_found} WhatsApp chat text file(s), but none produced complete timestamped readings."
+        elif members:
+            detail = " The archive did not contain a recognizable _chat.txt/WhatsApp chat export or a supported data attachment."
+        if diagnostics:
+            detail += " Details: " + " | ".join(diagnostics[:5])
+        raise RuntimeError("No usable production-test data was found in the ZIP archive." + detail)
 
     compat_tables: List[pd.DataFrame] = []
     smart_tables: List[pd.DataFrame] = []
@@ -556,6 +747,7 @@ def assign_test_ids(
     gap_hours: float = 12.0,
     *,
     preserve_existing: bool = False,
+    group_unknown_by_source: bool = True,
 ) -> pd.DataFrame:
     if df is None or df.empty:
         return df
@@ -568,11 +760,19 @@ def assign_test_ids(
     source_key = out.get("source", pd.Series([""] * len(out), index=out.index)).fillna("").astype(str)
     sheet_key = out.get("sheet", pd.Series([""] * len(out), index=out.index)).fillna("").astype(str)
     well_key = out["well"].fillna("Unknown").astype(str).str.strip().replace("", "Unknown")
-    out["__segment_key"] = np.where(
-        well_key.str.casefold().eq("unknown"),
-        "Unknown|" + source_key + "|" + sheet_key,
-        well_key,
-    )
+    if group_unknown_by_source:
+        # Parser-level default: unrelated files with no well context remain
+        # separated so an arbitrary ZIP cannot merge independent images.
+        out["__segment_key"] = np.where(
+            well_key.str.casefold().eq("unknown"),
+            "Unknown|" + source_key + "|" + sheet_key,
+            well_key,
+        )
+    else:
+        # Explicit UI custom-gap override: all unknown readings uploaded in the
+        # current analysis are allowed to share the same time-based segment.
+        # This lets two OCR snapshots within the selected gap form one line.
+        out["__segment_key"] = well_key
     out = out.sort_values(["__segment_key", "datetime", "source"], na_position="last", kind="stable").reset_index(drop=True)
 
     ids = pd.Series(index=out.index, dtype="object")

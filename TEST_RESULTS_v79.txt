@@ -1,0 +1,68 @@
+PRODUCTION TEST DASHBOARD v79 — VALIDATION RESULTS
+==================================================
+
+Build IDs
+---------
+Parser: v79-direct-whatsapp-zip-parser-20260627
+UI:     v79-whatsapp-zip-reliability-ui-20260627
+
+Reported failure reproduced
+---------------------------
+Input:
+  WhatsApp Chat - Sitra8-58 clean & test(2).zip
+
+Archive contents:
+  _chat.txt
+  00003066-AUDIO-2026-06-13-12-03-50.opus
+
+v78 failure mode:
+  The ZIP facade depended on recursive generic TXT handling and swallowed member
+  exceptions. A text-only export could therefore be reported as having no usable
+  production-test data.
+
+v79 result
+----------
+Rows: 74 unique production-test readings
+Well: S8-58
+First reading: 12-Jun-2026 00:00
+Last reading: 16-Jun-2026 15:00
+Duplicate well/timestamp rows: 0
+Source type: whatsapp_export_text
+Source member: _chat.txt
+Unsupported OPUS voice note: ignored safely
+
+Representative parsed values
+----------------------------
+12-Jun-2026 00:00
+  Total Gas 0.320 MMSCF/D
+  Gross 57.0 BBL/D
+  Oil 18.0 STB/D
+  Water 39.0 BBL/D
+  WHP 20 psi
+  Pumping Pressure 988 psi
+
+12-Jun-2026 00:30
+  Total Gas 0.339 MMSCF/D
+  Gross 101.0 BBL/D
+  Oil 27.0 STB/D
+  Water 64.0 BBL/D
+  WHP 20 psi
+  Pumping Pressure 1013 psi
+
+Performance
+-----------
+Parse images disabled: approximately 1.23 seconds
+Parse images enabled:  approximately 1.19 seconds
+The export has no image files, so the OPUS file does not trigger OCR.
+
+Regression checks
+-----------------
+Synthetic text-only WhatsApp ZIP plus unsupported audio: PASS
+Supplied S8-58 field ZIP: PASS
+Python compilation: PASS
+v79 parser self-test: PASS
+v79 UI/package smoke test: PASS
+TXT decoding fallbacks: enabled
+Android bracket timestamp recognition: enabled
+iOS/plain timestamp recognition: enabled
+Old Streamlit parse cache invalidation: PASS through new parser build ID

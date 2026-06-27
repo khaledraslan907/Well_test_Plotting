@@ -368,7 +368,7 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_UI_BUILD_ID = "v77-complete-test-ocr-dark-dropdown-ui-20260627"
+APP_UI_BUILD_ID = "v79-whatsapp-zip-reliability-ui-20260627"
 
 UI_THEME_PRESETS = {
     "Light": {
@@ -1199,6 +1199,64 @@ st.markdown(
         background-color: {ACTIVE_THEME['input_bg']} !important;
         color: {ACTIVE_THEME['text_strong']} !important;
     }}
+
+
+    /* Help/tooltip popovers are also mounted in a body portal. Streamlit and
+       BaseWeb may put an inline white background on an inner tooltip node, so
+       style every tooltip layer explicitly instead of styling only the icon. */
+    body [role="tooltip"],
+    body [data-baseweb="tooltip"],
+    body [data-testid="stTooltipContent"],
+    body [data-testid*="Tooltip" i][role="tooltip"],
+    body > div[data-baseweb="popover"] [role="tooltip"],
+    body > div[data-baseweb="popover"] [data-baseweb="tooltip"] {{
+        background-color: {ACTIVE_THEME['panel_bg_2']} !important;
+        background: {ACTIVE_THEME['panel_bg_2']} !important;
+        color: {ACTIVE_THEME['text_strong']} !important;
+        border: 1px solid {ACTIVE_THEME['border_strong']} !important;
+        box-shadow: 0 10px 28px {ACTIVE_THEME['shadow']} !important;
+        opacity: 1 !important;
+    }}
+    body [role="tooltip"] *,
+    body [data-baseweb="tooltip"] *,
+    body [data-testid="stTooltipContent"] *,
+    body > div[data-baseweb="popover"] [role="tooltip"] * {{
+        color: {ACTIVE_THEME['text_strong']} !important;
+        opacity: 1 !important;
+    }}
+    body [role="tooltip"] p,
+    body [data-baseweb="tooltip"] p,
+    body [data-testid="stTooltipContent"] p {{
+        color: {ACTIVE_THEME['text_strong']} !important;
+        line-height: 1.45 !important;
+    }}
+    body [data-baseweb="tooltip"] [data-popper-arrow],
+    body [role="tooltip"] [data-popper-arrow],
+    body [data-baseweb="tooltip"] [data-baseweb="arrow"] {{
+        background-color: {ACTIVE_THEME['panel_bg_2']} !important;
+        color: {ACTIVE_THEME['panel_bg_2']} !important;
+        fill: {ACTIVE_THEME['panel_bg_2']} !important;
+    }}
+    body [data-baseweb="tooltip"] svg,
+    body [role="tooltip"] svg {{
+        color: {ACTIVE_THEME['panel_bg_2']} !important;
+        fill: {ACTIVE_THEME['panel_bg_2']} !important;
+    }}
+
+    /* Fallback for Streamlit releases where the help card has no tooltip role
+       and is only an anonymous nested div inside the BaseWeb popover portal. */
+    body > div[data-baseweb="popover"] > div > div,
+    body > div[data-baseweb="popover"] > div > div > div {{
+        background-color: {ACTIVE_THEME['panel_bg_2']} !important;
+        color: {ACTIVE_THEME['text_strong']} !important;
+        border-color: {ACTIVE_THEME['border_strong']} !important;
+    }}
+    body > div[data-baseweb="popover"] > div > div p,
+    body > div[data-baseweb="popover"] > div > div span,
+    body > div[data-baseweb="popover"] > div > div label {{
+        color: {ACTIVE_THEME['text_strong']} !important;
+        opacity: 1 !important;
+    }}
     span[data-baseweb="tag"] {{
         background: color-mix(in srgb, var(--petro-accent) 38%, var(--petro-panel-2)) !important;
         color: var(--petro-text-strong) !important;
@@ -1545,29 +1603,36 @@ Pumping P= 849 Psi""",
     )
 
 with st.sidebar.expander("2. Ingestion & Processing", expanded=False):
-    st.caption("Control test segmentation, OCR workload, and robust parsing behavior.")
+    st.caption(
+        "Test segmentation controls when consecutive readings are treated as one continuous test or as a new test period."
+    )
     segmentation_mode = st.selectbox(
-        "Test segmentation",
+        "How should tests be separated?",
         [
-            "Smart parser detection (recommended)",
-            "Custom inactive gap",
-            "Keep each well/source as one test",
+            "Custom inactive gap (default)",
+            "Use parser-detected boundaries",
+            "Keep each well as one continuous test",
         ],
         index=0,
         help=(
-            "Smart mode preserves the parser's detected test boundaries, including restarts after long gaps, "
-            "while keeping sparse SRP trend readings connected."
+            "Custom inactive gap is the normal field workflow: readings stay in the same test while the time gap is at or below "
+            "the selected value, and a new test starts only when the gap is larger. This setting also controls whether uploaded "
+            "OCR images are connected by a line."
         ),
     )
-    if segmentation_mode == "Custom inactive gap":
+    if segmentation_mode == "Custom inactive gap (default)":
         test_gap_hours = st.number_input(
-            "Start a new test for the same well if gap exceeds (hours)",
+            "Start a new test when inactivity exceeds (hours)",
             min_value=1.0,
             max_value=8760.0,
             value=12.0,
             step=1.0,
-            help="Use this only when you want to override the parser's detected test boundaries.",
+            help=(
+                "Example: with 12 hours, readings 2 hours apart remain one continuous test and are joined by a line; "
+                "readings 13 hours apart start a new test period."
+            ),
         )
+        st.caption(f"Current rule: keep readings connected when the gap is ≤ {float(test_gap_hours):g} hours.")
     else:
         test_gap_hours = 12.0
     enable_ctu_ocr = st.checkbox(
@@ -1831,18 +1896,37 @@ if _quality_mask.any():
 # created later, after the safe parsing/mapping steps, so changing the display
 # unit never changes the original uploaded values.
 
-# Test segmentation. Smart mode preserves boundaries already detected from the
-# complete source table instead of re-merging separate test periods with a
-# larger UI gap. Custom modes explicitly override those boundaries.
-if segmentation_mode == "Smart parser detection (recommended)":
+# Test segmentation. The default is an explicit user-selected inactive gap.
+# In custom mode, existing parser IDs are intentionally rebuilt so uploaded
+# files, messages and OCR images from the same well remain one continuous test
+# until the selected gap is exceeded. Unknown OCR images are grouped together
+# in this explicit override mode; this is what allows two uploaded snapshots to
+# be connected by a line instead of becoming separate one-point traces.
+if segmentation_mode == "Use parser-detected boundaries":
     try:
         data = assign_test_ids(data, gap_hours=12.0, preserve_existing=True)
     except TypeError:
         data = assign_test_ids(data, gap_hours=12.0)
-elif segmentation_mode == "Custom inactive gap":
-    data = assign_test_ids(data, gap_hours=float(test_gap_hours))
+elif segmentation_mode == "Custom inactive gap (default)":
+    try:
+        data = assign_test_ids(
+            data,
+            gap_hours=float(test_gap_hours),
+            preserve_existing=False,
+            group_unknown_by_source=False,
+        )
+    except TypeError:
+        data = assign_test_ids(data, gap_hours=float(test_gap_hours))
 else:
-    data = assign_test_ids(data, gap_hours=1_000_000.0)
+    try:
+        data = assign_test_ids(
+            data,
+            gap_hours=1_000_000.0,
+            preserve_existing=False,
+            group_unknown_by_source=False,
+        )
+    except TypeError:
+        data = assign_test_ids(data, gap_hours=1_000_000.0)
 
 if "datetime" in data.columns:
     data["datetime"] = pd.to_datetime(data["datetime"], errors="coerce")
