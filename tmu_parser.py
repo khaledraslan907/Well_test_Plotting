@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Stable v73 parser facade.
+"""Stable v75 parser facade.
 
 Historical capabilities remain available through ``tmu_parser_compat`` while a
 clean adaptive engine independently interprets Excel/CSV tables.  The facade
@@ -21,9 +21,9 @@ import numpy as np
 import pandas as pd
 
 import tmu_parser_compat as compat
-import smart_tabular_v73 as smart
+import smart_tabular_v75 as smart
 
-PARSER_BUILD_ID = "v74-ensemble-smart-parser-safe-plot-columns-20260627"
+PARSER_BUILD_ID = "v75-fast-continuous-smart-parser-20260627"
 
 COLUMN_LABELS: Dict[str, str] = dict(getattr(compat, "COLUMN_LABELS", {}))
 COLUMN_LABELS.update(smart.FIELD_LABELS)
@@ -115,7 +115,16 @@ def _numeric_columns(df: pd.DataFrame) -> List[str]:
     result = []
     seen = set()
     for c in df.columns:
-        if c in seen or c in exclude or str(c).startswith("source_"):
+        ctext = str(c)
+        if c in seen or c in exclude or ctext.startswith("source_") or ctext.startswith("_"):
+            continue
+        # Hide generic template calculation helpers from the plotting list.
+        # Meaningful unfamiliar headers (for example raw_sand_probe_count) stay
+        # available, while raw_calcul_7/raw_channel_4 do not slow the UI.
+        if ctext.startswith("raw_") and re.match(
+            r"raw_(?:channel(?:_|$)|calcul(?:_|$)|factor(?:_|$)|psia(?:_|$)|h2o(?:_|$)|deg_[cf](?:_|$)|in(?:_|$)|fb(?:_|$)|ftf(?:_|$)|fg(?:_|$)|fpv(?:_|$)|y2(?:_|$)|0(?:_|$))",
+            ctext, flags=re.I,
+        ):
             continue
         seen.add(c)
         positions = [i for i, name in enumerate(df.columns) if name == c]
@@ -320,6 +329,39 @@ def _choose_ensemble(compat_tables: List[pd.DataFrame], smart_tables: List[pd.Da
     return selected
 
 
+def _xlsx_is_pathologically_wide(data: bytes) -> bool:
+    """Cheaply detect Excel used-range/formula spillover without opening pandas."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            worksheet_infos = [i for i in zf.infolist() if i.filename.startswith("xl/worksheets/sheet") and i.filename.endswith(".xml")]
+            if any(i.file_size >= 1_500_000 for i in worksheet_infos):
+                return True
+            for info in worksheet_infos:
+                head = zf.read(info.filename)[:4096].decode("utf-8", errors="ignore")
+                m = re.search(r'<dimension[^>]+ref="[A-Z]+\d+:([A-Z]+)\d+"', head)
+                if m:
+                    col = 0
+                    for ch in m.group(1):
+                        col = col * 26 + (ord(ch.upper()) - 64)
+                    if col > 512:
+                        return True
+    except Exception:
+        pass
+    return False
+
+
+def _credible_smart_tables(tables: List[pd.DataFrame]) -> bool:
+    if not tables:
+        return False
+    for table in tables:
+        if table is None or table.empty or smart.interpretation_score(table) < 70.0:
+            return False
+        known = [c for c in table.columns if c in smart.FIELD_LABELS and pd.to_numeric(table[c], errors="coerce").notna().sum() >= 2]
+        if len(known) < 2:
+            return False
+    return True
+
+
 def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: int = 1000) -> List[pd.DataFrame]:
     data, name = _bytes_and_name(uploaded_file)
     suffix = Path(name).suffix.lower()
@@ -356,27 +398,41 @@ def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: 
     compat_error = None
     smart_error = None
 
+    # Wide Excel workbooks often contain cached formulas to column XFD. The
+    # adaptive XML reader trims that spillover and is dramatically faster, so
+    # use it first. Normal workbooks continue through the mature compatibility
+    # parser. Only run the second engine when the first interpretation is weak.
+    smart_first = suffix in {".xlsx", ".xlsm"} and _xlsx_is_pathologically_wide(data)
+    if smart_first:
+        try:
+            smart_tables = smart.parse_file(data, name)
+        except Exception as exc:
+            smart_error = exc
+        if _credible_smart_tables(smart_tables):
+            return [assign_test_ids(_safe_postprocess(t)) for t in smart_tables]
+
     try:
         compat_tables = compat.load_tabular_file(UploadedBytes(data, name), parse_images=parse_images, max_ocr_images=max_ocr_images)
     except Exception as exc:
         compat_error = exc
 
     if suffix in {".xlsx", ".xlsm", ".csv", ".tsv"}:
-        # A proven high-confidence interpretation does not need a second full
-        # workbook scan.  Suspicious, sparse, warning-heavy or unfamiliar files
-        # automatically fall through to the adaptive engine.
         compat_ready = [_safe_postprocess(t) for t in compat_tables if t is not None and not t.empty]
+        # Engineering warnings are not parser-confidence failures. A legitimate
+        # field test may contain balance conflicts, so do not rescan the entire
+        # workbook merely because review_required is true.
         high_confidence = bool(compat_ready) and all(
             smart.interpretation_score(t) >= 70.0
-            and ("review_required" not in t or t["review_required"].fillna(False).astype(bool).mean() <= 0.02)
+            and len([c for c in t.columns if c in COLUMN_LABELS and pd.to_numeric(t[c], errors="coerce").notna().sum() >= 2]) >= 2
             for t in compat_ready
         )
         if high_confidence:
             return [assign_test_ids(t) for t in compat_ready]
-        try:
-            smart_tables = smart.parse_file(data, name)
-        except Exception as exc:
-            smart_error = exc
+        if not smart_tables:
+            try:
+                smart_tables = smart.parse_file(data, name)
+            except Exception as exc:
+                smart_error = exc
 
     selected = _choose_ensemble(compat_tables, smart_tables)
     if selected:

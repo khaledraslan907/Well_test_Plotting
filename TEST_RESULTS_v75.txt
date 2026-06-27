@@ -1,0 +1,69 @@
+PRODUCTION TEST DASHBOARD v75 — VALIDATION RESULTS
+=================================================
+
+Build IDs
+---------
+Parser: v75-fast-continuous-smart-parser-20260627
+Adaptive engine: v75-adaptive-fast-semantic-table-engine-20260627
+UI: v75-continuous-fast-responsive-ui-20260627
+
+Continuous plotting regression
+------------------------------
+SPR(2).xlsx:
+  Parsed readings: 12
+  Signals: Stroke Length, Stroke Rate, Peak Load, Minimum Load
+  Detected Test IDs: 1
+  Plot segments per signal: 1
+  Points in each trace: 12
+  Generic gap separators: 0
+  Result: PASS — daily readings are connected as one continuous test curve.
+
+Internal metadata regression
+----------------------------
+  _upload_order: excluded and removed before UI plotting
+  _table_order: excluded and removed before UI plotting
+  _source_row_order: excluded and removed before UI plotting
+  Generic raw_calcul_* and raw_channel_* helpers: hidden from plot choices
+  Result: PASS
+
+Uploaded-file parser validation
+-------------------------------
+SPR(2).xlsx
+  Rows: 12
+  Parser time: approximately 0.23 s
+  Result: PASS
+
+6-B15-42 (Dasco 27) (9-6-2026)(4).xlsx
+  Rows: 10
+  Parser time: approximately 2.98 s
+  Required oil/water/gas/gross fields: PASS
+
+12-S8-58 (12-06-2026)(3).xlsx
+  Workbook issue detected: cached/used range extended to column XFD
+  Actual measurement interval: 12-Jun-2026 18:00 to 15-Jun-2026 23:30
+  Measurement rows: 59
+  Parser time: approximately 4.45 s
+  WHP, N2, separator pressure, total gas, formation gas, oil, water,
+  gross rate and pumping pressure: PASS
+
+Streamlit interaction validation
+--------------------------------
+SPR upload and first chart: approximately 1.52 s
+Theme change after plotting: approximately 0.75 s
+Plot-style change after plotting: approximately 0.58 s
+Exceptions: 0
+
+Wide S8-58 application validation
+---------------------------------
+First upload, parse and chart: approximately 7.46 s
+Theme change after plotting: approximately 1.26 s
+Exceptions: 0
+Plotly charts rendered: 1
+
+Static and runtime tests
+------------------------
+Python compilation: PASS
+v75 UI smoke test: PASS
+v75 parser/plot regression test: PASS
+Streamlit AppTest upload: PASS
+Streamlit post-plot interaction: PASS

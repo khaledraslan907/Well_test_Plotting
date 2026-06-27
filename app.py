@@ -368,7 +368,7 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_UI_BUILD_ID = "v74-safe-numeric-theme-export-20260627"
+APP_UI_BUILD_ID = "v75-continuous-fast-responsive-ui-20260627"
 
 UI_THEME_PRESETS = {
     "Light": {
@@ -795,12 +795,9 @@ def detected_test_separator_positions(df):
     return dedup
 
 def chart_separator_positions(df):
-    items = list(detected_test_separator_positions(df))
-    existing = {str(x.get("x")) for x in items}
-    for x in compressed_separator_positions(df):
-        if str(x) not in existing:
-            items.append({"x": x})
-    return items
+    # Dashed separators mark actual detected test changes only. Long intervals
+    # between readings inside one test remain a continuous curve.
+    return list(detected_test_separator_positions(df))
 
 
 
@@ -1415,6 +1412,10 @@ else:
 if rows_merged:
     st.caption(f"Merged {rows_merged:,} repeated row(s) with the same well and date/time, keeping the most complete values.")
 
+# Internal ingestion-order fields are used only while resolving duplicate rows.
+# They are not engineering measurements and must never appear in plots/tables.
+data.drop(columns=[c for c in ["_upload_order", "_table_order", "_source_row_order"] if c in data.columns], inplace=True, errors="ignore")
+
 # Parser-level quality review. Impossible physical values are excluded from
 # plotted canonical columns but retained in Rejected Values for audit.
 _quality_mask = pd.Series(False, index=data.index)
@@ -1729,10 +1730,8 @@ def compressed_time_mapping(datetimes: pd.Series, continuous_gap_hours: float = 
         dt = pd.Timestamp(dt_raw)
         diff_h = max((dt - prev_dt).total_seconds() / 3600.0, 0.0)
         if diff_h > continuous_gap_hours:
-            # A true break between tests. Put a separator in the middle of the
-            # short visual gap and then continue from there.
-            sep_x = current_x + compressed_gap_hours / 2.0
-            separators.append({"x": sep_x, "before": prev_dt, "after": dt, "gap_hours": diff_h})
+            # Compress empty calendar time only. A long sampling interval does
+            # not split a physical test and does not create a dashed boundary.
             current_x += compressed_gap_hours
         else:
             current_x += diff_h
@@ -1762,25 +1761,20 @@ def add_plot_axis_columns(df, x_axis_mode, trace_grouping="Auto", continuous_gap
         for _, idx in out.groupby("series_group_key", dropna=False).groups.items():
             g0 = out.loc[idx].copy().sort_values("datetime")
             seg_id = 0
-            prev_dt = None
             prev_test = None
-            prev_source = None
             for row_idx, dt in zip(g0.index, pd.to_datetime(g0["datetime"], errors="coerce")):
-                current_test = str(g0.loc[row_idx, "test_id"]) if "test_id" in g0.columns else ""
-                current_source = "|".join(str(g0.loc[row_idx, c]) for c in ["source", "sheet"] if c in g0.columns)
+                current_test = str(g0.loc[row_idx, "test_id"]).strip() if "test_id" in g0.columns else ""
                 if pd.isna(dt):
                     out.loc[row_idx, "series_segment_id"] = seg_id
                     continue
-                if prev_dt is not None:
-                    diff_h = max((pd.Timestamp(dt) - pd.Timestamp(prev_dt)).total_seconds() / 3600.0, 0.0)
-                    changed_test = bool(current_test and prev_test and current_test != prev_test)
-                    changed_report_after_gap = bool(current_source != prev_source and diff_h > max(float(continuous_gap_hours or 0), 0.0))
-                    if changed_test or changed_report_after_gap or diff_h > max(float(continuous_gap_hours or 0), 0.0):
-                        seg_id += 1
+                # A curve is continuous for the complete detected test, regardless
+                # of whether samples are 30 minutes, 24 hours, or several days
+                # apart. Split only when test_id explicitly changes.
+                changed_test = bool(current_test and prev_test and current_test != prev_test)
+                if changed_test:
+                    seg_id += 1
                 out.loc[row_idx, "series_segment_id"] = seg_id
-                prev_dt = dt
-                prev_test = current_test
-                prev_source = current_source
+                prev_test = current_test or prev_test
 
     if x_axis_mode == "Real calendar time":
         if "datetime" in out.columns and out["datetime"].notna().any():
@@ -1803,9 +1797,8 @@ def add_plot_axis_columns(df, x_axis_mode, trace_grouping="Auto", continuous_gap
                 out.loc[g.index, "plot_x"] = pd.Series(range(0, len(g)), index=g.index, dtype=float)
         return out
 
-    # Compressed real-date timeline. The mapping is global, so readings from an
-    # Excel file ending at 05:00 and WhatsApp readings starting 06:00 stay
-    # continuous when the gap is under the user-defined threshold.
+    # Compressed real-date timeline. The mapping is global and only shortens
+    # empty calendar gaps; it never splits readings that share one Test ID.
     if "datetime" in out.columns and out["datetime"].notna().any():
         mapping, separators = compressed_time_mapping(out["datetime"], continuous_gap_hours, compressed_gap_hours)
         out["plot_x"] = pd.to_datetime(out["datetime"], errors="coerce").map(lambda d: mapping.get(pd.Timestamp(d), np.nan) if pd.notna(d) else np.nan)
@@ -2271,12 +2264,12 @@ with st.sidebar.expander("4. Timeline & Test Segmentation", expanded=False):
     )
     if is_compressed_real_date_mode(x_axis_mode):
         continuous_gap_hours = st.number_input(
-            "Treat readings as continuous when gap is ≤ hours",
+            "Keep real spacing for gaps up to (hours)",
             min_value=0.0,
             max_value=24.0,
             value=2.0,
             step=0.5,
-            help="Example: if Excel ends 05:00 and WhatsApp continues 06:00, a 2-hour threshold keeps them as one continuous test.",
+            help="Longer empty periods are visually compressed, but all readings with the same Test ID remain connected as one curve.",
         )
         compressed_gap_hours = st.number_input(
             "Visual gap shown for separated tests (hours)",
