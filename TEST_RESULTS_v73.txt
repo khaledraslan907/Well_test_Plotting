@@ -1,0 +1,31 @@
+PRODUCTION TEST DASHBOARD v73 — VALIDATION RESULTS
+=================================================
+
+Production Test Dashboard v73 smart parser self-test: PASS
+Production Test Dashboard v73 UI smoke test: PASS
+Streamlit AppTest: PASS — zero application exceptions on initial load.
+
+Field and adaptability validation
+----------------------------------
+B3 C18-7(3).xlsx	table=1	rows=74	numeric=28	review=0	start=2026-06-05 08:00:00	end=2026-06-06 21:00:00	engine=v68_sparse_xml	seconds=0.685
+SPR.xlsx	table=1	rows=12	numeric=7	review=0	start=2026-06-14 00:00:00	end=2026-06-25 00:00:00	engine=v68_sparse_xml	seconds=0.067
+CTR02097-1123 Bahga-9 EXPRO MPFM WELL TEST DATA REPORT (02-06-2023)(2).pdf	table=1	rows=229	numeric=34	review=0	start=2023-06-01 10:00:00	end=2023-06-02 05:00:00	engine=v68	seconds=1.767
+B7-22 (20-06-2026) future layout.xlsx	table=1	rows=5	numeric=11	review=0	start=2026-06-20 23:00:00	end=2026-06-21 01:00:00	engine=v73-adaptive-semantic-table-engine-20260626	seconds=0.356
+NEWCO_A12-3_adaptive.xlsx	table=1	rows=8	numeric=7	review=0	start=2026-06-20 23:00:00	end=2026-06-21 02:30:00	engine=v73-adaptive-semantic-table-engine-20260626	seconds=0.485
+SRP_X5 custom.xlsx	table=1	rows=6	numeric=8	review=0	start=2026-06-01 08:00:00	end=2026-06-01 13:00:00	engine=v68_sparse_xml	seconds=0.046
+
+Validated corrections
+---------------------
+- B3 C18-7: MM SCF/D remains MMSCF/D; 74 rows; no false gas-balance warnings.
+- SPR: Date column containing date and hour is accepted; native SRP fields are recognized.
+- EXPRO PDF: fixed-position MPFM row alignment is retained; BS&W and rates are not shifted.
+- New time-only template: date inferred from file name and midnight rollover repaired.
+- New metric-unit template: bar is converted to psi and m3/d is converted to bbl/d.
+- Unknown numeric channels: preserved as raw_<header> and available for plotting/mapping.
+- Parser facade: no duplicate public function definitions.
+
+Engineering behavior
+--------------------
+The parser does not overwrite supplied measurements merely to force a rate or gas
+balance. It derives a component only when it is missing. Material source conflicts
+are preserved and flagged for review with practical absolute/relative tolerances.

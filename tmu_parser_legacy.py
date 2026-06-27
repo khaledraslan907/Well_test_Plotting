@@ -15,6 +15,8 @@ PARSER_BUILD_ID_V59 = "v59-choke-zero-test-breaks-20260621"
 PARSER_BUILD_ID_V58 = "v58-persistent-units-test-separation-20260621"
 PARSER_BUILD_ID_V57 = PARSER_BUILD_ID_V58
 PARSER_BUILD_ID_V56 = PARSER_BUILD_ID_V57
+
+PARSER_COMPAT_BUILD_ID_V72 = "v72-expro-column-alignment-20260626"
 KEYWORDS = [
     "date", "time", "well", "choke", "whp", "w.h.p", "wellhead", "sep", "separator",
     "gas", "formation", "gross", "oil", "water", "bsw", "bs&w", "wc", "salinity",
@@ -1968,8 +1970,12 @@ def parse_expro_mpfm_text(text: str, source_name: str = "EXPRO_MPFM_PDF") -> pd.
 
     current_date = pd.NaT
     rows = []
+    # EXPRO Data & Events rows contain one choke column followed by 24 MPFM
+    # measurements. Older builds inserted an extra ``choke_ambiguous`` slot,
+    # shifting every value one column to the right (for example QGross became
+    # BS&W). Keep the schema exactly aligned with the report header.
     expro_cols = [
-        "choke_size_64", "choke_ambiguous", "whp_psi", "flow_press_psi", "flow_temp_c",
+        "choke_size_64", "whp_psi", "flow_press_psi", "flow_temp_c",
         "mpfm_press_psig", "mpfm_temp_f", "dp_mbar",
         "qoil_s_stbd", "qwat_s_bpd", "qgas_s_mmscfd",
         "qoil_a_bpd", "qwat_a_bpd", "qgas_a_mmcfd",
@@ -2000,10 +2006,10 @@ def parse_expro_mpfm_text(text: str, source_name: str = "EXPRO_MPFM_PDF") -> pd.
             continue
 
         nums = re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", rest.replace(",", ""))
-        if len(nums) < 25:
+        if len(nums) < len(expro_cols):
             continue
 
-        vals = [float(x) for x in nums[:25]]
+        vals = [float(x) for x in nums[: len(expro_cols)]]
         row = dict(zip(expro_cols, vals))
         row["source"] = source_name
         row["sheet"] = "EXPRO_MPFM_Data_Events"

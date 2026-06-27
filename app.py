@@ -367,7 +367,7 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_UI_BUILD_ID = "v72-clear-dark-srp-parser-ui-20260626"
+APP_UI_BUILD_ID = "v73-ensemble-smart-parser-ui-20260626"
 
 UI_THEME_PRESETS = {
     "Light": {
