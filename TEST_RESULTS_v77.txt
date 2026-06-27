@@ -1,0 +1,65 @@
+PRODUCTION TEST DASHBOARD v77 — VALIDATION RESULTS
+================================================
+
+Build IDs
+---------
+Parser: v77-complete-test-smart-segmentation-ocr-20260627
+UI:     v77-complete-test-ocr-dark-dropdown-ui-20260627
+
+S8-58 complete workbook
+-----------------------
+File: 12-S8-58 (12-06-2026)(4).xlsx
+Parsed engineering rows: 92
+Start: 2026-06-12 18:00:00
+End:   2026-06-16 16:00:00
+Detected test streams: 2
+  Test 1: 14 rows, 2026-06-12 18:00 to 2026-06-13 00:30
+  Test 2: 78 spreadsheet rows, 2026-06-15 01:30 to 2026-06-16 16:00
+Previous truncated result: 59 rows ending 2026-06-15 23:30
+Result: FIXED
+
+SRP segmentation
+----------------
+File: SPR(2).xlsx
+Rows: 12
+Test streams: 1
+Daily readings remain one connected SRP trend.
+Result: PASS
+
+CTU/HMI image OCR
+-----------------
+File: WhatsApp Image 2026-06-16 at 14.35.12.jpeg
+Weight: 21024 lbf
+Lt Weight: -1 lbf
+WHP: 29.16 psi
+Circulation Pressure: 693.99 psi
+Reel Depth: 10149.6 ft
+Reel Speed: -0.01 ft/min
+Fluid Flow: 0.00 bpm
+N2 Flow: 0 scf/min
+Fluid Total: 0.0 bbl
+N2 Total: 0 scf
+All ten fields match the screen.
+Result: PASS
+
+OCR contextual linking
+----------------------
+Image timestamp: 2026-06-16 14:35:12
+Nearest spreadsheet reading: 2026-06-16 14:30:00
+Inherited well: S8-58
+Inherited test: S8-58_20260615_0130
+Status: ocr_auto_linked_by_timestamp
+Result: PASS
+
+Plot signal filtering
+---------------------
+screen_* metadata hidden: PASS
+ocr_raw__* metadata hidden: PASS
+ocr_conf__* metadata hidden: PASS
+Canonical CTU channels available: PASS
+
+Static checks
+-------------
+Python compilation: PASS
+v77 parser self-test: PASS
+v77 UI smoke test: PASS

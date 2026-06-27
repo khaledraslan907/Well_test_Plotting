@@ -368,7 +368,7 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_UI_BUILD_ID = "v76-dark-visibility-scroll-controls-ui-20260627"
+APP_UI_BUILD_ID = "v77-complete-test-ocr-dark-dropdown-ui-20260627"
 
 UI_THEME_PRESETS = {
     "Light": {
@@ -1162,6 +1162,43 @@ st.markdown(
         background: color-mix(in srgb, var(--petro-accent) 22%, var(--petro-panel-2)) !important;
         color: var(--petro-text-strong) !important;
     }}
+
+    /* BaseWeb mounts select/multiselect menus in a body-level portal. Some
+       Streamlit builds apply an inline white surface to the inner menu, so use
+       explicit theme colors on every portal layer and option descendant. */
+    body > div[data-baseweb="popover"],
+    body > div[data-baseweb="popover"] > div,
+    [data-baseweb="popover"] [data-baseweb="menu"],
+    [data-baseweb="popover"] [role="listbox"],
+    [data-baseweb="popover"] ul[role="listbox"] {{
+        background-color: {ACTIVE_THEME['panel_bg_2']} !important;
+        color: {ACTIVE_THEME['text']} !important;
+        border-color: {ACTIVE_THEME['border_strong']} !important;
+    }}
+    [data-baseweb="popover"] [role="option"],
+    [data-baseweb="popover"] [role="option"] > div,
+    [data-baseweb="popover"] [role="option"] span,
+    [data-baseweb="popover"] li,
+    [data-baseweb="popover"] li * {{
+        color: {ACTIVE_THEME['text']} !important;
+        opacity: 1 !important;
+    }}
+    [data-baseweb="popover"] [role="option"]:not([aria-selected="true"]) {{
+        background-color: {ACTIVE_THEME['panel_bg_2']} !important;
+    }}
+    [data-baseweb="popover"] [role="option"]:hover,
+    [data-baseweb="popover"] [role="option"][aria-selected="true"] {{
+        background-color: {ACTIVE_THEME['control_hover']} !important;
+        color: {ACTIVE_THEME['text_strong']} !important;
+    }}
+    [data-baseweb="popover"] [role="option"]:hover *,
+    [data-baseweb="popover"] [role="option"][aria-selected="true"] * {{
+        color: {ACTIVE_THEME['text_strong']} !important;
+    }}
+    [data-baseweb="popover"] input {{
+        background-color: {ACTIVE_THEME['input_bg']} !important;
+        color: {ACTIVE_THEME['text_strong']} !important;
+    }}
     span[data-baseweb="tag"] {{
         background: color-mix(in srgb, var(--petro-accent) 38%, var(--petro-panel-2)) !important;
         color: var(--petro-text-strong) !important;
@@ -1509,21 +1546,30 @@ Pumping P= 849 Psi""",
 
 with st.sidebar.expander("2. Ingestion & Processing", expanded=False):
     st.caption("Control test segmentation, OCR workload, and robust parsing behavior.")
-    keep_same_well_one_test = st.checkbox(
-        "Keep same well as one test regardless of time gap",
-        value=False,
-        help="Use this when a long test has large inactive periods but still belongs to the same well test.",
+    segmentation_mode = st.selectbox(
+        "Test segmentation",
+        [
+            "Smart parser detection (recommended)",
+            "Custom inactive gap",
+            "Keep each well/source as one test",
+        ],
+        index=0,
+        help=(
+            "Smart mode preserves the parser's detected test boundaries, including restarts after long gaps, "
+            "while keeping sparse SRP trend readings connected."
+        ),
     )
-    test_gap_hours = st.number_input(
-        "Start a new test for the same well if gap exceeds (hours)",
-        min_value=1.0,
-        max_value=8760.0,
-        value=72.0,
-        step=1.0,
-        disabled=keep_same_well_one_test,
-        help="Same well continues the same test until this inactive gap is exceeded. Use a large value or the checkbox above for long tests.",
-    )
-    effective_test_gap_hours = 1_000_000.0 if keep_same_well_one_test else float(test_gap_hours)
+    if segmentation_mode == "Custom inactive gap":
+        test_gap_hours = st.number_input(
+            "Start a new test for the same well if gap exceeds (hours)",
+            min_value=1.0,
+            max_value=8760.0,
+            value=12.0,
+            step=1.0,
+            help="Use this only when you want to override the parser's detected test boundaries.",
+        )
+    else:
+        test_gap_hours = 12.0
     enable_ctu_ocr = st.checkbox(
         "Process images contained inside WhatsApp ZIPs",
         value=False,
@@ -1687,6 +1733,65 @@ if rows_merged:
 # They are not engineering measurements and must never appear in plots/tables.
 data.drop(columns=[c for c in ["_upload_order", "_table_order", "_source_row_order"] if c in data.columns], inplace=True, errors="ignore")
 
+
+def _auto_link_ocr_rows_by_time_context(df: pd.DataFrame, max_gap_hours: float = 3.0) -> pd.DataFrame:
+    """Link an OCR image only when one nearby test context is unambiguous.
+
+    Directly uploaded photos do not contain the well name, but their WhatsApp
+    filename contains an accurate timestamp. When spreadsheet/text readings
+    from exactly one test exist within the short time window, inherit that
+    well/test ID. Values still remain review-required until the engineer
+    approves the OCR fields.
+    """
+    parser_linker = getattr(_tmu_parser, "auto_link_ocr_rows_by_time_context", None)
+    if parser_linker is not None:
+        return parser_linker(df, max_gap_hours=max_gap_hours)
+    if df is None or df.empty or "datetime" not in df.columns or "source_type" not in df.columns:
+        return df
+    out = df.copy()
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+    ocr_mask = out["source_type"].astype(str).str.contains("ocr", case=False, na=False)
+    if not ocr_mask.any():
+        return out
+    well_text = out.get("well", pd.Series("Unknown", index=out.index)).fillna("Unknown").astype(str).str.strip()
+    test_text = out.get("test_id", pd.Series("", index=out.index)).fillna("").astype(str).str.strip()
+    anchors = out[
+        (~ocr_mask)
+        & out["datetime"].notna()
+        & well_text.ne("")
+        & ~well_text.str.casefold().eq("unknown")
+        & test_text.ne("")
+    ].copy()
+    if anchors.empty:
+        return out
+
+    for idx in out.index[ocr_mask & out["datetime"].notna()]:
+        current_well = str(out.at[idx, "well"] if "well" in out.columns else "Unknown").strip()
+        current_link = str(out.at[idx, "link_status"] if "link_status" in out.columns else "").strip()
+        if current_well and current_well.casefold() != "unknown" and current_link not in {"", "ocr_manual_link_required"}:
+            continue
+        deltas = (anchors["datetime"] - out.at[idx, "datetime"]).abs()
+        nearby = anchors.loc[deltas <= pd.Timedelta(hours=float(max_gap_hours))].copy()
+        if nearby.empty:
+            continue
+        contexts = nearby[[c for c in ["well", "test_id", "test_sequence"] if c in nearby.columns]].drop_duplicates()
+        if "test_id" not in contexts.columns or contexts["test_id"].astype(str).nunique() != 1:
+            continue
+        nearest_idx = deltas.loc[nearby.index].idxmin()
+        anchor = anchors.loc[nearest_idx]
+        for col in ["well", "test_id", "test_sequence"]:
+            if col in anchor.index and pd.notna(anchor[col]):
+                out.at[idx, col] = anchor[col]
+        out.at[idx, "link_status"] = "ocr_auto_linked_by_timestamp"
+        out.at[idx, "suggested_well"] = anchor.get("well", "")
+        out.at[idx, "suggested_test_id"] = anchor.get("test_id", "")
+        gap_minutes = float(deltas.loc[nearest_idx].total_seconds() / 60.0)
+        out.at[idx, "suggested_link_reason"] = f"Unique nearby test reading ({gap_minutes:.1f} min)"
+    return out
+
+
+data = _auto_link_ocr_rows_by_time_context(data, max_gap_hours=3.0)
+
 # Parser-level quality review. Impossible physical values are excluded from
 # plotted canonical columns but retained in Rejected Values for audit.
 _quality_mask = pd.Series(False, index=data.index)
@@ -1726,9 +1831,18 @@ if _quality_mask.any():
 # created later, after the safe parsing/mapping steps, so changing the display
 # unit never changes the original uploaded values.
 
-# Test segmentation: same well continues until the selected gap is exceeded;
-# a different well is always a separate test stream.
-data = assign_test_ids(data, gap_hours=float(effective_test_gap_hours))
+# Test segmentation. Smart mode preserves boundaries already detected from the
+# complete source table instead of re-merging separate test periods with a
+# larger UI gap. Custom modes explicitly override those boundaries.
+if segmentation_mode == "Smart parser detection (recommended)":
+    try:
+        data = assign_test_ids(data, gap_hours=12.0, preserve_existing=True)
+    except TypeError:
+        data = assign_test_ids(data, gap_hours=12.0)
+elif segmentation_mode == "Custom inactive gap":
+    data = assign_test_ids(data, gap_hours=float(test_gap_hours))
+else:
+    data = assign_test_ids(data, gap_hours=1_000_000.0)
 
 if "datetime" in data.columns:
     data["datetime"] = pd.to_datetime(data["datetime"], errors="coerce")

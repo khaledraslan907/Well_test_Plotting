@@ -6686,7 +6686,7 @@ CTU_VALUE_ROIS_V70 = {
 
 CTU_FIELD_RANGES_V70 = {
     "ctu_weight_lbf": (0.0, 250000.0),
-    "ctu_lt_weight_lbf": (0.0, 5000.0),
+    "ctu_lt_weight_lbf": (-5000.0, 5000.0),
     "ctu_wellhead_pressure_psi": (0.0, 10000.0),
     "ctu_circulation_pressure_psi": (0.0, 10000.0),
     "ctu_reel_depth_ft": (0.0, 60000.0),
@@ -6844,9 +6844,9 @@ def _normalise_ctu_candidate_v70(field, value, raw_text=""):
     if not np.isfinite(number):
         return []
     low, high = CTU_FIELD_RANGES_V70[field]
-    # All displayed CTU values in this template are nonnegative. A minus sign is
-    # commonly a border/line OCR artifact. Reel speed may be negative, so retain it.
-    if field != "ctu_reel_speed_ftmin":
+    # Most displayed values are nonnegative. Reel speed and line-tension weight
+    # can legitimately be negative, so preserve their signs.
+    if field not in {"ctu_reel_speed_ftmin", "ctu_lt_weight_lbf"}:
         number = abs(number)
 
     candidates = [(number, 0.0)]
@@ -6934,6 +6934,214 @@ def _full_screen_candidates_v70(rectified_image):
                         "penalty": transform_penalty,
                         "targeted": False,
                     })
+    return output
+
+
+def _adaptive_joined_screen_candidates_v77(rectified_image):
+    """Recover split/glare-obscured digits with one adaptive full-screen pass.
+
+    Tesseract often returns ``693`` and ``99.`` as separate tokens, or ``10149``
+    and ``6`` for the reel depth.  Joining the tokens inside each known value
+    box and applying the display's fixed decimal precision recovers the full
+    engineering value without using a generic OCR guess.
+    """
+    try:
+        import cv2
+        import numpy as _np
+        import pytesseract
+    except Exception:
+        return {field: [] for field in CTU_VALUE_ROIS_V70}
+
+    rgb = _np.array(rectified_image.convert("RGB"))
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    adaptive = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 9
+    )
+    try:
+        data = pytesseract.image_to_data(
+            adaptive,
+            config="--oem 3 --psm 11 -c tessedit_char_whitelist=-0123456789.",
+            output_type=pytesseract.Output.DATAFRAME,
+        )
+    except Exception:
+        return {field: [] for field in CTU_VALUE_ROIS_V70}
+
+    output = {field: [] for field in CTU_VALUE_ROIS_V70}
+    if data is None or data.empty:
+        return output
+    tokens = {field: [] for field in CTU_VALUE_ROIS_V70}
+    for _, item in data.dropna(subset=["text"]).iterrows():
+        field = _field_for_ocr_box_v70(
+            item.get("left", 0), item.get("top", 0), item.get("width", 0), item.get("height", 0)
+        )
+        text = str(item.get("text", "") or "").strip()
+        if not field or not re.search(r"\d", text):
+            continue
+        tokens[field].append((float(item.get("left", 0)), text, float(item.get("conf", 0) or 0)))
+
+    decimal_places = {
+        "ctu_circulation_pressure_psi": 2,
+        "ctu_reel_depth_ft": 1,
+        "ctu_reel_speed_ftmin": 2,
+        "ctu_fluid_rate_bpm": 2,
+        "ctu_fluid_total_bbl": 1,
+    }
+    supported = {
+        "ctu_weight_lbf", "ctu_circulation_pressure_psi", "ctu_reel_depth_ft",
+        "ctu_reel_speed_ftmin", "ctu_fluid_rate_bpm", "ctu_fluid_total_bbl",
+        "ctu_n2_total_scf",
+    }
+    for field in supported:
+        parts = sorted(tokens.get(field, []), key=lambda item: item[0])
+        if not parts:
+            continue
+        digits = "".join(re.sub(r"\D", "", part[1]) for part in parts)
+        if not digits:
+            continue
+        sign = -1.0 if any("-" in part[1] for part in parts) and field == "ctu_reel_speed_ftmin" else 1.0
+        if field in decimal_places:
+            places = decimal_places[field]
+            if len(digits) <= places:
+                continue
+            value = sign * (float(int(digits)) / (10.0 ** places))
+            raw_text = " | ".join(part[1] for part in parts) + f" -> {value:g}"
+        else:
+            value = sign * float(int(digits))
+            raw_text = " | ".join(part[1] for part in parts)
+        low, high = CTU_FIELD_RANGES_V70[field]
+        if not low <= value <= high:
+            continue
+        confidences = [max(0.0, min(100.0, part[2])) / 100.0 for part in parts]
+        confidence = max(0.72, float(_np.mean(confidences)) if confidences else 0.72)
+        output[field].append({
+            "value": float(value),
+            "confidence": confidence,
+            "raw_text": raw_text,
+            "variant": "adaptive_joined_v77",
+            "penalty": 0.0,
+            "targeted": True,
+            "digit_count": len(digits),
+        })
+    return output
+
+
+def _targeted_special_candidates_v77(rectified_image, field):
+    """Small field-specific fallbacks for glare, signs and isolated zeros."""
+    try:
+        import cv2
+        import numpy as _np
+        import pytesseract
+    except Exception:
+        return []
+
+    rgb = _np.array(rectified_image.convert("RGB"))
+    x1, y1, x2, y2 = CTU_VALUE_ROIS_V70[field]
+    crop = rgb[max(0, y1):min(rgb.shape[0], y2), max(0, x1):min(rgb.shape[1], x2)]
+    if crop.size == 0:
+        return []
+    output = []
+
+    def _read_candidates(image, variant_prefix, psms=(8, 13), confidence=0.94):
+        local = []
+        enlarged = cv2.resize(image, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+        for psm in psms:
+            try:
+                text = pytesseract.image_to_string(
+                    enlarged,
+                    config=f"--oem 3 --psm {psm} -c tessedit_char_whitelist=-0123456789.",
+                ).strip()
+            except Exception:
+                continue
+            for raw_number in _clean_ocr_numeric_text_v70(text):
+                for number, penalty in _normalise_ctu_candidate_v70(field, raw_number, text):
+                    local.append({
+                        "value": number,
+                        "confidence": confidence,
+                        "raw_text": text,
+                        "variant": f"{variant_prefix}_psm{psm}",
+                        "penalty": penalty,
+                        "targeted": True,
+                        "digit_count": len(re.sub(r"\D", "", text)),
+                    })
+        return local
+
+    bgr = cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+
+    if field == "ctu_wellhead_pressure_psi":
+        blue, green, red = cv2.split(bgr)
+        red_score = (red.astype(_np.int16) * 2 - green.astype(_np.int16) - blue.astype(_np.int16)).clip(0)
+        red_score = cv2.normalize(red_score, None, 0, 255, cv2.NORM_MINMAX).astype(_np.uint8)
+        output.extend(_read_candidates(red_score, "targeted_red_v77", confidence=0.97))
+
+    elif field == "ctu_lt_weight_lbf":
+        # The HMI displays a sign on the left and the magnitude on the right.
+        # OCR them separately so "- 1" cannot become 7.
+        width = crop.shape[1]
+        right = gray[:, int(width * 0.35):]
+        right = cv2.adaptiveThreshold(right, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 7)
+        magnitudes = []
+        enlarged_right = cv2.resize(right, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_CUBIC)
+        for psm in (8, 13):
+            try:
+                text = pytesseract.image_to_string(
+                    enlarged_right,
+                    config=f"--oem 3 --psm {psm} -c tessedit_char_whitelist=0123456789",
+                ).strip()
+            except Exception:
+                continue
+            match = re.search(r"\d+", text)
+            if match:
+                magnitudes.append((int(match.group(0)), text, psm))
+        sign_negative = False
+        left_red = cv2.split(bgr[:, :max(1, int(width * 0.45))])[2]
+        try:
+            sign_text = pytesseract.image_to_string(
+                cv2.resize(left_red, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_CUBIC),
+                config="--oem 3 --psm 8 -c tessedit_char_whitelist=-",
+            ).strip()
+            sign_negative = "-" in sign_text
+        except Exception:
+            sign_text = ""
+        # Tesseract may discard a standalone minus sign. Confirm it directly as
+        # a short horizontal component in the middle-left of the value box,
+        # excluding the long bottom border.
+        if not sign_negative:
+            sign_gray = gray[int(gray.shape[0] * 0.15):int(gray.shape[0] * 0.80), :max(1, int(width * 0.55))]
+            for threshold in (160, 180):
+                binary = cv2.threshold(sign_gray, threshold, 255, cv2.THRESH_BINARY_INV)[1]
+                count, _, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
+                for component in range(1, count):
+                    _, _, comp_w, comp_h, area = stats[component]
+                    aspect = comp_w / max(comp_h, 1)
+                    if 8 <= comp_w <= max(18, int(width * 0.18)) and comp_h <= 12 and aspect >= 2.5 and area >= 10:
+                        sign_negative = True
+                        sign_text = "-"
+                        break
+                if sign_negative:
+                    break
+        if magnitudes:
+            counts = {}
+            for magnitude, _, _ in magnitudes:
+                counts[magnitude] = counts.get(magnitude, 0) + 1
+            magnitude = max(counts, key=lambda key: (counts[key], key))
+            value = -float(magnitude) if sign_negative else float(magnitude)
+            output.append({
+                "value": value,
+                "confidence": 0.98 if counts[magnitude] >= 2 else 0.90,
+                "raw_text": f"{sign_text} {magnitude}".strip(),
+                "variant": "targeted_lt_signed_v77",
+                "penalty": 0.0,
+                "targeted": True,
+                "digit_count": len(str(magnitude)),
+            })
+
+    elif field in {"ctu_n2_rate_scfm", "ctu_n2_total_scf"}:
+        width = crop.shape[1]
+        right = gray[:, int(width * 0.42):]
+        right = cv2.adaptiveThreshold(right, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 7)
+        output.extend(_read_candidates(right, "targeted_right_adaptive_v77", confidence=0.95))
+
     return output
 
 
@@ -7122,6 +7330,39 @@ def _select_ctu_candidate_v70(field, candidates):
     if not candidates:
         return np.nan, 0.0, "", "missing"
 
+    # v77 audited field-specific reads. These are accepted only when the
+    # dedicated preprocessing produced a value for the intended box.
+    if field == "ctu_lt_weight_lbf":
+        signed = [c for c in candidates if str(c.get("variant", "")) == "targeted_lt_signed_v77"]
+        if signed:
+            best = max(signed, key=lambda item: float(item.get("confidence", 0.0)))
+            return (
+                float(round(float(best["value"]))),
+                float(best.get("confidence", 0.9)),
+                str(best.get("raw_text", ""))[:250],
+                "accepted" if float(best.get("confidence", 0.0)) >= 0.9 else "review_required",
+            )
+
+    if field in {"ctu_circulation_pressure_psi", "ctu_reel_depth_ft"}:
+        joined = [c for c in candidates if str(c.get("variant", "")) == "adaptive_joined_v77"]
+        if joined:
+            best = max(joined, key=lambda item: (float(item.get("confidence", 0.0)), int(item.get("digit_count", 0))))
+            value = float(best["value"])
+            value = round(value, 2 if field == "ctu_circulation_pressure_psi" else 1)
+            return value, min(0.99, float(best.get("confidence", 0.8)) + 0.08), str(best.get("raw_text", ""))[:250], "accepted"
+
+    if field == "ctu_wellhead_pressure_psi":
+        red = [c for c in candidates if str(c.get("variant", "")).startswith("targeted_red_v77")]
+        if red:
+            groups = {}
+            for item in red:
+                key = round(float(item["value"]), 2)
+                groups.setdefault(key, []).append(item)
+            value, group = max(groups.items(), key=lambda kv: (len(kv[1]), max(float(x.get("confidence", 0.0)) for x in kv[1])))
+            confidence = max(float(x.get("confidence", 0.0)) for x in group)
+            raw = " | ".join(sorted({str(x.get("raw_text", "")) for x in group if x.get("raw_text")}))
+            return float(value), confidence, raw[:250], "accepted" if len(group) >= 2 else "review_required"
+
     # A leading-digit correction is accepted only after at least two independent
     # single-character OCR modes agree. Prefer that audited result over a larger
     # whole-token consensus that repeats the same glyph confusion.
@@ -7226,6 +7467,9 @@ def parse_ctu_all_data_screen_image(uploaded_file, source_name="Image_OCR") -> p
         dt_from_name = parse_datetime_from_filename(file_name)
 
         all_candidates = _full_screen_candidates_v70(rectified)
+        adaptive_joined = _adaptive_joined_screen_candidates_v77(rectified)
+        for field, candidates in adaptive_joined.items():
+            all_candidates.setdefault(field, []).extend(candidates)
         # Always reinforce the historically difficult boxes; for all other boxes,
         # use targeted OCR only when the full-screen candidate set is weak.
         difficult = {
@@ -7237,6 +7481,7 @@ def parse_ctu_all_data_screen_image(uploaded_file, source_name="Image_OCR") -> p
             best_full_conf = max([float(item.get("confidence", 0.0)) for item in current] or [0.0])
             if field in difficult or len(current) == 0 or best_full_conf < 0.75:
                 all_candidates[field].extend(_targeted_field_candidates_v70(rectified, field))
+            all_candidates[field].extend(_targeted_special_candidates_v77(rectified, field))
 
         row = {
             "source": source_name,

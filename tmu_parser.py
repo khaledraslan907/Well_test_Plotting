@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Stable v75 parser facade.
+"""Stable v77 parser facade.
 
 Historical capabilities remain available through ``tmu_parser_compat`` while a
 clean adaptive engine independently interprets Excel/CSV tables.  The facade
@@ -23,7 +23,7 @@ import pandas as pd
 import tmu_parser_compat as compat
 import smart_tabular_v75 as smart
 
-PARSER_BUILD_ID = "v75-fast-continuous-smart-parser-20260627"
+PARSER_BUILD_ID = "v77-complete-test-smart-segmentation-ocr-20260627"
 
 COLUMN_LABELS: Dict[str, str] = dict(getattr(compat, "COLUMN_LABELS", {}))
 COLUMN_LABELS.update(smart.FIELD_LABELS)
@@ -116,7 +116,17 @@ def _numeric_columns(df: pd.DataFrame) -> List[str]:
     seen = set()
     for c in df.columns:
         ctext = str(c)
-        if c in seen or c in exclude or ctext.startswith("source_") or ctext.startswith("_"):
+        if (
+            c in seen
+            or c in exclude
+            or ctext.startswith("source_")
+            or ctext.startswith("_")
+            or ctext.startswith("screen_")
+            or ctext.startswith("ocr_raw__")
+            or ctext.startswith("ocr_conf__")
+            or ctext.startswith("ocr_status__")
+            or ctext in {"ocr_fields_found", "ocr_confidence"}
+        ):
             continue
         # Hide generic template calculation helpers from the plotting list.
         # Meaningful unfamiliar headers (for example raw_sand_probe_count) stay
@@ -324,8 +334,29 @@ def _choose_ensemble(compat_tables: List[pd.DataFrame], smart_tables: List[pd.Da
             groups.append([item])
     selected = []
     for group in groups:
-        ranked = sorted(group, key=lambda x: smart.interpretation_score(x[1]), reverse=True)
-        selected.append(ranked[0][1])
+        # A slightly cleaner interpretation must not win by silently truncating
+        # the end of a long field test. Score quality and coverage together.
+        max_rows = max(len(table) for _, table in group)
+        spans = []
+        for _, table in group:
+            dt = pd.to_datetime(table.get("datetime"), errors="coerce") if "datetime" in table else pd.Series(dtype="datetime64[ns]")
+            span_h = 0.0
+            if not dt.empty and dt.notna().any():
+                span_h = max(0.0, float((dt.max() - dt.min()).total_seconds() / 3600.0))
+            spans.append(span_h)
+        max_span = max(spans or [0.0])
+
+        ranked = []
+        for (engine, table), span_h in zip(group, spans):
+            quality = float(smart.interpretation_score(table))
+            row_coverage = len(table) / max(max_rows, 1)
+            span_coverage = span_h / max(max_span, 1.0) if max_span > 0 else 1.0
+            # Coverage bonuses are modest: they break close quality ties, but
+            # cannot rescue a genuinely poor interpretation.
+            ensemble_score = quality + 10.0 * row_coverage + 4.0 * span_coverage
+            ranked.append((ensemble_score, quality, len(table), span_h, engine, table))
+        ranked.sort(key=lambda item: (item[0], item[1], item[2], item[3]), reverse=True)
+        selected.append(ranked[0][-1])
     return selected
 
 
@@ -348,6 +379,42 @@ def _xlsx_is_pathologically_wide(data: bytes) -> bool:
     except Exception:
         pass
     return False
+
+
+def _xlsx_last_declared_row(data: bytes) -> int:
+    """Return the largest worksheet row declared in the XLSX XML."""
+    last_row = 0
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            for info in zf.infolist():
+                if not (info.filename.startswith("xl/worksheets/sheet") and info.filename.endswith(".xml")):
+                    continue
+                xml = zf.read(info.filename)
+                for match in re.finditer(rb"<row\s[^>]*\br=\"(\d+)\"", xml):
+                    last_row = max(last_row, int(match.group(1)))
+    except Exception:
+        return 0
+    return last_row
+
+
+def _smart_tables_reach_workbook_tail(tables: List[pd.DataFrame], data: bytes) -> bool:
+    """Guard the fast path against a credible but prematurely truncated table."""
+    last_declared = _xlsx_last_declared_row(data)
+    if last_declared <= 0 or not tables:
+        return True
+    parsed_rows = []
+    for table in tables:
+        if "source_row" in table.columns:
+            values = pd.to_numeric(table["source_row"], errors="coerce")
+            if values.notna().any():
+                parsed_rows.append(int(values.max()))
+    if not parsed_rows:
+        return True
+    parsed_last = max(parsed_rows)
+    # Allow headers, averages and a short footer. A larger unparsed tail is a
+    # strong sign that another test block exists below the first one.
+    allowance = max(8, int(0.08 * last_declared))
+    return parsed_last >= last_declared - allowance
 
 
 def _credible_smart_tables(tables: List[pd.DataFrame]) -> bool:
@@ -408,7 +475,7 @@ def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: 
             smart_tables = smart.parse_file(data, name)
         except Exception as exc:
             smart_error = exc
-        if _credible_smart_tables(smart_tables):
+        if _credible_smart_tables(smart_tables) and _smart_tables_reach_workbook_tail(smart_tables, data):
             return [assign_test_ids(_safe_postprocess(t)) for t in smart_tables]
 
     try:
@@ -462,7 +529,34 @@ def parse_whatsapp_plain_or_export_text(text: str, source_name: str = "WhatsApp"
     return assign_test_ids(_safe_postprocess(fn(text, source_name=source_name)))
 
 
-def assign_test_ids(df: pd.DataFrame, gap_hours: float = 12.0) -> pd.DataFrame:
+def _is_srp_trend_group(group: pd.DataFrame) -> bool:
+    """Return True for sparse SRP surveillance/trend datasets."""
+    srp_cols = {
+        "stroke_length_in", "stroke_rate_spm", "spm", "peak_load_lbf",
+        "min_load_lbf", "minimum_load_lbf", "polished_rod_load_lbf",
+    }
+    production_cols = {
+        "gross_rate_bpd", "oil_rate_stbd", "water_rate_bpd",
+        "gas_rate_mmscfd", "gas_formation_mmscfd", "sep_p_psi",
+        "pumping_pressure_psi", "n2_rate_mmscfd",
+    }
+    srp_hits = sum(
+        pd.to_numeric(group[c], errors="coerce").notna().sum()
+        for c in srp_cols if c in group.columns
+    )
+    production_hits = sum(
+        pd.to_numeric(group[c], errors="coerce").notna().sum()
+        for c in production_cols if c in group.columns
+    )
+    return srp_hits >= max(3, len(group)) and production_hits == 0
+
+
+def assign_test_ids(
+    df: pd.DataFrame,
+    gap_hours: float = 12.0,
+    *,
+    preserve_existing: bool = False,
+) -> pd.DataFrame:
     if df is None or df.empty:
         return df
     out = df.copy()
@@ -471,24 +565,105 @@ def assign_test_ids(df: pd.DataFrame, gap_hours: float = 12.0) -> pd.DataFrame:
     if "datetime" not in out:
         out["datetime"] = pd.NaT
     out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
-    out = out.sort_values(["well", "datetime", "source"], na_position="last", kind="stable").reset_index(drop=True)
-    ids = []
-    sequence = []
-    state: Dict[str, tuple[pd.Timestamp, int, str]] = {}
-    for _, row in out.iterrows():
-        well = str(row.get("well") or "Unknown")
-        dt = row.get("datetime")
-        last, seq, current = state.get(well, (pd.NaT, 0, ""))
-        new = not current or pd.isna(dt) or pd.isna(last) or dt - last > pd.Timedelta(hours=gap_hours) or dt < last
-        if new:
-            seq += 1
-            current = f"{well}_{pd.Timestamp(dt).strftime('%Y%m%d_%H%M')}" if pd.notna(dt) else f"{well}_T{seq:02d}"
-        ids.append(current); sequence.append(seq)
-        if pd.notna(dt):
-            last = dt
-        state[well] = (last, seq, current)
+    source_key = out.get("source", pd.Series([""] * len(out), index=out.index)).fillna("").astype(str)
+    sheet_key = out.get("sheet", pd.Series([""] * len(out), index=out.index)).fillna("").astype(str)
+    well_key = out["well"].fillna("Unknown").astype(str).str.strip().replace("", "Unknown")
+    out["__segment_key"] = np.where(
+        well_key.str.casefold().eq("unknown"),
+        "Unknown|" + source_key + "|" + sheet_key,
+        well_key,
+    )
+    out = out.sort_values(["__segment_key", "datetime", "source"], na_position="last", kind="stable").reset_index(drop=True)
+
+    ids = pd.Series(index=out.index, dtype="object")
+    sequences = pd.Series(index=out.index, dtype="Int64")
+    for _, idxs in out.groupby("__segment_key", sort=False, dropna=False).groups.items():
+        idxs = list(idxs)
+        group = out.loc[idxs]
+        effective_gap = max(float(gap_hours), 24.0 * 14.0) if _is_srp_trend_group(group) else float(gap_hours)
+        last = pd.NaT
+        seq = 0
+        current = ""
+        for i in idxs:
+            row = out.loc[i]
+            dt = row.get("datetime")
+            existing = str(row.get("test_id") or "").strip()
+            if preserve_existing and existing and existing.lower() not in {"nan", "none"}:
+                current = existing
+                try:
+                    seq = int(row.get("test_sequence")) if pd.notna(row.get("test_sequence")) else max(seq, 1)
+                except Exception:
+                    seq = max(seq, 1)
+                ids.at[i] = current
+                sequences.at[i] = seq
+                if pd.notna(dt):
+                    last = pd.Timestamp(dt)
+                continue
+
+            new = (
+                not current
+                or pd.isna(dt)
+                or pd.isna(last)
+                or pd.Timestamp(dt) - pd.Timestamp(last) > pd.Timedelta(hours=effective_gap)
+                or pd.Timestamp(dt) < pd.Timestamp(last)
+            )
+            if new:
+                seq += 1
+                display_well = str(row.get("well") or "Unknown").strip() or "Unknown"
+                current = (
+                    f"{display_well}_{pd.Timestamp(dt).strftime('%Y%m%d_%H%M')}"
+                    if pd.notna(dt)
+                    else f"{display_well}_T{seq:02d}"
+                )
+            ids.at[i] = current
+            sequences.at[i] = seq
+            if pd.notna(dt):
+                last = pd.Timestamp(dt)
+
     out["test_id"] = ids
-    out["test_sequence"] = sequence
+    out["test_sequence"] = sequences.astype("Int64")
+    return out.drop(columns=["__segment_key"], errors="ignore")
+
+
+def auto_link_ocr_rows_by_time_context(df: pd.DataFrame, max_gap_hours: float = 3.0) -> pd.DataFrame:
+    """Safely inherit well/test context for timestamped OCR rows.
+
+    A link is made only when all nearby non-OCR readings belong to one unique
+    test ID. OCR measurements remain review-required; only context is inherited.
+    """
+    if df is None or df.empty or "datetime" not in df.columns or "source_type" not in df.columns:
+        return df
+    out = df.copy()
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+    ocr_mask = out["source_type"].astype(str).str.contains("ocr", case=False, na=False)
+    if not ocr_mask.any():
+        return out
+    well_text = out.get("well", pd.Series("Unknown", index=out.index)).fillna("Unknown").astype(str).str.strip()
+    test_text = out.get("test_id", pd.Series("", index=out.index)).fillna("").astype(str).str.strip()
+    anchors = out[
+        (~ocr_mask)
+        & out["datetime"].notna()
+        & well_text.ne("")
+        & ~well_text.str.casefold().eq("unknown")
+        & test_text.ne("")
+    ].copy()
+    if anchors.empty:
+        return out
+    for idx in out.index[ocr_mask & out["datetime"].notna()]:
+        deltas = (anchors["datetime"] - out.at[idx, "datetime"]).abs()
+        nearby = anchors.loc[deltas <= pd.Timedelta(hours=float(max_gap_hours))]
+        if nearby.empty or nearby["test_id"].astype(str).nunique() != 1:
+            continue
+        nearest_idx = deltas.loc[nearby.index].idxmin()
+        anchor = anchors.loc[nearest_idx]
+        for col in ["well", "test_id", "test_sequence"]:
+            if col in anchor.index and pd.notna(anchor[col]):
+                out.at[idx, col] = anchor[col]
+        out.at[idx, "link_status"] = "ocr_auto_linked_by_timestamp"
+        out.at[idx, "suggested_well"] = anchor.get("well", "")
+        out.at[idx, "suggested_test_id"] = anchor.get("test_id", "")
+        gap_minutes = float(deltas.loc[nearest_idx].total_seconds() / 60.0)
+        out.at[idx, "suggested_link_reason"] = f"Unique nearby test reading ({gap_minutes:.1f} min)"
     return out
 
 
