@@ -368,7 +368,7 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_UI_BUILD_ID = "v80-complete-dark-control-visibility-ui-20260627"
+APP_UI_BUILD_ID = "v81-simple-controls-stability-ui-20260627"
 
 UI_THEME_PRESETS = {
     "Light": {
@@ -462,6 +462,39 @@ CHART_GRID = ACTIVE_THEME["chart_grid"]
 CHART_GRID_SOFT = ACTIVE_THEME["chart_grid_soft"]
 CHART_LEGEND_BG = ACTIVE_THEME["chart_legend"]
 
+
+def _clear_heavy_session_state_v81(*, include_uploads: bool = False) -> None:
+    """Release large cached DataFrames and export bytes without resetting user controls."""
+    exact_keys = {
+        "combined_data_key_v58", "combined_data_bundle_v58",
+        "combined_data_key_v81", "combined_data_bundle_v81",
+    }
+    if include_uploads:
+        exact_keys.update({
+            "upload_parse_key_v58", "upload_parse_bundle_v58",
+            "upload_parse_key_v81", "upload_parse_bundle_v81",
+        })
+    for key in list(st.session_state.keys()):
+        if key in exact_keys or key.startswith("export_bytes_") or key.startswith("export_error_"):
+            st.session_state.pop(key, None)
+
+
+# Old deployments kept parsed tables in both Streamlit's global cache and session
+# state. Clear the obsolete session keys once so a long-lived browser session does
+# not carry multiple full workbook copies after upgrading.
+if not st.session_state.get("_v81_state_migrated", False):
+    _clear_heavy_session_state_v81(include_uploads=True)
+    st.session_state["_v81_state_migrated"] = True
+
+# Keep export memory limited to the active theme. Prepared files can be large, and
+# retaining Light and Dark copies at the same time can exhaust small cloud workers.
+_active_theme_slug_v81 = re.sub(r"[^a-z0-9]+", "_", ACTIVE_THEME_NAME.lower()).strip("_")
+for _state_key in list(st.session_state.keys()):
+    if _state_key.startswith("export_bytes_") and not _state_key.endswith("_" + _active_theme_slug_v81):
+        st.session_state.pop(_state_key, None)
+    elif _state_key.startswith("export_error_") and not _state_key.endswith("_" + _active_theme_slug_v81):
+        st.session_state.pop(_state_key, None)
+
 # Export annotations and report notes must follow the active Light/Dark theme.
 EXPORT_LABEL_BG = CHART_PAPER_BG
 EXPORT_LABEL_EDGE = CHART_GRID
@@ -526,6 +559,73 @@ def numeric_feature_series(frame: pd.DataFrame, feature: str, *, reset_index: bo
 
     result = result.replace([np.inf, -np.inf], np.nan)
     return result.reset_index(drop=True) if reset_index else result
+
+
+
+def optimize_interactive_plot_frame(
+    frame: pd.DataFrame,
+    features: list[str],
+    *,
+    max_total_points: int = 12000,
+    max_points_per_group: int = 3000,
+) -> tuple[pd.DataFrame, bool]:
+    """Reduce only the browser chart payload while preserving full source data.
+
+    Large uploaded files can overwhelm the browser even when parsing succeeds.
+    The interactive view keeps evenly spaced points plus each selected signal's
+    extrema. Exports and data tables continue to use the complete filtered data.
+    """
+    if frame is None or frame.empty or len(frame) <= max_total_points:
+        return frame, False
+
+    group_cols = [c for c in ["series_label", "test_id"] if c in frame.columns]
+    groups = list(frame.groupby(group_cols, dropna=False, sort=False)) if group_cols else [(None, frame)]
+    if not groups:
+        return frame, False
+
+    group_budget = max(250, min(max_points_per_group, max_total_points // max(len(groups), 1)))
+    pieces = []
+    reduced = False
+    for _, group in groups:
+        g = group.sort_values("datetime", kind="stable") if "datetime" in group.columns else group
+        n = len(g)
+        if n <= group_budget:
+            pieces.append(g)
+            continue
+        reduced = True
+        chosen = set(np.linspace(0, n - 1, group_budget).round().astype(int).tolist())
+        for feature in features:
+            if feature not in g.columns:
+                continue
+            vals = numeric_feature_series(g, feature, reset_index=True)
+            valid = vals.dropna()
+            if valid.empty:
+                continue
+            chosen.add(int(valid.idxmin()))
+            chosen.add(int(valid.idxmax()))
+        pieces.append(g.iloc[sorted(i for i in chosen if 0 <= i < n)])
+
+    if not pieces:
+        return frame, False
+    out = pd.concat(pieces, ignore_index=False, sort=False, copy=False)
+    sort_cols = [c for c in ["series_label", "test_id", "datetime"] if c in out.columns]
+    if sort_cols:
+        out = out.sort_values(sort_cols, kind="stable")
+    return out, reduced
+
+
+def limited_dataframe_preview(
+    frame: pd.DataFrame,
+    *,
+    max_rows: int = 500,
+    max_cols: int = 48,
+) -> tuple[pd.DataFrame, int, int]:
+    """Return a browser-safe preview and the omitted row/column counts."""
+    if frame is None or frame.empty:
+        return frame, 0, 0
+    shown = frame.iloc[:max_rows, :max_cols].copy(deep=False)
+    return shown, max(0, len(frame) - len(shown)), max(0, frame.shape[1] - shown.shape[1])
+
 
 MIN_DATE_ALLOWED = pd.Timestamp("1900-01-01").date()
 MAX_DATE_ALLOWED = pd.Timestamp("2100-12-31").date()
@@ -635,7 +735,7 @@ def editable_column_mapping_panel(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]
                 if k.startswith("raw__") or k in [canonical_key(c) for c in cols_to_review]:
                     preview_rows.append({"Alias/header key": k, "Mapped to": alias_display_name(v, labels)})
             if preview_rows:
-                st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, height=160)
+                st.dataframe(pd.DataFrame(preview_rows), width="stretch", height=160)
 
     df_final = apply_user_column_mappings(df_after_saved, runtime_aliases)
     return df_final, {**saved_aliases, **runtime_aliases}
@@ -1724,17 +1824,15 @@ def render_section_title(title: str, subtitle: str = "") -> None:
 
 with st.sidebar:
     st.markdown("### 📊 Analysis Controls")
-    st.caption("Configure data ingestion, engineering units, plots, events, and reports.")
+    st.caption("Upload data, choose wells and signals, then adjust the chart only when needed.")
     st.radio(
         "Theme",
         ["Light", "Dark"],
         horizontal=True,
         key="ui_theme",
-        help="Light is optimized for office review and printed reports. Dark is optimized for screen-based engineering analysis.",
     )
 
 with st.sidebar.expander("1. Data Sources", expanded=True):
-    st.caption("Bring field data from spreadsheets, reports, exported chats, device files, or images.")
     uploaded_files = st.file_uploader(
         "Upload test files, reports, device exports, or WhatsApp ZIPs",
         type=["xlsx", "xls", "csv", "txt", "docx", "pdf", "zip", "jpg", "jpeg", "png", "webp"],
@@ -1743,7 +1841,7 @@ with st.sidebar.expander("1. Data Sources", expanded=True):
         key="general_data_uploader_v70",
     )
     uploaded_ocr_images = st.file_uploader(
-        "Upload CTU/HMI screen photos directly",
+        "Upload CTU/HMI photos",
         type=["jpg", "jpeg", "png", "webp"],
         accept_multiple_files=True,
         help="Use this dedicated uploader for field photos like the CTU ALL DATA screens. The display is rectified, OCR values are extracted, and every field remains editable in the OCR Review before plotting.",
@@ -1768,7 +1866,7 @@ with st.sidebar.expander("1. Data Sources", expanded=True):
                 pass
 
     whatsapp_text = st.text_area(
-        "Or paste one or many TMU WhatsApp messages",
+        "Paste TMU WhatsApp reports",
         height=180,
         placeholder="""PICO TMU-02
 Date :06-06-2026
@@ -1786,55 +1884,32 @@ Salinity = 35K PPM of NaCl
 Pumping P= 849 Psi""",
     )
 
-with st.sidebar.expander("2. Ingestion & Processing", expanded=False):
-    st.caption(
-        "Test segmentation controls when consecutive readings are treated as one continuous test or as a new test period."
+with st.sidebar.expander("2. Processing", expanded=False):
+    test_gap_hours = st.number_input(
+        "New test after inactive gap (hours)",
+        min_value=1.0,
+        max_value=8760.0,
+        value=12.0,
+        step=1.0,
+        help="Readings stay connected until the time gap is larger than this value.",
     )
-    segmentation_mode = st.selectbox(
-        "How should tests be separated?",
-        [
-            "Custom inactive gap (default)",
-            "Use parser-detected boundaries",
-            "Keep each well as one continuous test",
-        ],
-        index=0,
-        help=(
-            "Custom inactive gap is the normal field workflow: readings stay in the same test while the time gap is at or below "
-            "the selected value, and a new test starts only when the gap is larger. This setting also controls whether uploaded "
-            "OCR images are connected by a line."
-        ),
-    )
-    if segmentation_mode == "Custom inactive gap (default)":
-        test_gap_hours = st.number_input(
-            "Start a new test when inactivity exceeds (hours)",
-            min_value=1.0,
-            max_value=8760.0,
-            value=12.0,
-            step=1.0,
-            help=(
-                "Example: with 12 hours, readings 2 hours apart remain one continuous test and are joined by a line; "
-                "readings 13 hours apart start a new test period."
-            ),
-        )
-        st.caption(f"Current rule: keep readings connected when the gap is ≤ {float(test_gap_hours):g} hours.")
-    else:
-        test_gap_hours = 12.0
     enable_ctu_ocr = st.checkbox(
-        "Process images contained inside WhatsApp ZIPs",
+        "Read images inside WhatsApp ZIPs",
         value=False,
-        help="Directly uploaded CTU/HMI images are always OCR-processed. Turn this on only when a ZIP also contains screen images; keeping it off makes large ZIP uploads faster.",
+        help="Direct image uploads are always read. Enable this only when the ZIP contains CTU/HMI screens.",
     )
-    max_ocr_images = st.number_input(
-        "CTU/HMI image OCR limit per ZIP (0 = no limit)",
-        min_value=0,
-        max_value=5000,
-        value=1000,
-        step=50,
-        help="Use the OCR checkbox above to skip images completely. Set this to 0 only when you want to OCR every image in the ZIP. Excel/text/PDF attachments are always parsed normally.",
-    )
+    if enable_ctu_ocr:
+        max_ocr_images = st.number_input(
+            "Maximum ZIP images to read (0 = all)",
+            min_value=0,
+            max_value=5000,
+            value=1000,
+            step=50,
+        )
+    else:
+        max_ocr_images = 1000
 
-@st.cache_data(show_spinner=False, ttl=3600, max_entries=24)
-def cached_load_uploaded_file(file_name: str, file_bytes: bytes, parse_images: bool, max_ocr_images: int, parser_build_id: str):
+def load_uploaded_file_once(file_name: str, file_bytes: bytes, parse_images: bool, max_ocr_images: int, parser_build_id: str):
     class CachedUploadedFile(io.BytesIO):
         def __init__(self, data: bytes, name: str):
             super().__init__(data)
@@ -1875,15 +1950,16 @@ if uploaded_files:
         int(max_ocr_images),
         tuple(_uploaded_file_identity_v58(f) for f in uploaded_files),
     )
-    cached_bundle = st.session_state.get("upload_parse_bundle_v58")
-    cached_key = st.session_state.get("upload_parse_key_v58")
+    cached_bundle = st.session_state.get("upload_parse_bundle_v81")
+    cached_key = st.session_state.get("upload_parse_key_v81")
 
     if cached_bundle is not None and cached_key == upload_key:
-        # UI changes now reuse the already parsed DataFrames directly. This
-        # avoids per-file cache deserialization and repeated workbook handling.
         frames.extend(cached_bundle.get("frames", []))
         errors.extend(list(cached_bundle.get("errors", [])))
     else:
+        # A new upload invalidates merged data and prepared reports immediately.
+        # This prevents stale large objects from accumulating across file changes.
+        _clear_heavy_session_state_v81(include_uploads=False)
         parsed_frames = []
         parsed_errors = []
         upload_progress = st.progress(0.0, text="Reading uploaded files...") if len(uploaded_files) > 1 else None
@@ -1894,39 +1970,56 @@ if uploaded_files:
                         upload_order / max(len(uploaded_files), 1),
                         text=f"Reading {upload_order + 1}/{len(uploaded_files)}: {f.name}",
                     )
-                file_bytes = f.getvalue()
+                file_bytes = bytes(f.getbuffer()) if hasattr(f, "getbuffer") else f.getvalue()
                 _suffix = Path(str(f.name)).suffix.lower()
                 _is_direct_image = _suffix in {".jpg", ".jpeg", ".png", ".webp"}
                 _parse_images_for_file = bool(enable_ctu_ocr) or _is_direct_image
-                parsed_tables = cached_load_uploaded_file(
+                parsed_tables = load_uploaded_file_once(
                     f.name, file_bytes, _parse_images_for_file, int(max_ocr_images), PARSER_BUILD_ID
                 )
                 if parsed_tables:
                     for table_order, table in enumerate(parsed_tables):
                         if table is None or table.empty:
                             continue
-                        table = table.copy()
+                        table = table.copy(deep=False)
                         table["_upload_order"] = int(upload_order)
                         table["_table_order"] = int(table_order)
                         parsed_frames.append(table)
                 else:
-                    parsed_errors.append(f"{f.name}: no usable time-series table detected. The file may be blank, or it has no date/time plus numeric readings after all parsers were tried.")
+                    parsed_errors.append(
+                        f"{f.name}: no usable time-series table detected. "
+                        "The file may be blank or may not contain date/time plus engineering readings."
+                    )
             except Exception as e:
                 parsed_errors.append(f"{f.name}: {e}")
-                with st.expander(f"Technical error details for {f.name}", expanded=False):
+                with st.expander(f"Technical details: {f.name}", expanded=False):
                     st.code(traceback.format_exc())
             finally:
-                gc.collect()
+                try:
+                    del file_bytes
+                except Exception:
+                    pass
+                try:
+                    del parsed_tables
+                except Exception:
+                    pass
         if upload_progress is not None:
             upload_progress.progress(1.0, text="Uploaded files parsed")
 
-        st.session_state["upload_parse_key_v58"] = upload_key
-        st.session_state["upload_parse_bundle_v58"] = {
+        st.session_state["upload_parse_key_v81"] = upload_key
+        st.session_state["upload_parse_bundle_v81"] = {
             "frames": parsed_frames,
             "errors": list(parsed_errors),
         }
         frames.extend(parsed_frames)
         errors.extend(parsed_errors)
+        gc.collect()
+else:
+    # Removing all uploads should also release the previous workbook data and
+    # prepared export files instead of leaving them in the browser session.
+    if st.session_state.get("upload_parse_key_v81") is not None:
+        _clear_heavy_session_state_v81(include_uploads=True)
+        gc.collect()
 
 if whatsapp_text.strip():
     try:
@@ -1942,26 +2035,21 @@ if errors:
     st.warning("Some files/messages were skipped or could not be parsed:\n\n" + "\n".join(f"- {e}" for e in errors))
 
 if not frames:
-    st.info("Start by uploading field files or pasting one or more WhatsApp TMU reports in the Data Sources panel.")
+    st.info("Start by uploading field files or pasting one or more WhatsApp TMU reports in Data Sources.")
     st.stop()
 
-# Concatenation and duplicate merging are cached in session state as well as
-# individual file parsing. This keeps sidebar/chart interaction fast after a
-# large multi-file upload instead of rebuilding the same merged dataset on every
-# Streamlit rerun.
+# Keep one merged result for fast control changes. The session state stores the
+# same DataFrame object instead of a deep duplicate, reducing peak memory.
 _whatsapp_key = hashlib.sha1(whatsapp_text.encode("utf-8", errors="ignore")).hexdigest() if whatsapp_text.strip() else ""
 _combined_key = (PARSER_BUILD_ID, upload_key, _whatsapp_key)
-_combined_cached = st.session_state.get("combined_data_bundle_v58")
-_combined_cached_key = st.session_state.get("combined_data_key_v58")
+_combined_cached = st.session_state.get("combined_data_bundle_v81")
+_combined_cached_key = st.session_state.get("combined_data_key_v81")
 
 if _combined_cached is not None and _combined_cached_key == _combined_key:
     data = _combined_cached["data"].copy(deep=False)
     rows_merged = int(_combined_cached.get("rows_merged", 0))
 else:
-    data = pd.concat(frames, ignore_index=True, sort=False)
-    # Merge repeated/incomplete reports before assigning tests. The same well
-    # and minute timestamp becomes one row: the most complete upload wins and
-    # missing fields are filled from the other copy.
+    data = pd.concat(frames, ignore_index=True, sort=False, copy=False)
     rows_before_dedup = len(data)
     try:
         if hasattr(_tmu_parser, "merge_duplicate_test_rows_v53"):
@@ -1969,11 +2057,12 @@ else:
     except Exception as dedup_error:
         errors.append(f"Duplicate-row merge was skipped: {dedup_error}")
     rows_merged = max(0, rows_before_dedup - len(data))
-    st.session_state["combined_data_key_v58"] = _combined_key
-    st.session_state["combined_data_bundle_v58"] = {
-        "data": data.copy(deep=True),
+    st.session_state["combined_data_key_v81"] = _combined_key
+    st.session_state["combined_data_bundle_v81"] = {
+        "data": data.copy(deep=False),
         "rows_merged": int(rows_merged),
     }
+
 
 if rows_merged:
     st.caption(f"Merged {rows_merged:,} repeated row(s) with the same well and date/time, keeping the most complete values.")
@@ -2061,16 +2150,24 @@ if _quality_mask.any():
         ]
         _quality_columns = [column for column in _quality_columns if column in data.columns]
         _quality_data = data.loc[_quality_mask, _quality_columns].copy()
-        _quality_data = _quality_data.rename(columns={
+        _quality_download = _quality_data.copy(deep=False)
+        _quality_data, _quality_omitted_rows, _quality_omitted_cols = limited_dataframe_preview(
+            _quality_data, max_rows=1000, max_cols=24
+        )
+        _quality_rename = {
             "data_quality_note": "Engineering Check",
             "rejected_values": "Original / Withheld Values",
             "source_row": "Source Row",
             "datetime": "Date / Time",
-        })
-        st.dataframe(_quality_data, use_container_width=True, hide_index=True)
+        }
+        _quality_data = _quality_data.rename(columns=_quality_rename)
+        _quality_download = _quality_download.rename(columns=_quality_rename)
+        st.dataframe(_quality_data, width="stretch", hide_index=True)
+        if _quality_omitted_rows or _quality_omitted_cols:
+            st.caption("Preview limited for stability; the CSV contains all engineering checks.")
         st.download_button(
             "Download engineering checks CSV",
-            data=_quality_data.to_csv(index=False).encode("utf-8-sig"),
+            data=_quality_download.to_csv(index=False).encode("utf-8-sig"),
             file_name="production_test_engineering_checks.csv",
             mime="text/csv",
             key="download_data_quality_review_v69",
@@ -2080,37 +2177,18 @@ if _quality_mask.any():
 # created later, after the safe parsing/mapping steps, so changing the display
 # unit never changes the original uploaded values.
 
-# Test segmentation. The default is an explicit user-selected inactive gap.
-# In custom mode, existing parser IDs are intentionally rebuilt so uploaded
-# files, messages and OCR images from the same well remain one continuous test
-# until the selected gap is exceeded. Unknown OCR images are grouped together
-# in this explicit override mode; this is what allows two uploaded snapshots to
-# be connected by a line instead of becoming separate one-point traces.
-if segmentation_mode == "Use parser-detected boundaries":
-    try:
-        data = assign_test_ids(data, gap_hours=12.0, preserve_existing=True)
-    except TypeError:
-        data = assign_test_ids(data, gap_hours=12.0)
-elif segmentation_mode == "Custom inactive gap (default)":
-    try:
-        data = assign_test_ids(
-            data,
-            gap_hours=float(test_gap_hours),
-            preserve_existing=False,
-            group_unknown_by_source=False,
-        )
-    except TypeError:
-        data = assign_test_ids(data, gap_hours=float(test_gap_hours))
-else:
-    try:
-        data = assign_test_ids(
-            data,
-            gap_hours=1_000_000.0,
-            preserve_existing=False,
-            group_unknown_by_source=False,
-        )
-    except TypeError:
-        data = assign_test_ids(data, gap_hours=1_000_000.0)
+# One clear rule only: a new test starts after the user-selected inactive gap.
+# Existing parser IDs are rebuilt so spreadsheet, message and OCR readings use
+# the same rule and nearby image readings remain connected.
+try:
+    data = assign_test_ids(
+        data,
+        gap_hours=float(test_gap_hours),
+        preserve_existing=False,
+        group_unknown_by_source=False,
+    )
+except TypeError:
+    data = assign_test_ids(data, gap_hours=float(test_gap_hours))
 
 if "datetime" in data.columns:
     data["datetime"] = pd.to_datetime(data["datetime"], errors="coerce")
@@ -2167,7 +2245,7 @@ if ocr_mask.any():
             st.image(
                 direct_image_preview_map[selected_preview],
                 caption=f"OCR source: {selected_preview}",
-                use_container_width=True,
+                width="stretch",
             )
 
         confirmed_test_options = []
@@ -2207,7 +2285,7 @@ if ocr_mask.any():
         editable_columns = {"Approve OCR", "datetime", "well", "test_id", *ocr_numeric_cols}
         edited_review = st.data_editor(
             review_df,
-            use_container_width=True,
+            width="stretch",
             height=min(520, 150 + 42 * max(1, len(review_df))),
             key="ctu_ocr_review_editor_v70",
             column_config=column_config,
@@ -2617,9 +2695,8 @@ def convert_intervals_for_plot(operation_intervals, df, x_axis_mode):
 # ---------------------------------------------------------------------------
 # Display-unit conversion (v58)
 # ---------------------------------------------------------------------------
-units_sidebar_section = st.sidebar.expander("3. Engineering Units & Choke", expanded=False)
+units_sidebar_section = st.sidebar.expander("3. Units & Choke", expanded=False)
 with units_sidebar_section:
-    st.caption("Choose reporting units and interpret choke opening versus choke size.")
     pressure_display_unit = st.selectbox(
         "Pressure unit", ["psi", "bar"], index=0, key="pressure_display_unit_v58",
         help="Changes plot/table display only. Uploaded source values remain unchanged.",
@@ -2871,7 +2948,7 @@ with st.expander("Detected columns from uploaded files", expanded=False):
             "Detected columns": ", ".join(column_label(c) for c in g_numeric),
             "Raw fallback columns": ", ".join(column_label(c) for c in g_numeric if str(c).startswith("raw__")),
         })
-    st.dataframe(pd.DataFrame(detected_rows), use_container_width=True, height=180)
+    st.dataframe(pd.DataFrame(detected_rows), width="stretch", height=180)
     if any(str(c).startswith("raw__") for c in numeric_cols):
         st.info(
             "Raw fallback columns mean the parser found a numeric time-series column but did not know its header alias yet. "
@@ -2879,8 +2956,7 @@ with st.expander("Detected columns from uploaded files", expanded=False):
         )
 
 # Sidebar filters
-with st.sidebar.expander("4. Timeline & Test Segmentation", expanded=False):
-    st.caption("Configure calendar time, elapsed time, compressed gaps, and reporting ranges.")
+with st.sidebar.expander("4. Timeline & Range", expanded=False):
     time_filter_mode = st.selectbox(
         "Time range control",
         ["Slider", "Manual calendar/time"],
@@ -2955,8 +3031,7 @@ with st.sidebar.expander("4. Timeline & Test Segmentation", expanded=False):
     trace_grouping = "Auto"
 
 
-with st.sidebar.expander("5. Well & Signal Selection", expanded=True):
-    st.caption("Select the wells, test streams, and measured parameters to review.")
+with st.sidebar.expander("5. Wells & Signals", expanded=True):
 
     # Prefer recent wells/tests with actual numeric readings, not alphabetical chat history.
     def _has_any_plot_numeric(_df):
@@ -2991,7 +3066,7 @@ with st.sidebar.expander("5. Well & Signal Selection", expanded=True):
     all_tests = []
 
     select_all_features = st.checkbox(
-        "Select all numeric columns",
+        "Select all signals",
         value=False,
         help="Shows every detected numeric column in the plot list, including raw fallback columns from unseen templates.",
     )
@@ -3029,7 +3104,7 @@ with st.sidebar.expander("5. Well & Signal Selection", expanded=True):
                     reconciled.append(_raw_choke)
         st.session_state[feature_state_key] = reconciled
     selected_features = st.multiselect(
-        "Choose features to plot",
+        "Signals to plot",
         numeric_cols,
         format_func=column_label,
         key=feature_state_key,
@@ -3058,8 +3133,7 @@ with st.sidebar.expander("5. Well & Signal Selection", expanded=True):
         key=f"chart_header_{abs(hash(data_title_signature))}_{len(data)}",
     )
 
-with st.sidebar.expander("6. Visualization Studio", expanded=False):
-    st.caption("Semantic colors are fixed by engineering meaning: oil green, water blue, gas cyan, pressure red/orange, choke gold, and quality properties purple/brown.")
+with st.sidebar.expander("6. Chart Options", expanded=False):
     custom_y_ranges = {}
     with st.expander("Y-axis scale per graph", expanded=False):
         use_custom_y_scale = st.checkbox(
@@ -3121,11 +3195,6 @@ with st.sidebar.expander("6. Visualization Studio", expanded=False):
     dual_axis_charts = []
     if len(numeric_cols) >= 2 and selected_features:
         with st.expander("Combined charts with secondary Y-axis", expanded=False):
-            st.caption(
-                "Create one, two, or three combined charts. Each combined chart can have one or more "
-                "features on the left Y-axis and one or more features on the right Y-axis. "
-                "The normal selected-feature report remains below."
-            )
             n_dual_axis_charts = st.number_input(
                 "Number of combined secondary-axis charts",
                 min_value=0,
@@ -3190,10 +3259,6 @@ with st.sidebar.expander("6. Visualization Studio", expanded=False):
         ),
     )
 
-    st.caption(
-        "For dense charts, avoid All values. Clean readable and Every 20 readings are designed to keep values legible."
-    )
-
     label_decimals_default = st.selectbox(
         "Default number format on labels",
         ["Auto", "0 decimals", "1 decimal", "2 decimals"],
@@ -3202,7 +3267,6 @@ with st.sidebar.expander("6. Visualization Studio", expanded=False):
     label_decimals_by_feature = {}
     if selected_features:
         with st.expander("Number format per graph", expanded=False):
-            st.caption("Use this when one curve needs 0 decimals and another needs 1 or 2 decimals.")
             for feature in selected_features:
                 label_decimals_by_feature[feature] = st.selectbox(
                     column_label(feature),
@@ -3212,7 +3276,6 @@ with st.sidebar.expander("6. Visualization Studio", expanded=False):
                 )
 
     with st.expander("Rename column labels for view/export", expanded=False):
-        st.caption("Rename how columns appear in charts and tables without changing the parser field names.")
         current_overrides = dict(st.session_state.get("display_label_overrides", {}))
         edited_overrides = dict(current_overrides)
         for feature in selected_features:
@@ -3241,8 +3304,7 @@ with st.sidebar.expander("6. Visualization Studio", expanded=False):
 
     show_internal_names = False
 
-with st.sidebar.expander("7. Operations & Events", expanded=False):
-    st.caption("Add field events, operational intervals, and report annotations.")
+with st.sidebar.expander("7. Events & Notes", expanded=False):
 
     auto_hide_crowded_notes = st.checkbox(
         "Auto hide some notes when too crowded",
@@ -3275,7 +3337,6 @@ with st.sidebar.expander("7. Operations & Events", expanded=False):
         help="Mouse drag is for on-screen adjustment only. Downloaded PNG/PDF charts use the clean automatic note layout and do not save dragged positions.",
     )
 
-    st.caption("Select a start date/time and write a note. Add an optional end date/time only when the note should cover a period.")
 
     if "manual_events_table" not in st.session_state:
         st.session_state.manual_events_table = []
@@ -3396,7 +3457,7 @@ with st.sidebar.expander("7. Operations & Events", expanded=False):
         display_events.insert(0, "No.", range(1, len(display_events) + 1))
         edited_events = st.data_editor(
             display_events,
-            use_container_width=True,
+            width="stretch",
             height=185,
             key="point_notes_editor_v50",
             column_config={
@@ -3447,7 +3508,7 @@ with st.sidebar.expander("7. Operations & Events", expanded=False):
         display_intervals["start"] = display_intervals["start"].dt.strftime("%Y-%m-%d %H:%M")
         display_intervals["end"] = display_intervals["end"].dt.strftime("%Y-%m-%d %H:%M")
         display_intervals.insert(0, "No.", range(1, len(display_intervals) + 1))
-        st.dataframe(display_intervals, use_container_width=True, height=150)
+        st.dataframe(display_intervals, width="stretch", height=150)
 
         interval_options = {
             f"{i + 1}) {row['start']:%Y-%m-%d %H:%M} → {row['end']:%Y-%m-%d %H:%M} | {row.get('target', 'All selected wells')} | {row['label']}": i
@@ -3568,10 +3629,7 @@ for i in st.session_state.get("operation_intervals_table", []):
 plot_intervals = convert_intervals_for_plot(operation_intervals, filtered, x_axis_mode)
 
 # Engineering snapshot KPIs
-render_section_title(
-    "Engineering Snapshot",
-    "Live summary of the parsed dataset and the rows currently feeding the visualization.",
-)
+render_section_title("Engineering Snapshot")
 quality_count = int(_quality_mask.sum()) if "_quality_mask" in globals() else 0
 c1, c2, c3, c4, c5, c6 = st.columns(6)
 c1.metric("Detected readings", f"{len(data):,}")
@@ -3582,20 +3640,40 @@ c5.metric("Signals", f"{len(numeric_cols):,}")
 c6.metric("Engineering checks", f"{quality_count:,}")
 
 with st.expander("Detected data preview", expanded=False):
-    st.caption("Detected data = cleaned rows pulled from uploads before your well/time/feature filters.")
     preview_cols = ["source", "sheet", "source_type", "well", "test_id", "link_status", "datetime", "time_text"] + numeric_cols
     preview_cols = [c for c in preview_cols if c in data.columns]
-    display_detected = data[preview_cols].copy()
+    display_detected = data[preview_cols].copy(deep=False)
+    display_detected, _preview_omitted_rows, _preview_omitted_cols = limited_dataframe_preview(
+        display_detected, max_rows=500, max_cols=48
+    )
     if not show_internal_names:
         display_detected = display_detected.rename(columns={c: column_label(c) for c in display_detected.columns})
-    st.dataframe(display_detected, use_container_width=True, height=260)
+    st.dataframe(display_detected, width="stretch", height=260)
+    if _preview_omitted_rows or _preview_omitted_cols:
+        st.caption(
+            f"Preview limited to {len(display_detected):,} rows and {display_detected.shape[1]:,} columns to keep the app responsive."
+        )
 
 if selected_features and not filtered.empty:
-    render_section_title(
-        "Production Test Visualization",
-        "Interactive engineering charts using the selected wells, test periods, signals, units, and event annotations.",
+    render_section_title("Production Test Visualization")
+
+    # Protect the browser from very wide selections and very dense tests. The
+    # complete filtered data remains available to exports; only the interactive
+    # Plotly payload is reduced.
+    max_interactive_features = 12
+    interactive_features = list(selected_features[:max_interactive_features])
+    interactive_filtered, interactive_was_reduced = optimize_interactive_plot_frame(
+        filtered, interactive_features
     )
-    series_count_for_hint = filtered["series_label"].dropna().astype(str).nunique() if "series_label" in filtered.columns else 1
+    if len(selected_features) > max_interactive_features:
+        st.info(
+            f"Interactive view shows the first {max_interactive_features} selected signals for stability. "
+            "Prepared exports can still include all selected signals."
+        )
+    if interactive_was_reduced:
+        st.info("Interactive chart optimized for speed; prepared exports still use all filtered readings.")
+
+    series_count_for_hint = interactive_filtered["series_label"].dropna().astype(str).nunique() if "series_label" in interactive_filtered.columns else 1
     if x_axis_mode == "Real calendar time":
         axis_tick_settings = x_axis_tick_kwargs(x_axis_scale)
     elif is_aligned_elapsed_mode(x_axis_mode):
@@ -4453,26 +4531,80 @@ if selected_features and not filtered.empty:
         "scrollZoom": True,
     }
 
+    def render_plotly_safely(builder, *, key: str, fallback_feature: str | None = None):
+        """Keep one chart error from terminating the full Streamlit session."""
+        try:
+            figure = builder()
+            st.plotly_chart(figure, width="stretch", config=plotly_config_common, key=key)
+            return figure
+        except Exception:
+            st.error("This chart could not be rendered with the current settings. A safe simplified view is shown below.")
+            with st.expander("Chart technical details", expanded=False):
+                st.code(traceback.format_exc())
+            fallback = go.Figure()
+            try:
+                feature = fallback_feature or (interactive_features[0] if interactive_features else None)
+                if feature and feature in interactive_filtered.columns:
+                    fallback_df = interactive_filtered.head(3000)
+                    fallback.add_trace(
+                        go.Scatter(
+                            x=x_values(fallback_df),
+                            y=numeric_feature_series(fallback_df, feature),
+                            mode="lines+markers",
+                            name=column_label(feature),
+                            line=dict(color=feature_color(feature, 0), width=2.4),
+                            marker=dict(size=5),
+                        )
+                    )
+                    fallback.update_layout(
+                        title=chart_title_from_data(fallback_df, custom_chart_title),
+                        xaxis_title=x_axis_title,
+                        yaxis_title=column_label(feature),
+                        paper_bgcolor=CHART_PAPER_BG,
+                        plot_bgcolor=CHART_PLOT_BG,
+                        font=dict(color=CHART_TEXT),
+                    )
+                    st.plotly_chart(
+                        fallback, width="stretch",
+                        config={"responsive": True, "displaylogo": False},
+                        key=key + "_fallback",
+                    )
+            except Exception:
+                pass
+            return fallback
+
     if dual_axis_charts:
         for cfg_i, cfg in enumerate(dual_axis_charts, start=1):
             st.markdown(f"### Combined secondary Y-axis chart {cfg_i}")
-            dual_fig = build_dual_axis_multi_figure(filtered, cfg.get("left", []), cfg.get("right", []), cfg.get("title", ""))
-            st.plotly_chart(dual_fig, use_container_width=True, config=plotly_config_common)
+            render_plotly_safely(
+                lambda cfg=cfg: build_dual_axis_multi_figure(
+                    interactive_filtered, cfg.get("left", []), cfg.get("right", []), cfg.get("title", "")
+                ),
+                key=f"dual_axis_chart_{cfg_i}",
+                fallback_feature=(cfg.get("left", []) or interactive_features or [None])[0],
+            )
 
-    fig = build_figure(filtered, selected_features, plot_mode)
-    st.plotly_chart(fig, use_container_width=True, config=plotly_config_common)
+    fig = render_plotly_safely(
+        lambda: build_figure(interactive_filtered, interactive_features, plot_mode),
+        key="main_production_test_chart",
+        fallback_feature=interactive_features[0] if interactive_features else None,
+    )
 
     with st.expander("Filtered data used by current plot", expanded=False):
-        st.caption("Filtered data = only the rows currently feeding the chart after your sidebar selections.")
         filtered_cols = ["source", "sheet", "well", "datetime", "time_text"] + selected_features
         filtered_cols = [c for c in filtered_cols if c in filtered.columns]
-        display_filtered = filtered[filtered_cols].copy()
+        display_filtered = filtered[filtered_cols].copy(deep=False)
+        display_filtered, _filtered_omitted_rows, _filtered_omitted_cols = limited_dataframe_preview(
+            display_filtered, max_rows=1000, max_cols=48
+        )
         if not show_internal_names:
             display_filtered = display_filtered.rename(columns={c: column_label(c) for c in display_filtered.columns})
-        st.dataframe(display_filtered, use_container_width=True, height=280)
+        st.dataframe(display_filtered, width="stretch", height=280)
+        if _filtered_omitted_rows or _filtered_omitted_cols:
+            st.caption("Preview limited for browser stability; chart exports still use all filtered readings.")
 
-    render_section_title("Engineering Report Exports", "Prepare publication-ready PNG, PDF, and filtered-data outputs using the active chart configuration.")
-    st.caption(f"Exports use the active {ACTIVE_THEME_NAME} theme. Prepare again after changing theme or chart settings; cached files are separated by theme.")
+    render_section_title("Engineering Report Exports")
+    st.caption(f"Downloads use the active {ACTIVE_THEME_NAME} theme.")
 
     def chart_label_indices_for_export(g, feature):
         """Use the same readable label logic for exports as the interactive chart."""
@@ -5140,6 +5272,12 @@ if selected_features and not filtered.empty:
         st.session_state.setdefault(ekey, "")
 
         if st.button(f"Prepare {fmt_label} ({ACTIVE_THEME_NAME})", key=f"prepare_{export_key}_{theme_key}"):
+            for _k in list(st.session_state.keys()):
+                if _k.startswith("export_bytes_") and _k != bkey:
+                    st.session_state.pop(_k, None)
+                elif _k.startswith("export_error_") and _k != ekey:
+                    st.session_state.pop(_k, None)
+            gc.collect()
             st.session_state[bkey] = None
             st.session_state[ekey] = ""
             try:

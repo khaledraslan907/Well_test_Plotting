@@ -1,0 +1,81 @@
+PRODUCTION TEST DASHBOARD v81 — VALIDATION RESULTS
+==================================================
+
+Build
+-----
+UI: v81-simple-controls-stability-ui-20260627
+Parser: v79-direct-whatsapp-zip-parser-20260627
+
+Interface checks
+----------------
+PASS  Only one test-separation control is shown:
+      New test after inactive gap (hours)
+PASS  Default inactive gap is 12 hours.
+PASS  Removed "How should tests be separated?".
+PASS  Removed parser-boundary and whole-well segmentation modes.
+PASS  Removed the long test-segmentation explanation.
+PASS  Simplified sidebar section names and common labels.
+PASS  Light and Dark theme controls remain available.
+PASS  No deprecated use_container_width calls remain.
+
+Stability protections
+---------------------
+PASS  Removed duplicate global DataFrame cache.
+PASS  Removed deep merged-data duplication.
+PASS  Upload changes release stale merged data and export bytes.
+PASS  Only active-theme export bytes remain in memory.
+PASS  Preparing one export releases other prepared export payloads.
+PASS  Large data previews are capped for browser stability.
+PASS  Dense interactive charts are reduced without changing export data.
+PASS  Interactive view limits extremely wide selections to 12 signals.
+PASS  Chart rendering has a simplified fallback instead of terminating the app.
+PASS  Streamlit maxMessageSize matches the 200 MB upload setting.
+
+Parser sample validation
+------------------------
+WhatsApp Chat - Sitra8-58 clean & test(2).zip
+  Rows: 74
+  Parse time in validation environment: approximately 2.7 seconds
+  Result: PASS
+
+12-S8-58 (12-06-2026)(4).xlsx
+  Rows: 92
+  Parse time in validation environment: approximately 9.9 seconds
+  Result: PASS
+
+6-B15-42 (Dasco 27) (9-6-2026)(4).xlsx
+  Rows: 10
+  Parse time in validation environment: approximately 2.5 seconds
+  Result: PASS
+
+SPR(2).xlsx
+  Rows: 12
+  Parse time in validation environment: approximately 0.1 seconds
+  Result: PASS
+
+Repeated Streamlit interaction test
+------------------------------------
+For the WhatsApp ZIP, S8-58 workbook and SPR workbook, the following sequence
+was executed in separate AppTest sessions:
+  1. Upload file
+  2. Switch to Dark theme
+  3. Change inactive gap from 12 to 8 hours
+  4. Change aggregation to 30 minutes
+  5. Change plot style to Overlay actual values
+
+Application exceptions: 0
+Result: PASS
+
+Static and compilation tests
+----------------------------
+Python compilation: PASS
+v81 static UI/stability test: PASS
+v81 Streamlit AppTest: PASS
+Existing v79 parser regression: PASS
+
+Important limitation
+--------------------
+The Streamlit "Oh no" page is a generic frontend/server failure message. The
+specific original cause cannot be proven without the Streamlit Cloud logs from
+the failed runs. v81 removes or guards the main app-side memory, payload,
+deprecated-API and chart-exception risks found in the code.
