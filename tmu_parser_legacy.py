@@ -2404,13 +2404,25 @@ def apply_user_column_mappings(df: pd.DataFrame, mapping: Optional[Dict[str, str
 
 
 def available_numeric_columns(df: pd.DataFrame) -> List[str]:
-    return [
-        c
-        for c in df.columns
-        if c not in BASE_NON_PLOT_COLS
-        and pd.api.types.is_numeric_dtype(df[c])
-        and df[c].notna().any()
-    ]
+    audit_flags = {
+        "gas_formation_derived", "n2_rate_derived", "total_gas_derived",
+        "review_required", "ocr_approved", "is_event", "is_duplicate",
+    }
+    columns = []
+    seen = set()
+    for c in df.columns:
+        if c in seen or c in BASE_NON_PLOT_COLS or c in audit_flags:
+            continue
+        seen.add(c)
+        positions = [i for i, name in enumerate(df.columns) if name == c]
+        for pos in positions:
+            series = df.iloc[:, pos]
+            if pd.api.types.is_bool_dtype(series.dtype):
+                continue
+            if pd.api.types.is_numeric_dtype(series.dtype) and series.notna().any():
+                columns.append(c)
+                break
+    return columns
 
 
 def column_label(column_name: str) -> str:

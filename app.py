@@ -7,6 +7,7 @@ import traceback
 import gc
 import hashlib
 from pathlib import Path
+from datetime import date, datetime, time
 from typing import Optional
 
 import pandas as pd
@@ -367,7 +368,7 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_UI_BUILD_ID = "v73-ensemble-smart-parser-ui-20260626"
+APP_UI_BUILD_ID = "v74-safe-numeric-theme-export-20260627"
 
 UI_THEME_PRESETS = {
     "Light": {
@@ -444,6 +445,71 @@ CHART_TEXT = ACTIVE_THEME["chart_text"]
 CHART_GRID = ACTIVE_THEME["chart_grid"]
 CHART_GRID_SOFT = ACTIVE_THEME["chart_grid_soft"]
 CHART_LEGEND_BG = ACTIVE_THEME["chart_legend"]
+
+# Export annotations and report notes must follow the active Light/Dark theme.
+EXPORT_LABEL_BG = CHART_PAPER_BG
+EXPORT_LABEL_EDGE = CHART_GRID
+
+_PLOT_NUMBER_RE = re.compile(r"[-+]?(?:\d+(?:,\d{3})*(?:\.\d+)?|\.\d+)(?:[eE][-+]?\d+)?")
+
+def _plot_scalar_to_float(value) -> float:
+    """Convert one plotting value to a real float without leaving bool/object dtypes.
+
+    pandas intentionally keeps Boolean series as dtype bool when pd.to_numeric()
+    is used. Subtracting bool min/max raises TypeError. Field sheets can also
+    contain Decimal objects, numeric strings with units, commas, or duplicated
+    mapped columns. This converter always returns float64-compatible values.
+    """
+    if value is None:
+        return np.nan
+    if isinstance(value, (pd.Timestamp, datetime, date, time)):
+        return np.nan
+    try:
+        if pd.isna(value):
+            return np.nan
+    except Exception:
+        pass
+    if isinstance(value, (bool, np.bool_)):
+        return float(bool(value))
+    try:
+        number = float(value)
+        return number if np.isfinite(number) else np.nan
+    except (TypeError, ValueError, OverflowError):
+        pass
+    text = str(value).strip().replace("−", "-").replace("–", "-")
+    match = _PLOT_NUMBER_RE.search(text)
+    if not match:
+        return np.nan
+    try:
+        number = float(match.group(0).replace(",", ""))
+    except (TypeError, ValueError, OverflowError):
+        return np.nan
+    return number if np.isfinite(number) else np.nan
+
+def numeric_feature_series(frame: pd.DataFrame, feature: str, *, reset_index: bool = False) -> pd.Series:
+    """Return one safe float64 series, including when a mapped header is duplicated."""
+    if frame is None or feature not in frame.columns:
+        result = pd.Series(np.nan, index=getattr(frame, "index", None), dtype="float64", name=feature)
+        return result.reset_index(drop=True) if reset_index else result
+
+    positions = [i for i, col in enumerate(frame.columns) if col == feature]
+    if not positions:
+        result = pd.Series(np.nan, index=frame.index, dtype="float64", name=feature)
+    elif len(positions) == 1:
+        result = frame.iloc[:, positions[0]].map(_plot_scalar_to_float).astype("float64")
+        result.name = feature
+    else:
+        # Mapping can create the same canonical name more than once. Combine the
+        # duplicate candidates left-to-right instead of returning a DataFrame.
+        candidates = pd.concat(
+            [frame.iloc[:, pos].map(_plot_scalar_to_float).astype("float64") for pos in positions],
+            axis=1,
+        )
+        result = candidates.bfill(axis=1).iloc[:, 0].astype("float64")
+        result.name = feature
+
+    result = result.replace([np.inf, -np.inf], np.nan)
+    return result.reset_index(drop=True) if reset_index else result
 
 MIN_DATE_ALLOWED = pd.Timestamp("1900-01-01").date()
 MAX_DATE_ALLOWED = pd.Timestamp("2100-12-31").date()
@@ -2358,7 +2424,7 @@ with st.sidebar.expander("6. Visualization Studio", expanded=False):
 
         if use_custom_y_scale and selected_features:
             for feature in selected_features:
-                vals = pd.to_numeric(data[feature], errors="coerce").dropna() if feature in data.columns else pd.Series(dtype=float)
+                vals = numeric_feature_series(data, feature).dropna() if feature in data.columns else pd.Series(dtype="float64")
                 default_min = float(vals.min()) if not vals.empty else 0.0
                 default_max = float(vals.max()) if not vals.empty else 1.0
                 if default_min == default_max:
@@ -3200,10 +3266,9 @@ if selected_features and not filtered.empty:
         return set(list(range(0, n, step)) + [n - 1])
 
     def format_plot_value(feature, value):
-        if pd.isna(value):
+        v = _plot_scalar_to_float(value)
+        if pd.isna(v):
             return ""
-
-        v = float(value)
 
         fmt_choice = label_decimals_by_feature.get(feature, "Use default")
         if fmt_choice == "Use default":
@@ -3246,7 +3311,7 @@ if selected_features and not filtered.empty:
         if n == 0 or feature not in g.columns:
             return set()
 
-        y = pd.to_numeric(g[feature], errors="coerce").reset_index(drop=True)
+        y = numeric_feature_series(g, feature, reset_index=True)
         valid = y.dropna()
         if valid.empty:
             return set()
@@ -3335,10 +3400,11 @@ if selected_features and not filtered.empty:
         else:
             idxs = label_indices(len(g), value_label_mode)
 
+        values = numeric_feature_series(g, feature, reset_index=True)
         text = []
         pos = []
         position_cycle = ["top center", "bottom center", "middle right", "middle left"]
-        for i, v in enumerate(g[feature]):
+        for i, v in enumerate(values):
             text.append(format_plot_value(feature, v) if i in idxs else "")
             pos.append(position_cycle[i % len(position_cycle)])
         return text, pos
@@ -3347,7 +3413,7 @@ if selected_features and not filtered.empty:
         if feature in custom_y_ranges:
             return custom_y_ranges[feature]
 
-        vals = pd.to_numeric(df[feature], errors="coerce").dropna()
+        vals = numeric_feature_series(df, feature).dropna()
         if vals.empty:
             return None
 
@@ -3391,7 +3457,7 @@ if selected_features and not filtered.empty:
                         fig.add_trace(
                             go.Scatter(
                                 x=x_values(g),
-                                y=pd.to_numeric(g[feature], errors="coerce"),
+                                y=numeric_feature_series(g, feature),
                                 mode=line_mode + ("+text" if value_label_mode != "Off" else ""),
                                 text=text,
                                 textposition=textposition,
@@ -3474,7 +3540,7 @@ if selected_features and not filtered.empty:
                         fig.add_trace(
                             go.Scatter(
                                 x=x_values(g),
-                                y=g[feature],
+                                y=numeric_feature_series(g, feature),
                                 mode=line_mode + ("+text" if value_label_mode != "Off" else ""),
                                 text=text,
                                 textposition=textposition,
@@ -3682,7 +3748,7 @@ if selected_features and not filtered.empty:
                     fig.add_trace(
                         go.Scatter(
                             x=x_values(g),
-                            y=pd.to_numeric(g[feature], errors="coerce"),
+                            y=numeric_feature_series(g, feature),
                             mode=line_mode + ("+text" if value_label_mode != "Off" else ""),
                             text=text,
                             textposition=textposition,
@@ -3760,7 +3826,7 @@ if selected_features and not filtered.empty:
         st.dataframe(display_filtered, use_container_width=True, height=280)
 
     render_section_title("Engineering Report Exports", "Prepare publication-ready PNG, PDF, and filtered-data outputs using the active chart configuration.")
-    st.caption("Exports are generated only when you press a prepare button. This prevents Streamlit Cloud from crashing when charts are large.")
+    st.caption(f"Exports use the active {ACTIVE_THEME_NAME} theme. Prepare again after changing theme or chart settings; cached files are separated by theme.")
 
     def chart_label_indices_for_export(g, feature):
         """Use the same readable label logic for exports as the interactive chart."""
@@ -3840,7 +3906,7 @@ if selected_features and not filtered.empty:
                         x = g["plot_x"] if "plot_x" in g.columns and g["plot_x"].notna().any() else (
                             pd.to_datetime(g["datetime"], errors="coerce") if "datetime" in g.columns and g["datetime"].notna().any() else pd.Series(range(len(g)))
                         )
-                        y = pd.to_numeric(g[feature], errors="coerce")
+                        y = numeric_feature_series(g, feature)
                         ax.plot(
                             x,
                             y,
@@ -3872,14 +3938,14 @@ if selected_features and not filtered.empty:
                                 fontsize=9.5,
                                 color=color,
                                 fontweight="bold",
-                                bbox=dict(boxstyle="round,pad=0.12", fc="white", ec="none", alpha=0.65),
+                                bbox=dict(boxstyle="round,pad=0.12", fc=EXPORT_LABEL_BG, ec=EXPORT_LABEL_EDGE, alpha=0.65),
                             )
                         first_segment = False
 
                 if feature in custom_y_ranges:
                     ax.set_ylim(custom_y_ranges[feature][0], custom_y_ranges[feature][1])
                 else:
-                    vals = pd.to_numeric(df[feature], errors="coerce").dropna()
+                    vals = numeric_feature_series(df, feature).dropna()
                     if not vals.empty:
                         ymin = float(vals.min())
                         ymax = float(vals.max())
@@ -3922,7 +3988,7 @@ if selected_features and not filtered.empty:
 
                 apply_matplotlib_petro_style(fig_m, ax)
                 fig_m.tight_layout(rect=[0.02, 0.02, 0.98, 0.94])
-                pdf.savefig(fig_m)
+                pdf.savefig(fig_m, facecolor=CHART_PAPER_BG, edgecolor=CHART_PAPER_BG)
                 plt.close(fig_m)
 
         output.seek(0)
@@ -3954,7 +4020,7 @@ if selected_features and not filtered.empty:
                     x = g["plot_x"] if "plot_x" in g.columns and g["plot_x"].notna().any() else (
                         pd.to_datetime(g["datetime"], errors="coerce") if "datetime" in g.columns and g["datetime"].notna().any() else pd.Series(range(len(g)))
                     )
-                    y = pd.to_numeric(g[feature], errors="coerce")
+                    y = numeric_feature_series(g, feature)
                     color = feature_color(feature, wi)
 
                     ax.plot(x, y, marker="o", markersize=5, linewidth=2.6, color=color,
@@ -3974,13 +4040,13 @@ if selected_features and not filtered.empty:
                             fontsize=11,
                             color=color,
                             fontweight="bold",
-                            bbox=dict(boxstyle="round,pad=0.12", fc="white", ec="none", alpha=0.7),
+                            bbox=dict(boxstyle="round,pad=0.12", fc=EXPORT_LABEL_BG, ec=EXPORT_LABEL_EDGE, alpha=0.7),
                         )
 
                 if feature in custom_y_ranges:
                     ax.set_ylim(custom_y_ranges[feature][0], custom_y_ranges[feature][1])
                 else:
-                    vals = pd.to_numeric(df[feature], errors="coerce").dropna()
+                    vals = numeric_feature_series(df, feature).dropna()
                     if not vals.empty:
                         ymin = float(vals.min())
                         ymax = float(vals.max())
@@ -4021,7 +4087,7 @@ if selected_features and not filtered.empty:
                             ha="center",
                             va="center",
                             color=CHART_TEXT,
-                            bbox=dict(boxstyle="round,pad=0.22", fc="white", ec="#92400e", alpha=0.95),
+                            bbox=dict(boxstyle="round,pad=0.22", fc=EXPORT_LABEL_BG, ec="#C98B3C", alpha=0.95),
                         )
 
                 if plot_events:
@@ -4037,7 +4103,7 @@ if selected_features and not filtered.empty:
                             ha="right",
                             fontsize=11,
                             color=CHART_TEXT,
-                            bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="#111827", alpha=0.75),
+                            bbox=dict(boxstyle="round,pad=0.15", fc=EXPORT_LABEL_BG, ec=CHART_GRID, alpha=0.75),
                         )
                 ax.grid(True, which="major", alpha=0.28)
                 ax.tick_params(axis="both", labelsize=13)
@@ -4069,7 +4135,7 @@ if selected_features and not filtered.empty:
                 fig_m.tight_layout(rect=[0.02, 0.02, 0.98, 0.94])
 
                 png_buffer = io.BytesIO()
-                fig_m.savefig(png_buffer, format="png", dpi=190)
+                fig_m.savefig(png_buffer, format="png", dpi=190, facecolor=CHART_PAPER_BG, edgecolor=CHART_PAPER_BG)
                 plt.close(fig_m)
                 png_buffer.seek(0)
 
@@ -4175,7 +4241,7 @@ if selected_features and not filtered.empty:
                     ha="center",
                     va="bottom",
                     color=note_col,
-                    bbox=dict(boxstyle="round,pad=0.22", fc="white", ec=note_col, alpha=0.96),
+                    bbox=dict(boxstyle="round,pad=0.22", fc=EXPORT_LABEL_BG, ec=note_col, alpha=0.96),
                     clip_on=False,
                 )
 
@@ -4205,7 +4271,7 @@ if selected_features and not filtered.empty:
                     ha=ha,
                     fontsize=event_font_size,
                     color=note_col,
-                    bbox=dict(boxstyle="round,pad=0.15", fc="white", ec=note_col, alpha=0.82),
+                    bbox=dict(boxstyle="round,pad=0.15", fc=EXPORT_LABEL_BG, ec=note_col, alpha=0.82),
                     clip_on=False,
                 )
 
@@ -4251,7 +4317,7 @@ if selected_features and not filtered.empty:
                 for g in iter_plot_segments(g_all):
                     if g.empty:
                         continue
-                    y = pd.to_numeric(g[feature], errors="coerce")
+                    y = numeric_feature_series(g, feature)
                     if y.notna().sum() == 0:
                         continue
                     x = _matplotlib_x_values(g)
@@ -4283,14 +4349,14 @@ if selected_features and not filtered.empty:
                             fontsize=10.5,
                             color=color,
                             fontweight="bold",
-                            bbox=dict(boxstyle="round,pad=0.10", fc="white", ec="none", alpha=0.72),
+                            bbox=dict(boxstyle="round,pad=0.10", fc=EXPORT_LABEL_BG, ec=EXPORT_LABEL_EDGE, alpha=0.72),
                         )
                     first_segment = False
 
             if feature in custom_y_ranges:
                 ax.set_ylim(custom_y_ranges[feature][0], custom_y_ranges[feature][1])
             else:
-                vals = pd.to_numeric(df[feature], errors="coerce").dropna()
+                vals = numeric_feature_series(df, feature).dropna()
                 if not vals.empty:
                     ymin = float(vals.min())
                     ymax = float(vals.max())
@@ -4315,9 +4381,9 @@ if selected_features and not filtered.empty:
 
         output = io.BytesIO()
         if fmt == "pdf":
-            fig_m.savefig(output, format="pdf", bbox_inches="tight")
+            fig_m.savefig(output, format="pdf", bbox_inches="tight", facecolor=CHART_PAPER_BG, edgecolor=CHART_PAPER_BG)
         else:
-            fig_m.savefig(output, format="png", dpi=320, bbox_inches="tight")
+            fig_m.savefig(output, format="png", dpi=320, bbox_inches="tight", facecolor=CHART_PAPER_BG, edgecolor=CHART_PAPER_BG)
         plt.close(fig_m)
         output.seek(0)
         return output.getvalue()
@@ -4349,7 +4415,7 @@ if selected_features and not filtered.empty:
 
                 for g in iter_plot_segments(g_all):
                     x = _matplotlib_x_values(g)
-                    y = pd.to_numeric(g[feature], errors="coerce")
+                    y = numeric_feature_series(g, feature)
                     ax.plot(
                         x,
                         y,
@@ -4381,11 +4447,11 @@ if selected_features and not filtered.empty:
                             fontsize=9.5,
                             color=color,
                             fontweight="bold",
-                            bbox=dict(boxstyle="round,pad=0.10", fc="white", ec="none", alpha=0.70),
+                            bbox=dict(boxstyle="round,pad=0.10", fc=EXPORT_LABEL_BG, ec=EXPORT_LABEL_EDGE, alpha=0.70),
                         )
                     first_segment = False
 
-            vals = pd.to_numeric(df[feature], errors="coerce").dropna()
+            vals = numeric_feature_series(df, feature).dropna()
             if not vals.empty:
                 ymin = float(vals.min())
                 ymax = float(vals.max())
@@ -4408,7 +4474,7 @@ if selected_features and not filtered.empty:
             apply_matplotlib_petro_style(fig_m, ax)
             fig_m.tight_layout(rect=[0.02, 0.02, 0.98, 0.94])
             output = io.BytesIO()
-            fig_m.savefig(output, format="png", dpi=260, bbox_inches="tight")
+            fig_m.savefig(output, format="png", dpi=260, bbox_inches="tight", facecolor=CHART_PAPER_BG, edgecolor=CHART_PAPER_BG)
             plt.close(fig_m)
             output.seek(0)
 
@@ -4419,12 +4485,15 @@ if selected_features and not filtered.empty:
 
 
     def _prepare_export(export_key, fmt_label, make_bytes_func, file_name, mime):
-        bkey = f"export_bytes_{export_key}"
-        ekey = f"export_error_{export_key}"
+        # Theme is part of every key. A Light export can therefore never remain
+        # visible or downloadable after the user switches to Dark, or vice versa.
+        theme_key = re.sub(r"[^a-z0-9]+", "_", ACTIVE_THEME_NAME.lower()).strip("_")
+        bkey = f"export_bytes_{export_key}_{theme_key}"
+        ekey = f"export_error_{export_key}_{theme_key}"
         st.session_state.setdefault(bkey, None)
         st.session_state.setdefault(ekey, "")
 
-        if st.button(f"Prepare {fmt_label}", key=f"prepare_{export_key}"):
+        if st.button(f"Prepare {fmt_label} ({ACTIVE_THEME_NAME})", key=f"prepare_{export_key}_{theme_key}"):
             st.session_state[bkey] = None
             st.session_state[ekey] = ""
             try:
@@ -4447,7 +4516,7 @@ if selected_features and not filtered.empty:
                         data=data_bytes,
                         file_name=fname,
                         mime="image/png",
-                        key=f"download_{export_key}_{i}",
+                        key=f"download_{export_key}_{theme_key}_{i}",
                     )
             else:
                 st.download_button(
@@ -4455,7 +4524,7 @@ if selected_features and not filtered.empty:
                     data=prepared,
                     file_name=file_name,
                     mime=mime,
-                    key=f"download_{export_key}",
+                    key=f"download_{export_key}_{theme_key}",
                 )
 
     dl1, dl2 = st.columns(2)
@@ -4466,7 +4535,7 @@ if selected_features and not filtered.empty:
             "single_png",
             "single chart PNG",
             lambda: matplotlib_overview_export_bytes(filtered, selected_features, fmt="png"),
-            "tmu_single_chart.png",
+            f"production_test_single_chart_{ACTIVE_THEME_NAME.lower()}.png",
             "image/png",
         )
 
@@ -4475,7 +4544,7 @@ if selected_features and not filtered.empty:
             "single_pdf",
             "single chart PDF",
             lambda: matplotlib_overview_export_bytes(filtered, selected_features, fmt="pdf"),
-            "tmu_single_chart.pdf",
+            f"production_test_single_chart_{ACTIVE_THEME_NAME.lower()}.pdf",
             "application/pdf",
         )
 
@@ -4484,7 +4553,7 @@ if selected_features and not filtered.empty:
             "multi_png",
             "separate charts PNGs",
             lambda: human_readable_multi_png_bytes(filtered, selected_features),
-            "tmu_separate_charts.png",
+            f"production_test_separate_charts_{ACTIVE_THEME_NAME.lower()}.png",
             "image/png",
         )
 
@@ -4493,7 +4562,7 @@ if selected_features and not filtered.empty:
             "multi_pdf",
             "multi-charts PDF",
             lambda: human_readable_pdf_bytes(filtered, selected_features),
-            "tmu_multi_charts.pdf",
+            f"production_test_multi_charts_{ACTIVE_THEME_NAME.lower()}.pdf",
             "application/pdf",
         )
 else:

@@ -23,7 +23,7 @@ import pandas as pd
 import tmu_parser_compat as compat
 import smart_tabular_v73 as smart
 
-PARSER_BUILD_ID = "v73-ensemble-schema-tolerant-parser-20260626"
+PARSER_BUILD_ID = "v74-ensemble-smart-parser-safe-plot-columns-20260627"
 
 COLUMN_LABELS: Dict[str, str] = dict(getattr(compat, "COLUMN_LABELS", {}))
 COLUMN_LABELS.update(smart.FIELD_LABELS)
@@ -103,12 +103,36 @@ def _numeric_columns(df: pd.DataFrame) -> List[str]:
         "caption_text", "suggested_well", "suggested_test_id",
         "suggested_link_reason", "test_start", "test_end",
     }
+    # Boolean/audit flags are not engineering curves.  pandas keeps bool dtype
+    # after pd.to_numeric(), and subtracting bool min/max raises TypeError in
+    # chart labelling.  Keep them in the audit table but never offer them as
+    # plot features.
+    exclude |= {
+        "gas_formation_derived", "n2_rate_derived", "total_gas_derived",
+        "ocr_approved", "is_event", "is_duplicate", "is_interpolated",
+    }
+
     result = []
+    seen = set()
     for c in df.columns:
-        if c in exclude or str(c).startswith("source_"):
+        if c in seen or c in exclude or str(c).startswith("source_"):
             continue
-        values = pd.to_numeric(df[c], errors="coerce")
-        if values.notna().sum() > 0:
+        seen.add(c)
+        positions = [i for i, name in enumerate(df.columns) if name == c]
+        candidates = []
+        for pos in positions:
+            series = df.iloc[:, pos]
+            if pd.api.types.is_bool_dtype(series.dtype):
+                continue
+            converted = pd.to_numeric(series, errors="coerce")
+            # Force numeric extension/object results to real floats so Decimal,
+            # nullable and mixed spreadsheet columns behave consistently.
+            try:
+                converted = converted.astype("float64")
+            except (TypeError, ValueError):
+                converted = converted.map(lambda v: float(v) if pd.notna(v) else np.nan)
+            candidates.append(converted)
+        if candidates and pd.concat(candidates, axis=1).notna().any(axis=1).sum() > 0:
             result.append(c)
     return result
 
@@ -126,7 +150,7 @@ def apply_fill_method(df: pd.DataFrame, columns: Sequence[str], method: str) -> 
         out[selected] = out[selected].ffill()
     elif method in {"Backward fill", "bfill"}:
         out[selected] = out[selected].bfill()
-    elif method in {"Linear interpolation", "interpolate"}:
+    elif method in {"Linear interpolation", "Linear interpolation by row", "interpolate"}:
         out[selected] = out[selected].apply(pd.to_numeric, errors="coerce").interpolate(limit_direction="both")
     elif method in {"Zero", "Fill zero"}:
         out[selected] = out[selected].fillna(0)

@@ -1,0 +1,62 @@
+PRODUCTION TEST DASHBOARD v74 - VALIDATION RESULTS
+=================================================
+
+Build IDs
+---------
+Parser: v74-ensemble-smart-parser-safe-plot-columns-20260627
+UI:     v74-safe-numeric-theme-export-20260627
+
+Reported crash
+--------------
+Reproduced original failure with a Boolean pandas Series:
+  numpy boolean subtract, the `-` operator, is not supported
+
+Cause:
+  gas_formation_derived, n2_rate_derived and total_gas_derived were Boolean
+  audit columns but were offered by available_numeric_columns().
+
+Correction:
+  - Boolean/audit columns excluded from plot choices.
+  - All plotted values normalized to float64 through numeric_feature_series().
+  - Duplicate mapped columns combined safely.
+  - Labels, traces, ranges and exports share the same conversion path.
+
+Supplied file validation
+------------------------
+SPR(1).xlsx
+  Parsed rows: 12
+  Plot features: Stroke Length, Stroke Rate, Peak Load, Minimum Load
+  Boolean audit features exposed: 0
+
+6-B15-42 (Dasco 27) (9-6-2026)(3).xlsx
+  Parsed rows: 10
+  Production-rate, pressure, gas and quality fields detected
+  Boolean audit features exposed: 0
+
+Streamlit AppTest
+-----------------
+  Empty application launch: PASS
+  Upload both supplied workbooks: PASS
+  Default plots: PASS
+  Select all 25 valid engineering curves: PASS
+  Switch Light -> Dark: PASS
+  Application exceptions: 0
+
+Export validation
+-----------------
+  Light single-chart PNG preparation: PASS
+  Dark single-chart PNG preparation: PASS
+  Dark single-chart PDF preparation: PASS
+  Theme name present on prepare buttons: PASS
+  Light/Dark export cache isolation: PASS
+  All Matplotlib PNG/PDF save paths use active theme facecolor: PASS
+  Value/event/interval label boxes use active theme background: PASS
+
+Static/compatibility tests
+--------------------------
+  Python compilation: PASS
+  v74 parser self-test: PASS
+  v74 UI/export smoke test: PASS
+  Adaptive unseen-layout test: PASS
+  EXPRO alignment regression: PASS
+  MM SCF/D unit regression: PASS

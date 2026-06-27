@@ -1742,14 +1742,27 @@ def assign_test_ids(df: pd.DataFrame, gap_hours: float = 12.0) -> pd.DataFrame:
 def available_numeric_columns(df: pd.DataFrame) -> List[str]:
     if df is None or df.empty:
         return []
+    audit_flags = {
+        "gas_formation_derived", "n2_rate_derived", "total_gas_derived",
+        "review_required", "ocr_approved", "is_event", "is_duplicate",
+    }
     columns: List[str] = []
+    seen = set()
     for col in df.columns:
-        if col in BASE_NON_PLOT_COLS or str(col).startswith("_"):
+        if col in seen or col in BASE_NON_PLOT_COLS or col in audit_flags or str(col).startswith("_"):
             continue
-        if col == "gas_rate_status":
-            continue
-        values = pd.to_numeric(df[col], errors="coerce")
-        if values.notna().any():
+        seen.add(col)
+        positions = [i for i, name in enumerate(df.columns) if name == col]
+        usable = False
+        for pos in positions:
+            series = df.iloc[:, pos]
+            if pd.api.types.is_bool_dtype(series.dtype):
+                continue
+            values = pd.to_numeric(series, errors="coerce")
+            if values.notna().any():
+                usable = True
+                break
+        if usable:
             columns.append(col)
     return columns
 
