@@ -1,0 +1,52 @@
+PRODUCTION TEST DASHBOARD v76 — DARK THEME VISIBILITY VALIDATION
+================================================================
+
+Build
+-----
+UI: v76-dark-visibility-scroll-controls-ui-20260627
+Parser: unchanged v75 fast/adaptive parser
+
+Dark-theme controls corrected
+-----------------------------
+PASS  Main-page vertical and horizontal scrollbar styling
+PASS  Sidebar scrollbar track, thumb and stable gutter
+PASS  Scrollbar up/down and left/right buttons for supporting browsers
+PASS  Sidebar collapse/expand arrows
+PASS  Expander arrows
+PASS  Tab and pagination scroll arrows
+PASS  Uploaded-file chip background, name, size, file icon and remove button
+PASS  Add-file control
+PASS  Number-input plus/minus controls
+PASS  Select, multiselect, date and time icons
+PASS  Help, popover, menu and toolbar icons
+PASS  Radio, checkbox, toggle and slider states
+PASS  Dialog, toast, status, menu and code-block surfaces
+PASS  Plotly modebar icons and background
+PASS  Disabled control readability
+
+Dark-token contrast ratios
+--------------------------
+Body text / sidebar background:       16.16:1
+Muted text / sidebar background:      10.55:1
+Strong text / panel background:       16.11:1
+Control icon / control background:    12.31:1
+Disabled text / disabled background:   7.15:1
+Scrollbar thumb / scrollbar track:     4.91:1
+Scrollbar hover / scrollbar track:    10.45:1
+Accent / input background:              7.27:1
+
+Runtime checks
+--------------
+PASS  Python compilation
+PASS  v76 static UI smoke test
+PASS  Streamlit initial Light run
+PASS  Streamlit rerun after selecting Dark
+PASS  No Streamlit exceptions
+PASS  SPR workbook parser compatibility
+PASS  B15-42 workbook parser compatibility
+PASS  S8-58 workbook parser compatibility
+
+Scope
+-----
+This release changes the UI only. Parser behavior, continuous-test plotting,
+performance improvements and theme-aware PNG/PDF exports from v75 are retained.

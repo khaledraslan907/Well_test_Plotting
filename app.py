@@ -368,7 +368,7 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_UI_BUILD_ID = "v75-continuous-fast-responsive-ui-20260627"
+APP_UI_BUILD_ID = "v76-dark-visibility-scroll-controls-ui-20260627"
 
 UI_THEME_PRESETS = {
     "Light": {
@@ -395,6 +395,14 @@ UI_THEME_PRESETS = {
         "grid": "rgba(15, 98, 123, 0.035)",
         "glow": "rgba(47, 141, 168, 0.14)",
         "shadow": "rgba(22, 46, 60, 0.10)",
+        "control_bg": "#E8F0F4",
+        "control_hover": "#D6E6ED",
+        "control_icon": "#214454",
+        "disabled_bg": "#E8EEF2",
+        "disabled_text": "#6A7E89",
+        "scroll_track": "#E7EEF2",
+        "scroll_thumb": "#6D8D9C",
+        "scroll_thumb_hover": "#0F627B",
         "chart_paper": "#FFFFFF",
         "chart_plot": "#F8FAFC",
         "chart_text": "#152631",
@@ -426,6 +434,14 @@ UI_THEME_PRESETS = {
         "grid": "rgba(139, 194, 214, 0.035)",
         "glow": "rgba(61, 166, 198, 0.13)",
         "shadow": "rgba(0, 0, 0, 0.34)",
+        "control_bg": "#17313E",
+        "control_hover": "#214655",
+        "control_icon": "#E9F6FA",
+        "disabled_bg": "#152A35",
+        "disabled_text": "#A4B7C0",
+        "scroll_track": "#061119",
+        "scroll_thumb": "#5F8798",
+        "scroll_thumb_hover": "#78CCE0",
         "chart_paper": "#0C1B25",
         "chart_plot": "#10232F",
         "chart_text": "#EAF2F5",
@@ -828,10 +844,83 @@ st.markdown(
         --petro-grid: {ACTIVE_THEME['grid']};
         --petro-glow: {ACTIVE_THEME['glow']};
         --petro-shadow: {ACTIVE_THEME['shadow']};
+        --petro-control-bg: {ACTIVE_THEME['control_bg']};
+        --petro-control-hover: {ACTIVE_THEME['control_hover']};
+        --petro-control-icon: {ACTIVE_THEME['control_icon']};
+        --petro-disabled-bg: {ACTIVE_THEME['disabled_bg']};
+        --petro-disabled-text: {ACTIVE_THEME['disabled_text']};
+        --petro-scroll-track: {ACTIVE_THEME['scroll_track']};
+        --petro-scroll-thumb: {ACTIVE_THEME['scroll_thumb']};
+        --petro-scroll-thumb-hover: {ACTIVE_THEME['scroll_thumb_hover']};
+        --petro-chart-text: {ACTIVE_THEME['chart_text']};
+        --petro-chart-paper: {ACTIVE_THEME['chart_paper']};
     }}
 
     html, body, [class*="css"] {{
         font-family: Inter, Aptos, "Segoe UI", Roboto, Arial, sans-serif;
+    }}
+
+
+    /* High-contrast scrollbars and scroll arrows for both the main page and sidebar. */
+    html, body, .stApp, .stApp *, section[data-testid="stSidebar"] * {{
+        scrollbar-color: var(--petro-scroll-thumb) var(--petro-scroll-track);
+        scrollbar-width: auto;
+    }}
+    html {{ overflow-y: scroll; scrollbar-gutter: stable; }}
+    [data-testid="stAppViewContainer"],
+    [data-testid="stSidebarContent"],
+    [data-testid="stSidebarUserContent"] {{ scrollbar-gutter: stable; }}
+    section[data-testid="stSidebar"] [data-testid="stSidebarContent"] {{ overflow-y: scroll !important; }}
+    *::-webkit-scrollbar {{ width: 13px; height: 13px; }}
+    *::-webkit-scrollbar-track {{
+        background: var(--petro-scroll-track);
+        border-radius: 999px;
+    }}
+    *::-webkit-scrollbar-thumb {{
+        min-height: 42px;
+        background: var(--petro-scroll-thumb);
+        border: 3px solid var(--petro-scroll-track);
+        border-radius: 999px;
+    }}
+    *::-webkit-scrollbar-thumb:hover,
+    *::-webkit-scrollbar-thumb:active {{ background: var(--petro-scroll-thumb-hover); }}
+    *::-webkit-scrollbar-corner {{ background: var(--petro-scroll-track); }}
+    *::-webkit-scrollbar-button:single-button {{
+        display: block;
+        width: 13px;
+        height: 13px;
+        background-color: var(--petro-control-bg);
+        border: 1px solid var(--petro-border);
+        background-repeat: no-repeat;
+    }}
+    *::-webkit-scrollbar-button:single-button:hover {{ background-color: var(--petro-control-hover); }}
+    *::-webkit-scrollbar-button:single-button:vertical:decrement {{
+        background-image:
+            linear-gradient(135deg, transparent 50%, var(--petro-control-icon) 50%),
+            linear-gradient(225deg, transparent 50%, var(--petro-control-icon) 50%);
+        background-size: 5px 5px, 5px 5px;
+        background-position: 2px 5px, 6px 5px;
+    }}
+    *::-webkit-scrollbar-button:single-button:vertical:increment {{
+        background-image:
+            linear-gradient(45deg, transparent 50%, var(--petro-control-icon) 50%),
+            linear-gradient(315deg, transparent 50%, var(--petro-control-icon) 50%);
+        background-size: 5px 5px, 5px 5px;
+        background-position: 2px 3px, 6px 3px;
+    }}
+    *::-webkit-scrollbar-button:single-button:horizontal:decrement {{
+        background-image:
+            linear-gradient(45deg, transparent 50%, var(--petro-control-icon) 50%),
+            linear-gradient(135deg, transparent 50%, var(--petro-control-icon) 50%);
+        background-size: 5px 5px, 5px 5px;
+        background-position: 5px 2px, 5px 6px;
+    }}
+    *::-webkit-scrollbar-button:single-button:horizontal:increment {{
+        background-image:
+            linear-gradient(225deg, transparent 50%, var(--petro-control-icon) 50%),
+            linear-gradient(315deg, transparent 50%, var(--petro-control-icon) 50%);
+        background-size: 5px 5px, 5px 5px;
+        background-position: 3px 2px, 3px 6px;
     }}
 
     .stApp {{
@@ -862,6 +951,43 @@ st.markdown(
         color: var(--petro-text) !important;
         fill: var(--petro-text) !important;
     }}
+
+
+    /* Sidebar open/close arrows, tab scroll arrows and icon-only controls. */
+    [data-testid="stSidebarCollapseButton"],
+    [data-testid="stExpandSidebarButton"],
+    [data-testid="stTabsScrollLeft"],
+    [data-testid="stTabsScrollRight"],
+    [data-testid="stPaginationPrev"],
+    [data-testid="stPaginationNext"] {{
+        color: var(--petro-control-icon) !important;
+        background: var(--petro-control-bg) !important;
+        border: 1px solid var(--petro-border-strong) !important;
+        border-radius: 8px !important;
+        opacity: 1 !important;
+    }}
+    [data-testid="stSidebarCollapseButton"]:hover,
+    [data-testid="stExpandSidebarButton"]:hover,
+    [data-testid="stTabsScrollLeft"]:hover,
+    [data-testid="stTabsScrollRight"]:hover,
+    [data-testid="stPaginationPrev"]:hover,
+    [data-testid="stPaginationNext"]:hover {{
+        color: var(--petro-text-strong) !important;
+        background: var(--petro-control-hover) !important;
+    }}
+    [data-testid="stSidebarCollapseButton"] svg,
+    [data-testid="stExpandSidebarButton"] svg,
+    [data-testid="stTabsScrollLeft"] svg,
+    [data-testid="stTabsScrollRight"] svg,
+    [data-testid="stPaginationPrev"] svg,
+    [data-testid="stPaginationNext"] svg {{
+        color: currentColor !important;
+        fill: currentColor !important;
+        stroke: currentColor !important;
+        opacity: 1 !important;
+    }}
+    [data-testid="stIconMaterial"],
+    [data-testid="stIconEmoji"] {{ color: inherit !important; opacity: 1 !important; }}
 
     .block-container {{
         padding-top: 1.1rem;
@@ -1128,8 +1254,153 @@ st.markdown(
     }}
     [data-testid="stTabs"] [data-baseweb="tab-border"] {{ background: var(--petro-border) !important; }}
 
+
     [data-testid="stProgress"] > div > div {{ background-color: var(--petro-accent) !important; }}
     hr {{ border-color: var(--petro-border) !important; }}
+
+    /* Uploaded-file chips were rendered with a light background in Dark mode. */
+    [data-testid="stFileChips"] {{ gap: .45rem !important; }}
+    [data-testid="stFileChip"] {{
+        background: var(--petro-panel-2) !important;
+        color: var(--petro-text) !important;
+        border: 1px solid var(--petro-border-strong) !important;
+        box-shadow: 0 3px 10px color-mix(in srgb, var(--petro-shadow) 64%, transparent) !important;
+    }}
+    [data-testid="stFileChipName"] {{ color: var(--petro-text-strong) !important; opacity: 1 !important; }}
+    [data-testid="stFileChip"] small,
+    [data-testid="stFileChip"] div {{ color: var(--petro-muted) !important; opacity: 1 !important; }}
+    [data-testid="stFileChip"] > div:first-child {{
+        background: var(--petro-control-bg) !important;
+        color: var(--petro-accent-hover) !important;
+        border: 1px solid var(--petro-border) !important;
+    }}
+    [data-testid="stFileChipDeleteBtn"] button,
+    [data-testid="stFileChips"] > button,
+    [data-testid="stFileChips"] button[aria-label*="upload" i] {{
+        background: var(--petro-control-bg) !important;
+        color: var(--petro-control-icon) !important;
+        border: 1px solid var(--petro-border-strong) !important;
+        opacity: 1 !important;
+    }}
+    [data-testid="stFileChipDeleteBtn"] button:hover,
+    [data-testid="stFileChips"] > button:hover,
+    [data-testid="stFileChips"] button[aria-label*="upload" i]:hover {{
+        background: var(--petro-control-hover) !important;
+        color: var(--petro-text-strong) !important;
+    }}
+    [data-testid="stFileChipDeleteBtn"] svg,
+    [data-testid="stFileChips"] button svg {{ color: currentColor !important; fill: currentColor !important; }}
+
+    /* Number-input +/- controls, input adornments and clear buttons. */
+    [data-testid="stNumberInputStepDown"],
+    [data-testid="stNumberInputStepUp"],
+    [data-testid="stTimeInputClearButton"] {{
+        background: var(--petro-control-bg) !important;
+        color: var(--petro-control-icon) !important;
+        border-left: 1px solid var(--petro-border) !important;
+        opacity: 1 !important;
+    }}
+    [data-testid="stNumberInputStepDown"]:hover:not(:disabled),
+    [data-testid="stNumberInputStepUp"]:hover:not(:disabled),
+    [data-testid="stTimeInputClearButton"]:hover:not(:disabled) {{
+        background: var(--petro-control-hover) !important;
+        color: var(--petro-text-strong) !important;
+    }}
+    [data-testid="stNumberInputStepDown"] svg,
+    [data-testid="stNumberInputStepUp"] svg,
+    [data-testid="stTimeInputClearButton"] svg {{ color: currentColor !important; fill: currentColor !important; }}
+
+    /* Select, date/time, help, popover and toolbar icons. */
+    [data-testid="stSelectbox"] svg,
+    [data-testid="stMultiSelect"] svg,
+    [data-testid="stDateInput"] svg,
+    [data-testid="stDateTimeInput"] svg,
+    [data-testid="stTimeInput"] svg,
+    [data-testid="stPopoverButton"] svg,
+    [data-testid="stMenuButton"] svg,
+    [data-testid="stElementToolbarButton"] svg,
+    [data-testid="stMainMenuButton"] svg {{
+        color: var(--petro-control-icon) !important;
+        fill: currentColor !important;
+        stroke: currentColor !important;
+        opacity: 1 !important;
+    }}
+    [data-testid="stPopoverButton"] button,
+    [data-testid="stMenuButtonButton"],
+    [data-testid="stElementToolbarButton"],
+    [data-testid="stMainMenuButton"] {{
+        color: var(--petro-control-icon) !important;
+        opacity: 1 !important;
+    }}
+    button[aria-label*="help" i],
+    button[aria-label*="tooltip" i],
+    button[title*="help" i] {{ color: var(--petro-control-icon) !important; opacity: 1 !important; }}
+
+    /* Radio, checkbox, toggle and slider states stay visible on dark surfaces. */
+    [data-testid="stRadio"] [role="radio"],
+    [data-testid="stCheckbox"] [role="checkbox"],
+    [data-testid="stToggle"] [role="switch"] {{
+        border-color: var(--petro-border-strong) !important;
+        opacity: 1 !important;
+    }}
+    [data-testid="stRadio"] [role="radio"][aria-checked="true"],
+    [data-testid="stCheckbox"] [role="checkbox"][aria-checked="true"],
+    [data-testid="stToggle"] [role="switch"][aria-checked="true"] {{
+        background: var(--petro-accent) !important;
+        border-color: var(--petro-accent-hover) !important;
+    }}
+    [data-testid="stSlider"] [role="slider"] {{
+        background: var(--petro-accent) !important;
+        border: 2px solid var(--petro-text-strong) !important;
+        box-shadow: 0 0 0 2px color-mix(in srgb, var(--petro-accent) 28%, transparent) !important;
+    }}
+    [data-testid="stSliderThumbValue"],
+    [data-testid="stSliderTickBar"] {{ color: var(--petro-text) !important; }}
+
+    /* Tables, menus, dialogs, status cards and code blocks. */
+    [data-testid="stPopoverBody"],
+    [data-testid="stDialog"],
+    [data-testid="stToast"],
+    [data-testid="stStatusWidget"],
+    [data-testid="stMainMenuPopover"] {{
+        background: var(--petro-panel) !important;
+        color: var(--petro-text) !important;
+        border-color: var(--petro-border) !important;
+    }}
+    [data-testid="stPopoverBody"] *,
+    [data-testid="stDialog"] *,
+    [data-testid="stToast"] *,
+    [data-testid="stStatusWidget"] *,
+    [data-testid="stMainMenuPopover"] * {{ color: var(--petro-text) !important; }}
+    [data-testid="stMarkdownPre"],
+    [data-testid="stCode"], pre, code {{
+        background: var(--petro-input) !important;
+        color: var(--petro-text-strong) !important;
+        border-color: var(--petro-border) !important;
+    }}
+    [data-testid="stSpinnerIcon"] {{ color: var(--petro-accent-hover) !important; }}
+
+    /* Plotly modebar follows the selected app theme. */
+    .js-plotly-plot .modebar {{
+        background: color-mix(in srgb, var(--petro-chart-paper) 92%, transparent) !important;
+        border: 1px solid var(--petro-border) !important;
+        border-radius: 8px !important;
+    }}
+    .js-plotly-plot .modebar-btn {{ opacity: .82 !important; }}
+    .js-plotly-plot .modebar-btn:hover {{ opacity: 1 !important; }}
+    .js-plotly-plot .modebar-btn path {{ fill: var(--petro-chart-text) !important; }}
+
+    /* Disabled widgets remain readable instead of fading into dark panels. */
+    button:disabled,
+    input:disabled,
+    textarea:disabled,
+    [aria-disabled="true"] {{
+        opacity: 1 !important;
+        color: var(--petro-disabled-text) !important;
+    }}
+    input:disabled,
+    textarea:disabled,
+    [aria-disabled="true"]:not(button) {{ background: var(--petro-disabled-bg) !important; }}
 
     @media (max-width: 900px) {{
         .block-container {{ padding-left: .8rem; padding-right: .8rem; }}
