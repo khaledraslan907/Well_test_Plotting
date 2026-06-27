@@ -368,7 +368,7 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_UI_BUILD_ID = "v79-whatsapp-zip-reliability-ui-20260627"
+APP_UI_BUILD_ID = "v80-complete-dark-control-visibility-ui-20260627"
 
 UI_THEME_PRESETS = {
     "Light": {
@@ -1484,6 +1484,190 @@ st.markdown(
     .js-plotly-plot .modebar-btn {{ opacity: .82 !important; }}
     .js-plotly-plot .modebar-btn:hover {{ opacity: 1 !important; }}
     .js-plotly-plot .modebar-btn path {{ fill: var(--petro-chart-text) !important; }}
+
+    /* v80: final high-contrast layer for Streamlit 1.58+ controls.
+       Newer Streamlit releases render tooltip icons and select menus through
+       BaseWeb portals whose generated classes change between releases.  These
+       selectors use stable data-testid / ARIA attributes instead. */
+
+    /* Help/question-mark icon: the icon is stroke-based, so changing only the
+       button text color does not make it visible. */
+    [data-testid="stTooltipIcon"],
+    [data-testid="stTooltipHoverTarget"] {{
+        color: var(--petro-control-icon) !important;
+        opacity: 1 !important;
+        visibility: visible !important;
+    }}
+    [data-testid="stTooltipIcon"] button {{
+        width: 1.08rem !important;
+        height: 1.08rem !important;
+        min-width: 1.08rem !important;
+        min-height: 1.08rem !important;
+        padding: 0 !important;
+        display: inline-flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        color: var(--petro-control-icon) !important;
+        background: color-mix(in srgb, var(--petro-control-bg) 88%, transparent) !important;
+        border: 1px solid color-mix(in srgb, var(--petro-control-icon) 48%, var(--petro-border-strong)) !important;
+        border-radius: 999px !important;
+        opacity: 1 !important;
+        visibility: visible !important;
+        cursor: help !important;
+    }}
+    [data-testid="stTooltipIcon"] button:hover,
+    [data-testid="stTooltipIcon"] button:focus-visible {{
+        color: var(--petro-text-strong) !important;
+        background: var(--petro-control-hover) !important;
+        border-color: var(--petro-accent-hover) !important;
+        box-shadow: 0 0 0 2px color-mix(in srgb, var(--petro-accent) 28%, transparent) !important;
+    }}
+    [data-testid="stTooltipIcon"] button svg.icon,
+    [data-testid="stTooltipIcon"] svg,
+    [data-testid="stTooltipHoverTarget"] svg.icon,
+    [data-testid="stTooltipHoverTarget"] svg {{
+        width: .82rem !important;
+        height: .82rem !important;
+        color: currentColor !important;
+        stroke: currentColor !important;
+        stroke-width: 1.9 !important;
+        fill: none !important;
+        opacity: 1 !important;
+        visibility: visible !important;
+    }}
+
+    /* Select and multiselect controls, including selected well tags, clear
+       icons, search cursor and open arrow. */
+    [data-testid="stSelectbox"] div[data-baseweb="select"],
+    [data-testid="stMultiSelect"] div[data-baseweb="select"] {{
+        color: var(--petro-text-strong) !important;
+        opacity: 1 !important;
+    }}
+    [data-testid="stSelectbox"] div[data-baseweb="select"] > div,
+    [data-testid="stMultiSelect"] div[data-baseweb="select"] > div {{
+        background: var(--petro-input) !important;
+        background-color: var(--petro-input) !important;
+        color: var(--petro-text-strong) !important;
+        border-color: var(--petro-border-strong) !important;
+        box-shadow: none !important;
+        opacity: 1 !important;
+    }}
+    [data-testid="stSelectbox"] div[data-baseweb="select"]:focus-within > div,
+    [data-testid="stMultiSelect"] div[data-baseweb="select"]:focus-within > div {{
+        border-color: var(--petro-accent-hover) !important;
+        box-shadow: 0 0 0 2px color-mix(in srgb, var(--petro-accent) 24%, transparent) !important;
+    }}
+    [data-testid="stSelectbox"] input,
+    [data-testid="stMultiSelect"] input {{
+        color: var(--petro-text-strong) !important;
+        caret-color: var(--petro-accent-hover) !important;
+        background: transparent !important;
+        opacity: 1 !important;
+    }}
+    [data-testid="stSelectbox"] input::placeholder,
+    [data-testid="stMultiSelect"] input::placeholder {{
+        color: var(--petro-muted) !important;
+        opacity: 1 !important;
+    }}
+    [data-testid="stMultiSelect"] span[data-baseweb="tag"] {{
+        background: color-mix(in srgb, var(--petro-accent) 52%, var(--petro-panel-2)) !important;
+        color: var(--petro-text-strong) !important;
+        border: 1px solid color-mix(in srgb, var(--petro-accent-hover) 50%, var(--petro-border-strong)) !important;
+        opacity: 1 !important;
+    }}
+    [data-testid="stMultiSelect"] span[data-baseweb="tag"] *,
+    [data-testid="stMultiSelect"] span[data-baseweb="tag"] svg {{
+        color: var(--petro-text-strong) !important;
+        fill: currentColor !important;
+        stroke: currentColor !important;
+        opacity: 1 !important;
+    }}
+    [data-testid="stSelectbox"] svg,
+    [data-testid="stMultiSelect"] svg {{
+        color: var(--petro-control-icon) !important;
+        fill: currentColor !important;
+        stroke: currentColor !important;
+        opacity: 1 !important;
+    }}
+
+    /* BaseWeb menu portals.  The no-results row is a li[aria-live="polite"]
+       and did not inherit the earlier menu rules, leaving a white rectangle. */
+    body [data-baseweb="popover"],
+    body [data-baseweb="popover"] > div,
+    body [data-baseweb="popover"] > div > div,
+    body [data-baseweb="popover"] > div > div > div,
+    body [data-baseweb="popover"] [data-baseweb="menu"],
+    body [data-baseweb="popover"] [role="listbox"],
+    body [data-baseweb="popover"] ul[role="listbox"] {{
+        background: var(--petro-panel-2) !important;
+        background-color: var(--petro-panel-2) !important;
+        color: var(--petro-text-strong) !important;
+        border-color: var(--petro-border-strong) !important;
+        opacity: 1 !important;
+    }}
+    body [data-baseweb="popover"] [data-baseweb="menu"] {{
+        border: 1px solid var(--petro-border-strong) !important;
+        border-radius: 9px !important;
+        overflow: hidden !important;
+        box-shadow: 0 14px 34px var(--petro-shadow) !important;
+    }}
+    body [data-baseweb="popover"] li[aria-live="polite"],
+    body [data-baseweb="popover"] [aria-live="polite"][aria-atomic="true"],
+    body [data-baseweb="menu"] li[aria-live="polite"] {{
+        min-height: 4.5rem !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        margin: 0 !important;
+        padding: .9rem !important;
+        background: var(--petro-panel-2) !important;
+        background-color: var(--petro-panel-2) !important;
+        color: var(--petro-muted) !important;
+        border: 0 !important;
+        opacity: 1 !important;
+        cursor: default !important;
+    }}
+    body [data-baseweb="popover"] li[aria-live="polite"] *,
+    body [data-baseweb="popover"] [aria-live="polite"][aria-atomic="true"] * {{
+        color: var(--petro-muted) !important;
+        opacity: 1 !important;
+    }}
+    body [data-baseweb="popover"] [role="option"],
+    body [data-baseweb="popover"] li[role="option"] {{
+        background: var(--petro-panel-2) !important;
+        color: var(--petro-text) !important;
+        border-bottom: 1px solid color-mix(in srgb, var(--petro-border) 62%, transparent) !important;
+        opacity: 1 !important;
+    }}
+    body [data-baseweb="popover"] [role="option"] *,
+    body [data-baseweb="popover"] li[role="option"] * {{
+        color: inherit !important;
+        opacity: 1 !important;
+    }}
+    body [data-baseweb="popover"] [role="option"]:hover,
+    body [data-baseweb="popover"] [role="option"][aria-selected="true"],
+    body [data-baseweb="popover"] li[role="option"]:hover,
+    body [data-baseweb="popover"] li[role="option"][aria-selected="true"] {{
+        background: var(--petro-control-hover) !important;
+        color: var(--petro-text-strong) !important;
+    }}
+
+    /* Other icon-only controls use either fill or stroke depending on the
+       Streamlit release.  Set both without dimming disabled-but-readable UI. */
+    [data-testid="stWidgetLabel"] svg,
+    [data-testid="stSelectbox"] button svg,
+    [data-testid="stMultiSelect"] button svg,
+    [data-testid="stDateInput"] button svg,
+    [data-testid="stTimeInput"] button svg,
+    [data-testid="stNumberInput"] button svg,
+    [data-testid="stPopoverButton"] button svg,
+    [data-testid="stMenuButton"] button svg {{
+        color: var(--petro-control-icon) !important;
+        fill: currentColor !important;
+        stroke: currentColor !important;
+        opacity: 1 !important;
+        visibility: visible !important;
+    }}
 
     /* Disabled widgets remain readable instead of fading into dark panels. */
     button:disabled,

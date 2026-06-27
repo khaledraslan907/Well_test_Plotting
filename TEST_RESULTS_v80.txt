@@ -1,0 +1,55 @@
+PRODUCTION TEST DASHBOARD v80 — DARK CONTROL VISIBILITY RESULTS
+================================================================
+
+Build
+-----
+UI:     v80-complete-dark-control-visibility-ui-20260627
+Parser: v79-direct-whatsapp-zip-parser-20260627 (unchanged)
+
+Reported regressions
+--------------------
+1. Help/question-mark icon was nearly invisible in Dark mode.
+2. Choose wells multiselect opened a white No results panel.
+3. Multiselect arrows, selected tags, clear controls, and portal menus needed a complete contrast review.
+
+Corrections
+-----------
+- Direct high-contrast styling for stTooltipIcon, stTooltipHoverTarget, and stroke-based SVG icons.
+- Visible circular help control, hover state, and keyboard focus ring.
+- Explicit BaseWeb portal backgrounds for popover, menu, listbox, and nested surfaces.
+- Explicit li[aria-live="polite"] empty-state styling for No results.
+- High-contrast normal, hover, and selected dropdown options.
+- High-contrast multiselect tags, remove icons, search input, caret, clear icon, and open arrow.
+- Stable data-testid, data-baseweb, role, and ARIA selectors; no reliance on generated CSS class names.
+- Existing v79 parser, OCR, custom-gap segmentation, plotting, exports, and ZIP support preserved.
+
+Runtime validation
+------------------
+Python compilation: PASS
+v79 WhatsApp ZIP parser regression: PASS
+v80 static UI smoke test: PASS
+v79/v80 compatibility smoke test: PASS
+Streamlit AppTest Light render: PASS
+Streamlit AppTest Dark render: PASS
+S8-58 WhatsApp ZIP upload in Dark mode: PASS
+Choose wells options include S8-58: PASS
+Application exceptions: 0
+
+Computed dark-theme styles
+--------------------------
+Help SVG stroke:            #E9F6FA
+Multiselect input surface:  #0D202B
+Dropdown/no-results panel:  #142A37
+No-results text:            #B7C8D0
+Dropdown strong border:     #587483
+
+Contrast checks
+---------------
+Help/control icon vs sidebar:       16.47:1
+Normal text vs dropdown panel:      13.18:1
+No-results text vs dropdown panel:   8.61:1
+Disabled text vs disabled control:   7.15:1
+
+Notes
+-----
+When only one well is loaded and already selected, BaseWeb correctly shows No results because there are no additional wells to add. v80 makes that state clearly readable and visually consistent with the Dark theme.
