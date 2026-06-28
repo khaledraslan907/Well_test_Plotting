@@ -1,0 +1,17 @@
+PRODUCTION TEST DASHBOARD v85 — VALIDATION RESULTS
+=================================================
+
+Static validation
+-----------------
+- Python AST parsing: PASS
+- Dedicated scrollable note time picker present: PASS
+- Start and End note controls both use the new picker: PASS
+- 15-minute time increments: PASS
+- Exact typed-time fallback retained: PASS
+- Popover max-height and forced vertical scrolling: PASS
+- Light/Dark scrollbar variables retained: PASS
+
+Scope
+-----
+This release changes only the Events & Notes time-selection interface.
+Parser, OCR, production history, privacy masking and export behavior are unchanged.

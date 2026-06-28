@@ -2,10 +2,11 @@ from __future__ import annotations
 
 """Fast long-term production-history reduction.
 
-The detailed parser may return thousands of readings from dozens of tests.  A
-multi-year performance chart should not render every sample.  This module
-reduces each detected test to one stabilized point using the final valid
-readings, then adds a small moving-average trend for decline/increase review.
+A multi-year production-history chart should show one representative point for
+one detected test, not every raw sample.  This module calculates the arithmetic
+mean of all valid readings inside each test and returns those test averages in
+chronological order.  The app then connects the points with one continuous line
+per well and selected signal.
 """
 
 from typing import Iterable
@@ -14,17 +15,15 @@ import numpy as np
 import pandas as pd
 
 
-def history_trend_column(feature: str) -> str:
-    return f"_history_trend_{feature}"
-
-
 def _safe_numeric_series(frame: pd.DataFrame, column: str) -> pd.Series:
     if frame is None or column not in frame.columns:
         return pd.Series(np.nan, index=getattr(frame, "index", None), dtype="float64")
+
     positions = [i for i, name in enumerate(frame.columns) if name == column]
     if not positions:
         return pd.Series(np.nan, index=frame.index, dtype="float64")
-    candidates = []
+
+    candidates: list[pd.Series] = []
     for pos in positions:
         raw = frame.iloc[:, pos]
         if pd.api.types.is_bool_dtype(raw.dtype):
@@ -37,6 +36,7 @@ def _safe_numeric_series(frame: pd.DataFrame, column: str) -> pd.Series:
                 errors="coerce",
             )
         candidates.append(vals.astype("float64"))
+
     if len(candidates) == 1:
         return candidates[0]
     return pd.concat(candidates, axis=1).bfill(axis=1).iloc[:, 0].astype("float64")
@@ -55,22 +55,16 @@ def _join_unique(values: Iterable[object]) -> str:
 def build_production_history(
     frame: pd.DataFrame,
     features: Iterable[str],
-    *,
-    final_readings: int = 6,
-    trend_window: int = 3,
 ) -> pd.DataFrame:
-    """Return one stabilized point per detected test.
+    """Return one arithmetic-average point per detected test.
 
-    Each feature is calculated independently from its final ``final_readings``
-    valid samples.  This avoids a missing value in one signal changing the
-    averaging window of another signal.  The point date is the test end time.
-    A moving-average trend is added under a private, non-selectable column name.
+    Each selected feature is averaged independently across all valid readings in
+    that test.  Missing values in one signal therefore do not change the average
+    used for another signal.  The point timestamp is the test end time.
     """
     if frame is None or frame.empty:
         return pd.DataFrame()
 
-    final_readings = max(1, int(final_readings))
-    trend_window = max(2, int(trend_window))
     features = [str(f) for f in features if str(f) in frame.columns]
     if not features:
         return pd.DataFrame()
@@ -78,6 +72,7 @@ def build_production_history(
     data = frame.copy(deep=False)
     if "datetime" not in data.columns:
         return pd.DataFrame()
+
     data = data.copy()
     data["datetime"] = pd.to_datetime(data["datetime"], errors="coerce")
     data = data[data["datetime"].notna()]
@@ -99,9 +94,11 @@ def build_production_history(
         g = group.sort_values("datetime", kind="stable")
         if g.empty:
             continue
+
         if not isinstance(group_key, tuple):
             group_key = (group_key,)
         meta = dict(zip(group_cols, group_key))
+
         row: dict = {
             "well": str(meta.get("well", g["well"].iloc[0])),
             "datetime": pd.Timestamp(g["datetime"].max()),
@@ -112,14 +109,16 @@ def build_production_history(
             "source": _join_unique(g["source"].dropna()) if "source" in g.columns else "",
             "sheet": _join_unique(g["sheet"].dropna()) if "sheet" in g.columns else "Production history",
             "source_type": "production_history",
-            "history_method": f"Average of final {final_readings} valid readings",
+            "history_method": "Average of all valid readings in each test",
         }
+
         usable = False
         for feature in features:
             valid = _safe_numeric_series(g, feature).dropna()
-            value = float(valid.tail(final_readings).mean()) if not valid.empty else np.nan
+            value = float(valid.mean()) if not valid.empty else np.nan
             row[feature] = value
             usable = usable or pd.notna(value)
+
         if usable:
             rows.append(row)
 
@@ -130,17 +129,10 @@ def build_production_history(
     out["date"] = out["datetime"].dt.floor("D")
     out["time_text"] = out["datetime"].dt.strftime("%H:%M")
 
-    # A single history test_id per well deliberately keeps all test points on
-    # one continuous line.  The original detected test ID is retained privately.
+    # A single history test_id per well keeps every averaged test point on one
+    # continuous line.  The source test ID remains available in the private
+    # audit column above.
     out["test_id"] = out["well"].astype(str) + "_production_history"
     out["test_sequence"] = out.groupby("well", sort=False).cumcount() + 1
-
-    for feature in features:
-        trend_col = history_trend_column(feature)
-        out[trend_col] = (
-            out.groupby("well", sort=False)[feature]
-            .transform(lambda values: pd.to_numeric(values, errors="coerce").rolling(trend_window, min_periods=2).mean())
-            .astype("float64")
-        )
 
     return out

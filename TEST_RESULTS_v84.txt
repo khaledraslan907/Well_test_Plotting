@@ -1,0 +1,40 @@
+PRODUCTION TEST DASHBOARD v84 — VALIDATION RESULTS
+=================================================
+
+Build
+-----
+UI build: v84-test-average-single-line-ui-20260628
+History method: Average of all valid readings in each test
+
+Static checks
+-------------
+Python compilation: PASS
+v84 parser/history self-test: PASS
+v84 UI smoke test: PASS
+Obsolete moving-average trend code: NOT PRESENT
+Private history trend columns: 0
+
+Supplied ESP.xlsx validation
+----------------------------
+Raw parsed readings: 3,672
+Detected tests: 54
+Production-history points: 54
+Continuous history test IDs per well: 1
+History reduction time after parsing: approximately 0.11 seconds
+History method: arithmetic mean of all valid readings in each test
+
+Default history labels for 54 points
+------------------------------------
+Point 1   (index 0)
+Point 21  (index 20)
+Point 41  (index 40)
+Point 54  (index 53, last point)
+
+Plot behavior
+-------------
+One marker per detected test: PASS
+One continuous chronological line per well/signal: PASS
+Separate dashed performance trend: REMOVED
+Custom Y-axis ranges in Production History: PASS
+Selectable history label density: PASS
+PNG/PDF label policy matches interactive chart: PASS

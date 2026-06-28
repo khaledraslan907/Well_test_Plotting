@@ -60,7 +60,7 @@ parse_whatsapp_plain_or_export_text = getattr(
 PARSER_BUILD_ID = getattr(_tmu_parser, 'PARSER_BUILD_ID', 'v70')
 assign_test_ids = getattr(_tmu_parser, "assign_test_ids", lambda df, gap_hours=12.0: df)
 
-from history_analysis import build_production_history, history_trend_column
+from history_analysis import build_production_history
 
 DISPLAY_LABEL_FILE = Path(__file__).with_name("user_display_labels.json")
 
@@ -370,7 +370,7 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_UI_BUILD_ID = "v83-detail-history-fast-ui-20260628"
+APP_UI_BUILD_ID = "v85-scrollable-note-time-picker-ui-20260628"
 
 UI_THEME_PRESETS = {
     "Light": {
@@ -794,6 +794,56 @@ def combine_date_and_time(date_value, picker_time, typed_time_text=""):
     if date_value is None or parsed_time is None:
         return None
     return pd.Timestamp.combine(date_value, parsed_time)
+
+
+def _time_picker_options(default_time=None, step_minutes: int = 15):
+    """Return a full-day list of time values for a reliably scrollable picker.
+
+    Streamlit's native ``time_input`` may be rendered by the browser as a popup
+    without a visible scrollbar.  A normal BaseWeb selectbox gives us a real
+    scrollable list that can be styled consistently in Light and Dark themes.
+    """
+    step_minutes = max(1, int(step_minutes or 15))
+    minute_values = set(range(0, 24 * 60, step_minutes))
+
+    if default_time is not None:
+        try:
+            minute_values.add(int(default_time.hour) * 60 + int(default_time.minute))
+        except Exception:
+            pass
+
+    return [
+        pd.Timestamp(year=2000, month=1, day=1, hour=minute // 60, minute=minute % 60).time()
+        for minute in sorted(minute_values)
+    ]
+
+
+def scrollable_time_picker(label, default_time=None, *, key: str, step_minutes: int = 15):
+    """A 24-hour time picker with a visible vertical scrollbar."""
+    options = _time_picker_options(default_time, step_minutes=step_minutes)
+    normalized_default = None
+    if default_time is not None:
+        try:
+            normalized_default = default_time.replace(second=0, microsecond=0)
+        except Exception:
+            normalized_default = default_time
+
+    try:
+        default_index = options.index(normalized_default) if normalized_default is not None else 0
+    except ValueError:
+        default_index = 0
+
+    return st.selectbox(
+        label,
+        options,
+        index=default_index,
+        format_func=lambda value: value.strftime("%H:%M"),
+        key=key,
+        help=(
+            "Scroll through the full 24-hour list in 15-minute steps. "
+            "For an exact minute not shown, use the optional typed-time field below."
+        ),
+    )
 
 
 def feature_key_text(feature_name):
@@ -1367,9 +1417,12 @@ st.markdown(
     body > div[data-baseweb="popover"] [role="listbox"],
     body > div[data-baseweb="popover"] [data-baseweb="menu"],
     body > div[data-baseweb="popover"] ul {{
+        max-height: min(22rem, 58vh) !important;
+        overflow-y: scroll !important;
+        overscroll-behavior: contain !important;
+        scrollbar-gutter: stable !important;
         scrollbar-width: auto !important;
         scrollbar-color: {ACTIVE_THEME['scroll_thumb']} {ACTIVE_THEME['scroll_track']} !important;
-        overflow-y: auto !important;
     }}
     body > div[data-baseweb="popover"] [role="listbox"]::-webkit-scrollbar,
     body > div[data-baseweb="popover"] [data-baseweb="menu"]::-webkit-scrollbar,
@@ -1741,6 +1794,13 @@ st.markdown(
         border-radius: 9px !important;
         overflow: hidden !important;
         box-shadow: 0 14px 34px var(--petro-shadow) !important;
+    }}
+    body [data-baseweb="popover"] [role="listbox"],
+    body [data-baseweb="popover"] ul[role="listbox"] {{
+        max-height: min(22rem, 58vh) !important;
+        overflow-y: scroll !important;
+        overscroll-behavior: contain !important;
+        scrollbar-gutter: stable !important;
     }}
     body [data-baseweb="popover"] li[aria-live="polite"],
     body [data-baseweb="popover"] [aria-live="polite"][aria-atomic="true"],
@@ -3097,7 +3157,7 @@ with st.sidebar.expander("4. Analysis View", expanded=True):
 
     if analysis_view == "Production history":
         # Fixed engineering defaults keep this mode simple and fast:
-        # one final-6-reading average per test plus a 3-test moving-average trend.
+        # one arithmetic-average point per detected test, connected chronologically.
         time_filter_mode = "All data"
         time_aggregation = "Raw data"
         x_axis_scale = "1 year"
@@ -3107,7 +3167,7 @@ with st.sidebar.expander("4. Analysis View", expanded=True):
         x_axis_label_density = "Balanced"
         chart_view_mode = "Auto / desktop"
         trace_grouping = "Auto"
-        st.caption("One point per test · final 6 valid readings averaged · 3-test trend line")
+        st.caption("One point per test · average of all valid readings · one connected performance line")
     else:
         time_filter_mode = st.selectbox(
             "Time range control",
@@ -3258,19 +3318,76 @@ with st.sidebar.expander("5. Wells & Signals", expanded=True):
 
 with st.sidebar.expander("6. Chart Options", expanded=False):
     if analysis_view == "Production history":
-        # No extra history settings: use the same clean engineering convention every time.
+        # Keep only the two controls that materially improve a long-term history:
+        # optional Y-axis limits and sparse value labels.
         custom_y_ranges = {}
         fill_method = "No fill"
         hide_zero_flow_rows = False
         plot_mode = "Separate panels like report"
         dual_axis_charts = []
         show_points = True
-        value_label_mode = "Clean readable - recommended"
+
+        with st.expander("Y-axis scale", expanded=False):
+            use_custom_y_scale = st.checkbox(
+                "Use custom Y-axis ranges",
+                value=False,
+                key="history_use_custom_y_scale",
+            )
+            if use_custom_y_scale and selected_features:
+                # Calculate the small history preview only when the user opens
+                # this optional control; normal history plotting avoids duplicate work.
+                history_source_for_scale = data
+                if selected_wells and "well" in history_source_for_scale.columns:
+                    history_source_for_scale = history_source_for_scale[
+                        history_source_for_scale["well"].astype(str).isin(selected_wells)
+                    ]
+                history_scale_preview = build_production_history(history_source_for_scale, selected_features)
+                for feature in selected_features:
+                    vals = (
+                        numeric_feature_series(history_scale_preview, feature).dropna()
+                        if feature in history_scale_preview.columns
+                        else pd.Series(dtype="float64")
+                    )
+                    default_min = float(vals.min()) if not vals.empty else 0.0
+                    default_max = float(vals.max()) if not vals.empty else 1.0
+                    if default_min == default_max:
+                        default_max = default_min + 1.0
+                    st.markdown(f"**{column_label(feature)}**")
+                    cy1, cy2 = st.columns(2)
+                    with cy1:
+                        y_min = st.number_input(
+                            "Min",
+                            value=float(round(default_min, 3)),
+                            key=f"history_ymin_{feature_key_text(feature)}",
+                        )
+                    with cy2:
+                        y_max = st.number_input(
+                            "Max",
+                            value=float(round(default_max, 3)),
+                            key=f"history_ymax_{feature_key_text(feature)}",
+                        )
+                    if y_max > y_min:
+                        custom_y_ranges[feature] = [float(y_min), float(y_max)]
+                    else:
+                        st.warning(f"Max must be greater than Min for {column_label(feature)}")
+
+        value_label_mode = st.selectbox(
+            "Value labels",
+            [
+                "First, last + every 20 tests",
+                "First and last only",
+                "Clean readable - recommended",
+                "Off",
+            ],
+            index=0,
+            help="Default: label the first test, last test, and every twentieth test point.",
+            key="history_value_label_mode",
+        )
         label_decimals_default = "Auto"
         label_decimals_by_feature = {}
         note_color_theme = "Theme adaptive"
         show_internal_names = False
-        st.caption("Stabilized test points and the 3-test performance trend are shown automatically.")
+        st.caption("Each marker is the average of all valid readings in one test; markers are connected in date order.")
     else:
         custom_y_ranges = {}
         with st.expander("Y-axis scale per graph", expanded=False):
@@ -3510,11 +3627,11 @@ with st.sidebar.expander("7. Events & Notes", expanded=False):
             key="note_start_date_input",
         )
     with n2:
-        note_start_time_picker = st.time_input(
+        note_start_time_picker = scrollable_time_picker(
             "Start time",
-            value=default_event_dt.time().replace(second=0, microsecond=0) if default_event_dt else None,
+            default_event_dt.time().replace(second=0, microsecond=0) if default_event_dt else None,
             key="note_start_time_picker",
-            step=900,
+            step_minutes=15,
         )
 
     note_start_time_text = st.text_input(
@@ -3545,11 +3662,11 @@ with st.sidebar.expander("7. Events & Notes", expanded=False):
                 key="note_end_date_input",
             )
         with e2:
-            note_end_time_picker = st.time_input(
+            note_end_time_picker = scrollable_time_picker(
                 "End time",
-                value=default_event_dt.time().replace(second=0, microsecond=0) if default_event_dt else None,
+                default_event_dt.time().replace(second=0, microsecond=0) if default_event_dt else None,
                 key="note_end_time_picker",
-                step=900,
+                step_minutes=15,
             )
         note_end_time_text = st.text_input(
             "Or type end time",
@@ -3678,14 +3795,9 @@ if "test_id" in filtered.columns and selected_tests:
     filtered = filtered[filtered["test_id"].astype(str).isin(selected_tests)]
 
 if analysis_view == "Production history":
-    # Convert thousands of within-test readings into one stabilized point per test.
+    # Convert thousands of within-test readings into one average point per test.
     # This is substantially faster to render and is the correct view for multi-year performance.
-    filtered = build_production_history(
-        filtered,
-        selected_features,
-        final_readings=6,
-        trend_window=3,
-    )
+    filtered = build_production_history(filtered, selected_features)
 
 if hide_zero_flow_rows:
     # Prefer gross-rate columns when available, because some bypass periods still
@@ -3823,7 +3935,7 @@ if selected_features and not filtered.empty:
     if interactive_was_reduced:
         st.info("Interactive chart optimized for speed; prepared exports still use all filtered readings.")
     if analysis_view == "Production history":
-        st.caption("Markers = average of the final 6 valid readings in each test · Dashed line = 3-test moving average")
+        st.caption("Each marker = average of all valid readings in one test · one line connects tests in chronological order")
 
     series_count_for_hint = interactive_filtered["series_label"].dropna().astype(str).nunique() if "series_label" in interactive_filtered.columns else 1
     if x_axis_mode == "Real calendar time":
@@ -4096,46 +4208,6 @@ if selected_features and not filtered.empty:
             return df["time_text"]
         return df.index
 
-    def history_trend_values(frame, feature):
-        trend_col = history_trend_column(feature)
-        if analysis_view != "Production history" or trend_col not in frame.columns:
-            return pd.Series(np.nan, index=frame.index, dtype="float64")
-        return numeric_feature_series(frame, trend_col)
-
-    def add_history_trend_plotly(fig, frame, feature, color, *, row=None, col=None, secondary_y=None, showlegend=True, name="3-test trend"):
-        if analysis_view != "Production history" or frame is None or frame.empty:
-            return
-        ordered = frame.sort_values("datetime", kind="stable") if "datetime" in frame.columns else frame
-        trend = history_trend_values(ordered, feature)
-        if trend.notna().sum() < 2:
-            return
-        trace = go.Scatter(
-            x=x_values(ordered),
-            y=trend,
-            mode="lines",
-            name=name,
-            legendgroup=name,
-            showlegend=showlegend,
-            line=dict(color=color, width=4.2, dash="dash"),
-            hovertemplate="%{x}<br>3-test trend: %{y:.3g}<extra></extra>",
-        )
-        kwargs = {}
-        if row is not None:
-            kwargs.update(row=row, col=col or 1)
-        if secondary_y is not None:
-            kwargs["secondary_y"] = secondary_y
-        fig.add_trace(trace, **kwargs)
-
-    def add_history_trend_matplotlib(ax, frame, feature, color, *, label="3-test trend"):
-        if analysis_view != "Production history" or frame is None or frame.empty:
-            return
-        ordered = frame.sort_values("datetime", kind="stable") if "datetime" in frame.columns else frame
-        trend = history_trend_values(ordered, feature)
-        if trend.notna().sum() < 2:
-            return
-        x = _matplotlib_x_values(ordered)
-        ax.plot(x, trend, linewidth=3.6, linestyle="--", color=color, alpha=0.95, label=label)
-
     def max_points_per_trace(df):
         if "series_label" in df.columns:
             return int(df.groupby("series_label").size().max())
@@ -4150,8 +4222,8 @@ if selected_features and not filtered.empty:
             return set(range(n))
         if mode == "Every 8 readings":
             return set(list(range(0, n, 8)) + [n - 1])
-        if mode == "Every 20 readings":
-            return set(list(range(0, n, 20)) + [n - 1])
+        if mode in {"Every 20 readings", "First, last + every 20 tests"}:
+            return set([0, n - 1] + list(range(0, n, 20)))
         if mode == "First and last only":
             return {0, n - 1}
 
@@ -4299,11 +4371,10 @@ if selected_features and not filtered.empty:
 
     def build_text_and_positions(g, feature):
         if analysis_view == "Production history":
-            values_for_labels = numeric_feature_series(g, feature, reset_index=True)
-            valid_for_labels = values_for_labels.dropna()
-            idxs = set()
-            if not valid_for_labels.empty:
-                idxs = {int(valid_for_labels.index[0]), int(valid_for_labels.index[-1]), int(valid_for_labels.idxmin()), int(valid_for_labels.idxmax())}
+            if value_label_mode == "Clean readable - recommended":
+                idxs = report_label_indices(g.reset_index(drop=True), feature)
+            else:
+                idxs = label_indices(len(g), value_label_mode)
         elif value_label_mode in ["Clean readable - recommended", "Hourly + min/max"]:
             idxs = report_label_indices(g.reset_index(drop=True), feature)
         else:
@@ -4381,15 +4452,6 @@ if selected_features and not filtered.empty:
                             secondary_y=secondary,
                         )
                         first_segment = False
-                    add_history_trend_plotly(
-                        fig,
-                        g_all,
-                        feature,
-                        color,
-                        secondary_y=secondary,
-                        showlegend=(series_idx == 0),
-                        name=f"{column_label(feature)} · 3-test trend",
-                    )
 
             fig.update_layout(
                 height=850 if chart_view_mode != "Mobile-friendly" else 680,
@@ -4425,7 +4487,7 @@ if selected_features and not filtered.empty:
             return fig
 
         if mode == "Separate panels like report":
-            show_chart_legend = len(series_values) > 1 or analysis_view == "Production history"
+            show_chart_legend = len(series_values) > 1
             rows_count = len(features)
             if rows_count <= 1:
                 vertical_gap = 0.03
@@ -4474,16 +4536,6 @@ if selected_features and not filtered.empty:
                             col=1,
                         )
                         first_segment = False
-                    add_history_trend_plotly(
-                        fig,
-                        g_all,
-                        feature,
-                        color,
-                        row=row_idx,
-                        col=1,
-                        showlegend=(row_idx == 1 and series_label == series_values[0]),
-                        name="3-test trend",
-                    )
 
                 y_range = padded_range(pd.concat(feature_data_for_range), feature) if feature_data_for_range else None
                 fig.update_yaxes(
@@ -4592,14 +4644,6 @@ if selected_features and not filtered.empty:
                         )
                     )
                     first_segment = False
-                add_history_trend_plotly(
-                    fig,
-                    g_all,
-                    feature,
-                    color,
-                    showlegend=(series_label == series_values[0]),
-                    name=f"{column_label(feature)} · 3-test trend",
-                )
 
         fig.update_layout(
             height=850,
@@ -4823,10 +4867,9 @@ if selected_features and not filtered.empty:
         g2 = g.reset_index(drop=True)
         n = len(g2)
         if analysis_view == "Production history":
-            vals = numeric_feature_series(g2, feature, reset_index=True).dropna()
-            if vals.empty:
-                return set()
-            return {int(vals.index[0]), int(vals.index[-1]), int(vals.idxmin()), int(vals.idxmax())}
+            if value_label_mode == "Clean readable - recommended":
+                return report_label_indices(g2, feature)
+            return label_indices(n, value_label_mode)
         if value_label_mode in ["Clean readable - recommended", "Hourly + min/max"]:
             return report_label_indices(g2, feature)
         idxs = label_indices(n, value_label_mode)
@@ -4936,13 +4979,6 @@ if selected_features and not filtered.empty:
                                 bbox=dict(boxstyle="round,pad=0.12", fc=EXPORT_LABEL_BG, ec=EXPORT_LABEL_EDGE, alpha=0.65),
                             )
                         first_segment = False
-                    add_history_trend_matplotlib(
-                        ax,
-                        g_all,
-                        feature,
-                        color,
-                        label=(f"{series_label} trend" if len(series_values) > 1 else "3-test trend"),
-                    )
 
                 if feature in custom_y_ranges:
                     ax.set_ylim(custom_y_ranges[feature][0], custom_y_ranges[feature][1])
@@ -5044,13 +5080,6 @@ if selected_features and not filtered.empty:
                             fontweight="bold",
                             bbox=dict(boxstyle="round,pad=0.12", fc=EXPORT_LABEL_BG, ec=EXPORT_LABEL_EDGE, alpha=0.7),
                         )
-                    add_history_trend_matplotlib(
-                        ax,
-                        g,
-                        feature,
-                        color,
-                        label=(f"{series_label} trend" if len(series_values) > 1 else "3-test trend"),
-                    )
 
                 if feature in custom_y_ranges:
                     ax.set_ylim(custom_y_ranges[feature][0], custom_y_ranges[feature][1])
@@ -5361,13 +5390,6 @@ if selected_features and not filtered.empty:
                             bbox=dict(boxstyle="round,pad=0.10", fc=EXPORT_LABEL_BG, ec=EXPORT_LABEL_EDGE, alpha=0.72),
                         )
                     first_segment = False
-                add_history_trend_matplotlib(
-                    ax,
-                    g_all,
-                    feature,
-                    color,
-                    label=(f"{series_label} trend" if len(series_values) > 1 else "3-test trend"),
-                )
 
             if feature in custom_y_ranges:
                 ax.set_ylim(custom_y_ranges[feature][0], custom_y_ranges[feature][1])
@@ -5466,13 +5488,6 @@ if selected_features and not filtered.empty:
                             bbox=dict(boxstyle="round,pad=0.10", fc=EXPORT_LABEL_BG, ec=EXPORT_LABEL_EDGE, alpha=0.70),
                         )
                     first_segment = False
-                add_history_trend_matplotlib(
-                    ax,
-                    g_all,
-                    feature,
-                    color,
-                    label=(f"{series_label} trend" if len(series_values) > 1 else "3-test trend"),
-                )
 
             vals = numeric_feature_series(df, feature).dropna()
             if not vals.empty:
