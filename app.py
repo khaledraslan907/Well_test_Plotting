@@ -60,6 +60,8 @@ parse_whatsapp_plain_or_export_text = getattr(
 PARSER_BUILD_ID = getattr(_tmu_parser, 'PARSER_BUILD_ID', 'v70')
 assign_test_ids = getattr(_tmu_parser, "assign_test_ids", lambda df, gap_hours=12.0: df)
 
+from history_analysis import build_production_history, history_trend_column
+
 DISPLAY_LABEL_FILE = Path(__file__).with_name("user_display_labels.json")
 
 def load_display_label_overrides() -> dict:
@@ -368,7 +370,7 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_UI_BUILD_ID = "v81-simple-controls-stability-ui-20260627"
+APP_UI_BUILD_ID = "v83-detail-history-fast-ui-20260628"
 
 UI_THEME_PRESETS = {
     "Light": {
@@ -453,6 +455,11 @@ UI_THEME_PRESETS = {
 
 if st.session_state.get("ui_theme") not in UI_THEME_PRESETS:
     st.session_state["ui_theme"] = "Light"
+if "share_safe_mode" not in st.session_state:
+    # Enabled by default so screenshots, exports, and a shared deployment do not
+    # expose uploaded well, source-file, service-provider, or sender names.
+    st.session_state["share_safe_mode"] = True
+SHARE_SAFE_MODE = bool(st.session_state.get("share_safe_mode", True))
 ACTIVE_THEME_NAME = st.session_state.get("ui_theme", "Light")
 ACTIVE_THEME = UI_THEME_PRESETS.get(ACTIVE_THEME_NAME, UI_THEME_PRESETS["Light"])
 CHART_PAPER_BG = ACTIVE_THEME["chart_paper"]
@@ -463,16 +470,16 @@ CHART_GRID_SOFT = ACTIVE_THEME["chart_grid_soft"]
 CHART_LEGEND_BG = ACTIVE_THEME["chart_legend"]
 
 
-def _clear_heavy_session_state_v81(*, include_uploads: bool = False) -> None:
+def _clear_heavy_session_state_v83(*, include_uploads: bool = False) -> None:
     """Release large cached DataFrames and export bytes without resetting user controls."""
     exact_keys = {
         "combined_data_key_v58", "combined_data_bundle_v58",
-        "combined_data_key_v81", "combined_data_bundle_v81",
+        "combined_data_key_v83", "combined_data_bundle_v83",
     }
     if include_uploads:
         exact_keys.update({
             "upload_parse_key_v58", "upload_parse_bundle_v58",
-            "upload_parse_key_v81", "upload_parse_bundle_v81",
+            "upload_parse_key_v83", "upload_parse_bundle_v83",
         })
     for key in list(st.session_state.keys()):
         if key in exact_keys or key.startswith("export_bytes_") or key.startswith("export_error_"):
@@ -482,17 +489,17 @@ def _clear_heavy_session_state_v81(*, include_uploads: bool = False) -> None:
 # Old deployments kept parsed tables in both Streamlit's global cache and session
 # state. Clear the obsolete session keys once so a long-lived browser session does
 # not carry multiple full workbook copies after upgrading.
-if not st.session_state.get("_v81_state_migrated", False):
-    _clear_heavy_session_state_v81(include_uploads=True)
-    st.session_state["_v81_state_migrated"] = True
+if not st.session_state.get("_v83_state_migrated", False):
+    _clear_heavy_session_state_v83(include_uploads=True)
+    st.session_state["_v83_state_migrated"] = True
 
 # Keep export memory limited to the active theme. Prepared files can be large, and
 # retaining Light and Dark copies at the same time can exhaust small cloud workers.
-_active_theme_slug_v81 = re.sub(r"[^a-z0-9]+", "_", ACTIVE_THEME_NAME.lower()).strip("_")
+_active_theme_slug_v83 = re.sub(r"[^a-z0-9]+", "_", ACTIVE_THEME_NAME.lower()).strip("_")
 for _state_key in list(st.session_state.keys()):
-    if _state_key.startswith("export_bytes_") and not _state_key.endswith("_" + _active_theme_slug_v81):
+    if _state_key.startswith("export_bytes_") and not _state_key.endswith("_" + _active_theme_slug_v83):
         st.session_state.pop(_state_key, None)
-    elif _state_key.startswith("export_error_") and not _state_key.endswith("_" + _active_theme_slug_v81):
+    elif _state_key.startswith("export_error_") and not _state_key.endswith("_" + _active_theme_slug_v83):
         st.session_state.pop(_state_key, None)
 
 # Export annotations and report notes must follow the active Light/Dark theme.
@@ -631,7 +638,7 @@ MIN_DATE_ALLOWED = pd.Timestamp("1900-01-01").date()
 MAX_DATE_ALLOWED = pd.Timestamp("2100-12-31").date()
 
 # User-taught column aliases are stored beside app.py. This makes the app learn
-# new company abbreviations without editing Python code every time.
+# new field abbreviations without editing Python code every time.
 USER_ALIAS_FILE = Path(__file__).with_name("user_column_aliases.json")
 
 
@@ -662,7 +669,7 @@ def editable_column_mapping_panel(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]
     """Interactive review step that lets users teach new column names.
 
     The parser still auto-detects columns first.  This panel is the safety net for
-    any new company abbreviation, such as Pi, Pd, AMp, Freq, Ti, Tm, Vx, etc.
+    any new field abbreviation, such as Pi, Pd, AMp, Freq, Ti, Tm, Vx, etc.
     """
     saved_aliases = load_saved_aliases()
     labels = standard_column_options(include_meta=False)
@@ -1357,6 +1364,27 @@ st.markdown(
         color: {ACTIVE_THEME['text_strong']} !important;
         opacity: 1 !important;
     }}
+    body > div[data-baseweb="popover"] [role="listbox"],
+    body > div[data-baseweb="popover"] [data-baseweb="menu"],
+    body > div[data-baseweb="popover"] ul {{
+        scrollbar-width: auto !important;
+        scrollbar-color: {ACTIVE_THEME['scroll_thumb']} {ACTIVE_THEME['scroll_track']} !important;
+        overflow-y: auto !important;
+    }}
+    body > div[data-baseweb="popover"] [role="listbox"]::-webkit-scrollbar,
+    body > div[data-baseweb="popover"] [data-baseweb="menu"]::-webkit-scrollbar,
+    body > div[data-baseweb="popover"] ul::-webkit-scrollbar {{ width: 12px !important; }}
+    body > div[data-baseweb="popover"] [role="listbox"]::-webkit-scrollbar-track,
+    body > div[data-baseweb="popover"] [data-baseweb="menu"]::-webkit-scrollbar-track,
+    body > div[data-baseweb="popover"] ul::-webkit-scrollbar-track {{ background: {ACTIVE_THEME['scroll_track']} !important; }}
+    body > div[data-baseweb="popover"] [role="listbox"]::-webkit-scrollbar-thumb,
+    body > div[data-baseweb="popover"] [data-baseweb="menu"]::-webkit-scrollbar-thumb,
+    body > div[data-baseweb="popover"] ul::-webkit-scrollbar-thumb {{
+        min-height: 36px !important;
+        background: {ACTIVE_THEME['scroll_thumb']} !important;
+        border: 2px solid {ACTIVE_THEME['scroll_track']} !important;
+        border-radius: 999px !important;
+    }}
     span[data-baseweb="tag"] {{
         background: color-mix(in srgb, var(--petro-accent) 38%, var(--petro-panel-2)) !important;
         color: var(--petro-text-strong) !important;
@@ -1452,6 +1480,9 @@ st.markdown(
 
     [data-testid="stProgress"] > div > div {{ background-color: var(--petro-accent) !important; }}
     hr {{ border-color: var(--petro-border) !important; }}
+
+    /* Share-safe mode hides original upload filenames in the browser UI. */
+    {('[data-testid="stFileChipName"] {{ font-size: 0 !important; }} [data-testid="stFileChipName"]::after {{ content: "Uploaded file"; font-size: .86rem; color: var(--petro-text-strong); }}' if SHARE_SAFE_MODE else '')}
 
     /* Uploaded-file chips were rendered with a light background in Dark mode. */
     [data-testid="stFileChips"] {{ gap: .45rem !important; }}
@@ -1831,13 +1862,18 @@ with st.sidebar:
         horizontal=True,
         key="ui_theme",
     )
+    st.checkbox(
+        "Share-safe labels",
+        key="share_safe_mode",
+        help="Masks well names, source filenames, service-provider/unit names, and sender names on screen and in exports. Parsing still uses the original uploaded values.",
+    )
 
 with st.sidebar.expander("1. Data Sources", expanded=True):
     uploaded_files = st.file_uploader(
-        "Upload test files, reports, device exports, or WhatsApp ZIPs",
+        "Upload test files, reports, device exports, or chat export ZIPs",
         type=["xlsx", "xls", "csv", "txt", "docx", "pdf", "zip", "jpg", "jpeg", "png", "webp"],
         accept_multiple_files=True,
-        help="Upload normal test files or a WhatsApp exported ZIP. Directly uploaded images are OCR-processed automatically; the OCR switch controls images inside ZIP files.",
+        help="Upload normal test files or a chat export ZIP. Directly uploaded images are OCR-processed automatically; the OCR switch controls images inside ZIP files.",
         key="general_data_uploader_v70",
     )
     uploaded_ocr_images = st.file_uploader(
@@ -1866,11 +1902,11 @@ with st.sidebar.expander("1. Data Sources", expanded=True):
                 pass
 
     whatsapp_text = st.text_area(
-        "Paste TMU WhatsApp reports",
+        "Paste field-test messages",
         height=180,
-        placeholder="""PICO TMU-02
+        placeholder="""TEST UNIT-01
 Date :06-06-2026
-Well name : B3C18-7
+Well name : WELL-001
 Time @ 10:30
 Choke = 100%
 W.H.P =60 PSI
@@ -1894,7 +1930,7 @@ with st.sidebar.expander("2. Processing", expanded=False):
         help="Readings stay connected until the time gap is larger than this value.",
     )
     enable_ctu_ocr = st.checkbox(
-        "Read images inside WhatsApp ZIPs",
+        "Read images inside chat export ZIPs",
         value=False,
         help="Direct image uploads are always read. Enable this only when the ZIP contains CTU/HMI screens.",
     )
@@ -1908,6 +1944,89 @@ with st.sidebar.expander("2. Processing", expanded=False):
         )
     else:
         max_ocr_images = 1000
+
+
+def _natural_alias_map(values, prefix: str) -> dict:
+    clean = sorted({str(v).strip() for v in values if str(v).strip() and str(v).strip().casefold() not in {"nan", "none", "unknown"}})
+    return {value: f"{prefix} {idx + 1}" for idx, value in enumerate(clean)}
+
+
+def _replace_sensitive_tokens(text, replacements: dict) -> str:
+    value = "" if text is None else str(text)
+    # Longest first avoids partial replacement where one identifier contains another.
+    for old in sorted((k for k in replacements if k), key=len, reverse=True):
+        value = re.sub(re.escape(old), replacements[old], value, flags=re.I)
+    # Generic unit/provider prefixes are not needed for plotting or reporting.
+    value = re.sub(r"\b(?:[A-Z][A-Z0-9_-]*\s+)?TMU\s*[- ]?\d+\b", "Test Unit", value, flags=re.I)
+    return value
+
+
+def apply_share_safe_anonymization(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """Mask operational identifiers without changing engineering measurements."""
+    if df is None or df.empty or not SHARE_SAFE_MODE:
+        return df, {}
+    out = df.copy(deep=False)
+    well_values = out.get("well", pd.Series(dtype=object)).dropna().astype(str).tolist() if "well" in out.columns else []
+    well_map = _natural_alias_map(well_values, "Well")
+    source_values = out.get("source", pd.Series(dtype=object)).dropna().astype(str).tolist() if "source" in out.columns else []
+    source_map = _natural_alias_map(source_values, "Uploaded file")
+    sheet_values = out.get("sheet", pd.Series(dtype=object)).dropna().astype(str).tolist() if "sheet" in out.columns else []
+    sheet_map = _natural_alias_map(sheet_values, "Data table")
+    sender_values = out.get("chat_sender", pd.Series(dtype=object)).dropna().astype(str).tolist() if "chat_sender" in out.columns else []
+    sender_map = _natural_alias_map(sender_values, "Sender")
+    image_values = out.get("image_file", pd.Series(dtype=object)).dropna().astype(str).tolist() if "image_file" in out.columns else []
+    image_map = _natural_alias_map(image_values, "Uploaded image")
+    replacements = {**well_map, **source_map, **sheet_map, **sender_map, **image_map}
+
+    if "well" in out.columns:
+        out["well"] = out["well"].astype(str).map(lambda x: well_map.get(x.strip(), "Unknown" if x.strip().casefold() == "unknown" else "Well"))
+    if "source" in out.columns:
+        out["source"] = out["source"].astype(str).map(lambda x: source_map.get(x.strip(), "Uploaded file"))
+    if "sheet" in out.columns:
+        out["sheet"] = out["sheet"].astype(str).map(lambda x: sheet_map.get(x.strip(), "Data table"))
+    if "chat_sender" in out.columns:
+        out["chat_sender"] = out["chat_sender"].astype(str).map(lambda x: sender_map.get(x.strip(), "Sender"))
+    if "test_unit" in out.columns:
+        out["test_unit"] = out["test_unit"].where(out["test_unit"].isna(), "Test Unit")
+    if "image_file" in out.columns:
+        out["_private_image_file"] = out["image_file"]
+        out["image_file"] = out["image_file"].astype(str).map(lambda x: image_map.get(x.strip(), "Uploaded image"))
+
+    for col, label in {
+        "attachment_name": "Attachment",
+        "file_name": "Uploaded file",
+        "suggested_well": "Well",
+    }.items():
+        if col in out.columns:
+            out[col] = out[col].where(out[col].isna(), label)
+
+    for col in ["test_id", "suggested_test_id", "source_group", "caption_text", "note", "data_quality_note", "rejected_values", "link_status", "whatsapp_message_body"]:
+        if col in out.columns:
+            out[col] = out[col].map(lambda x: _replace_sensitive_tokens(x, replacements) if pd.notna(x) else x)
+    if "source_member" in out.columns:
+        out["source_member"] = out["source_member"].where(out["source_member"].isna(), "Attachment")
+    if "source_type" in out.columns:
+        out["source_type"] = out["source_type"].astype(str).map(
+            lambda x: "chat_export_text" if "whatsapp" in x.casefold() else ("message_text" if "pasted" in x.casefold() else x)
+        )
+    if "parser_engine" in out.columns:
+        out["parser_engine"] = out["parser_engine"].astype(str).map(
+            lambda x: "message_parser" if "whatsapp" in x.casefold() else x
+        )
+    if "ocr_template" in out.columns:
+        out["ocr_template"] = out["ocr_template"].where(out["ocr_template"].isna(), "ctu_hmi_screen")
+    for col in [c for c in out.columns if str(c).startswith("ocr_raw_") or str(c) == "ocr_raw_text"]:
+        out[col] = "Hidden in share-safe mode"
+
+    st.session_state["share_safe_replacements"] = replacements
+    return out, replacements
+
+
+def sanitize_share_text(value) -> str:
+    if not SHARE_SAFE_MODE:
+        return "" if value is None else str(value)
+    return _replace_sensitive_tokens(value, st.session_state.get("share_safe_replacements", {}))
+
 
 def load_uploaded_file_once(file_name: str, file_bytes: bytes, parse_images: bool, max_ocr_images: int, parser_build_id: str):
     class CachedUploadedFile(io.BytesIO):
@@ -1950,8 +2069,8 @@ if uploaded_files:
         int(max_ocr_images),
         tuple(_uploaded_file_identity_v58(f) for f in uploaded_files),
     )
-    cached_bundle = st.session_state.get("upload_parse_bundle_v81")
-    cached_key = st.session_state.get("upload_parse_key_v81")
+    cached_bundle = st.session_state.get("upload_parse_bundle_v83")
+    cached_key = st.session_state.get("upload_parse_key_v83")
 
     if cached_bundle is not None and cached_key == upload_key:
         frames.extend(cached_bundle.get("frames", []))
@@ -1959,7 +2078,7 @@ if uploaded_files:
     else:
         # A new upload invalidates merged data and prepared reports immediately.
         # This prevents stale large objects from accumulating across file changes.
-        _clear_heavy_session_state_v81(include_uploads=False)
+        _clear_heavy_session_state_v83(include_uploads=False)
         parsed_frames = []
         parsed_errors = []
         upload_progress = st.progress(0.0, text="Reading uploaded files...") if len(uploaded_files) > 1 else None
@@ -1968,7 +2087,7 @@ if uploaded_files:
                 if upload_progress is not None:
                     upload_progress.progress(
                         upload_order / max(len(uploaded_files), 1),
-                        text=f"Reading {upload_order + 1}/{len(uploaded_files)}: {f.name}",
+                        text=(f"Reading {upload_order + 1}/{len(uploaded_files)}" if SHARE_SAFE_MODE else f"Reading {upload_order + 1}/{len(uploaded_files)}: {f.name}"),
                     )
                 file_bytes = bytes(f.getbuffer()) if hasattr(f, "getbuffer") else f.getvalue()
                 _suffix = Path(str(f.name)).suffix.lower()
@@ -1987,12 +2106,12 @@ if uploaded_files:
                         parsed_frames.append(table)
                 else:
                     parsed_errors.append(
-                        f"{f.name}: no usable time-series table detected. "
-                        "The file may be blank or may not contain date/time plus engineering readings."
+                        (("Uploaded file" if SHARE_SAFE_MODE else f.name) + ": no usable time-series table detected. "
+                         "The file may be blank or may not contain date/time plus engineering readings.")
                     )
             except Exception as e:
-                parsed_errors.append(f"{f.name}: {e}")
-                with st.expander(f"Technical details: {f.name}", expanded=False):
+                parsed_errors.append(f"{'Uploaded file' if SHARE_SAFE_MODE else f.name}: {e}")
+                with st.expander("Technical details" if SHARE_SAFE_MODE else f"Technical details: {f.name}", expanded=False):
                     st.code(traceback.format_exc())
             finally:
                 try:
@@ -2006,8 +2125,8 @@ if uploaded_files:
         if upload_progress is not None:
             upload_progress.progress(1.0, text="Uploaded files parsed")
 
-        st.session_state["upload_parse_key_v81"] = upload_key
-        st.session_state["upload_parse_bundle_v81"] = {
+        st.session_state["upload_parse_key_v83"] = upload_key
+        st.session_state["upload_parse_bundle_v83"] = {
             "frames": parsed_frames,
             "errors": list(parsed_errors),
         }
@@ -2017,17 +2136,17 @@ if uploaded_files:
 else:
     # Removing all uploads should also release the previous workbook data and
     # prepared export files instead of leaving them in the browser session.
-    if st.session_state.get("upload_parse_key_v81") is not None:
-        _clear_heavy_session_state_v81(include_uploads=True)
+    if st.session_state.get("upload_parse_key_v83") is not None:
+        _clear_heavy_session_state_v83(include_uploads=True)
         gc.collect()
 
 if whatsapp_text.strip():
     try:
-        msg_df = parse_whatsapp_plain_or_export_text(whatsapp_text, source_name="Pasted_WhatsApp_Text")
+        msg_df = parse_whatsapp_plain_or_export_text(whatsapp_text, source_name="Pasted_Message_Text")
         if not msg_df.empty:
             frames.append(msg_df)
         else:
-            errors.append("WhatsApp text: no recognizable TMU report detected")
+            errors.append("WhatsApp text: no recognizable production-test report detected")
     except Exception as e:
         errors.append(f"WhatsApp text: {e}")
 
@@ -2035,15 +2154,15 @@ if errors:
     st.warning("Some files/messages were skipped or could not be parsed:\n\n" + "\n".join(f"- {e}" for e in errors))
 
 if not frames:
-    st.info("Start by uploading field files or pasting one or more WhatsApp TMU reports in Data Sources.")
+    st.info("Start by uploading field files or pasting one or more field-test messages in Data Sources.")
     st.stop()
 
 # Keep one merged result for fast control changes. The session state stores the
 # same DataFrame object instead of a deep duplicate, reducing peak memory.
 _whatsapp_key = hashlib.sha1(whatsapp_text.encode("utf-8", errors="ignore")).hexdigest() if whatsapp_text.strip() else ""
 _combined_key = (PARSER_BUILD_ID, upload_key, _whatsapp_key)
-_combined_cached = st.session_state.get("combined_data_bundle_v81")
-_combined_cached_key = st.session_state.get("combined_data_key_v81")
+_combined_cached = st.session_state.get("combined_data_bundle_v83")
+_combined_cached_key = st.session_state.get("combined_data_key_v83")
 
 if _combined_cached is not None and _combined_cached_key == _combined_key:
     data = _combined_cached["data"].copy(deep=False)
@@ -2057,8 +2176,8 @@ else:
     except Exception as dedup_error:
         errors.append(f"Duplicate-row merge was skipped: {dedup_error}")
     rows_merged = max(0, rows_before_dedup - len(data))
-    st.session_state["combined_data_key_v81"] = _combined_key
-    st.session_state["combined_data_bundle_v81"] = {
+    st.session_state["combined_data_key_v83"] = _combined_key
+    st.session_state["combined_data_bundle_v83"] = {
         "data": data.copy(deep=False),
         "rows_merged": int(rows_merged),
     }
@@ -2129,6 +2248,7 @@ def _auto_link_ocr_rows_by_time_context(df: pd.DataFrame, max_gap_hours: float =
 
 
 data = _auto_link_ocr_rows_by_time_context(data, max_gap_hours=3.0)
+data, share_safe_replacements = apply_share_safe_anonymization(data)
 
 # Parser-level quality review. Impossible physical values are excluded from
 # plotted canonical columns but retained in Rejected Values for audit.
@@ -2235,16 +2355,24 @@ if ocr_mask.any():
         # Preview directly uploaded field photos. ZIP-contained images still appear
         # by filename and can be reviewed after extraction outside the application.
         preview_names = [
+            str(name) for name in data.loc[ocr_mask, "_private_image_file"].dropna().astype(str).unique()
+            if "_private_image_file" in data.columns and str(name) in direct_image_preview_map
+        ] if "_private_image_file" in data.columns else [
             str(name) for name in review_df.get("image_file", pd.Series(dtype=str)).dropna().astype(str).unique()
             if str(name) in direct_image_preview_map
         ]
         if preview_names:
+            def _preview_display_name(private_name):
+                if not SHARE_SAFE_MODE:
+                    return str(private_name)
+                rows = data.loc[data.get("_private_image_file", pd.Series(index=data.index, dtype=object)).astype(str).eq(str(private_name)), "image_file"]
+                return str(rows.iloc[0]) if not rows.empty else "Uploaded image"
             selected_preview = st.selectbox(
-                "Image preview", preview_names, key="ocr_image_preview_v70"
+                "Image preview", preview_names, format_func=_preview_display_name, key="ocr_image_preview_v70"
             )
             st.image(
                 direct_image_preview_map[selected_preview],
-                caption=f"OCR source: {selected_preview}",
+                caption=f"OCR source: {_preview_display_name(selected_preview)}",
                 width="stretch",
             )
 
@@ -2478,7 +2606,7 @@ def add_plot_axis_columns(df, x_axis_mode, trace_grouping="Auto", continuous_gap
     out = df.copy()
 
     # Legend/curve grouping is by clean well name only. This prevents the same
-    # well from appearing several times as B15-42 (09-Jun), B15-42 (10-Jun), etc.
+    # well from appearing several times with date suffixes.
     if "well" in out.columns:
         out["series_group_key"] = out["well"].apply(clean_well_label)
     else:
@@ -2956,79 +3084,74 @@ with st.expander("Detected columns from uploaded files", expanded=False):
         )
 
 # Sidebar filters
-with st.sidebar.expander("4. Timeline & Range", expanded=False):
-    time_filter_mode = st.selectbox(
-        "Time range control",
-        ["Slider", "Manual calendar/time"],
-        index=0,
-        help="Use Manual calendar/time for long tests where a slider is difficult.",
-    )
-    time_aggregation = st.selectbox(
-        "Average readings by time interval",
-        ["Raw data", "5 minutes", "15 minutes", "30 minutes", "1 hour", "6 hours", "1 day", "1 month", "1 year"],
-        index=0,
+with st.sidebar.expander("4. Analysis View", expanded=True):
+    analysis_view = st.radio(
+        "Choose analysis view",
+        ["Test detail", "Production history"],
+        horizontal=True,
         help=(
-            "This reduces dense data. Example: 1 hour means all readings inside each hour are averaged "
-            "into one plotted point. Raw data keeps every original reading."
+            "Test detail shows every reading inside a short test. Production history shows one stabilized "
+            "value per test across months or years."
         ),
-    )
-    x_axis_scale = st.selectbox(
-        "X-axis tick scale",
-        ["Auto readable", "30 minutes", "1 hour", "3 hours", "6 hours", "12 hours", "1 day", "1 month", "1 year"],
-        index=0,
-        help="Controls x-axis tick spacing. Start from 30 minutes to avoid unreadable dense time labels.",
     )
 
-    x_axis_mode = st.selectbox(
-        "X-axis display mode",
-        [
-            "Real calendar time",
-            "Compressed real dates - remove empty gaps",
-        ],
-        index=0,
-        help=(
-            "Real calendar time keeps true dates and gaps. "
-            "Compressed real dates removes long empty gaps between test periods."
-        ),
-    )
-    if is_compressed_real_date_mode(x_axis_mode):
-        continuous_gap_hours = st.number_input(
-            "Keep real spacing for gaps up to (hours)",
-            min_value=0.0,
-            max_value=24.0,
-            value=2.0,
-            step=0.5,
-            help="Longer empty periods are visually compressed, but all readings with the same Test ID remain connected as one curve.",
-        )
-        compressed_gap_hours = st.number_input(
-            "Visual gap shown for separated tests (hours)",
-            min_value=0.1,
-            max_value=12.0,
-            value=0.75,
-            step=0.25,
-            help="Controls how much empty space remains after long gaps are compressed.",
-        )
-    else:
+    if analysis_view == "Production history":
+        # Fixed engineering defaults keep this mode simple and fast:
+        # one final-6-reading average per test plus a 3-test moving-average trend.
+        time_filter_mode = "All data"
+        time_aggregation = "Raw data"
+        x_axis_scale = "1 year"
+        x_axis_mode = "Real calendar time"
         continuous_gap_hours = 2.0
         compressed_gap_hours = 0.75
-
-    x_axis_label_density = st.selectbox(
-        "X-axis label density",
-        ["Sparse", "Balanced", "Detailed"],
-        index=1,
-        help="Use Sparse for phone view or many uploads; Detailed for final wide reports.",
-    )
-
-    chart_view_mode = st.selectbox(
-        "Chart screen layout",
-        ["Auto / desktop", "Mobile-friendly", "Wide report view"],
-        index=0,
-        help=(
-            "Mobile-friendly reduces tick and value-label crowding on phones. "
-            "Wide report view gives larger panels on desktop and exports."
-        ),
-    )
-    trace_grouping = "Auto"
+        x_axis_label_density = "Balanced"
+        chart_view_mode = "Auto / desktop"
+        trace_grouping = "Auto"
+        st.caption("One point per test · final 6 valid readings averaged · 3-test trend line")
+    else:
+        time_filter_mode = st.selectbox(
+            "Time range control",
+            ["Slider", "Manual calendar/time"],
+            index=0,
+            help="Use Manual calendar/time for long tests where a slider is difficult.",
+        )
+        time_aggregation = st.selectbox(
+            "Average readings by time interval",
+            ["Raw data", "5 minutes", "15 minutes", "30 minutes", "1 hour", "6 hours", "1 day", "1 month", "1 year"],
+            index=0,
+            help="Use Raw data for normal tests. Choose an interval only when the chart is very dense.",
+        )
+        x_axis_scale = st.selectbox(
+            "X-axis tick scale",
+            ["Auto readable", "30 minutes", "1 hour", "3 hours", "6 hours", "12 hours", "1 day", "1 month", "1 year"],
+            index=0,
+        )
+        x_axis_mode = st.selectbox(
+            "X-axis display mode",
+            ["Real calendar time", "Compressed real dates - remove empty gaps"],
+            index=0,
+        )
+        if is_compressed_real_date_mode(x_axis_mode):
+            continuous_gap_hours = st.number_input(
+                "Keep real spacing for gaps up to (hours)",
+                min_value=0.0,
+                max_value=24.0,
+                value=2.0,
+                step=0.5,
+            )
+            compressed_gap_hours = st.number_input(
+                "Visual gap shown after long gaps (hours)",
+                min_value=0.1,
+                max_value=12.0,
+                value=0.75,
+                step=0.25,
+            )
+        else:
+            continuous_gap_hours = 2.0
+            compressed_gap_hours = 0.75
+        x_axis_label_density = "Balanced"
+        chart_view_mode = "Auto / desktop"
+        trace_grouping = "Auto"
 
 
 with st.sidebar.expander("5. Wells & Signals", expanded=True):
@@ -3134,176 +3257,190 @@ with st.sidebar.expander("5. Wells & Signals", expanded=True):
     )
 
 with st.sidebar.expander("6. Chart Options", expanded=False):
-    custom_y_ranges = {}
-    with st.expander("Y-axis scale per graph", expanded=False):
-        use_custom_y_scale = st.checkbox(
-            "Use custom Y-axis ranges",
-            value=False,
-            help="Set min/max for each selected graph, e.g. Gross Rate from 0 to 1000.",
+    if analysis_view == "Production history":
+        # No extra history settings: use the same clean engineering convention every time.
+        custom_y_ranges = {}
+        fill_method = "No fill"
+        hide_zero_flow_rows = False
+        plot_mode = "Separate panels like report"
+        dual_axis_charts = []
+        show_points = True
+        value_label_mode = "Clean readable - recommended"
+        label_decimals_default = "Auto"
+        label_decimals_by_feature = {}
+        note_color_theme = "Theme adaptive"
+        show_internal_names = False
+        st.caption("Stabilized test points and the 3-test performance trend are shown automatically.")
+    else:
+        custom_y_ranges = {}
+        with st.expander("Y-axis scale per graph", expanded=False):
+            use_custom_y_scale = st.checkbox(
+                "Use custom Y-axis ranges",
+                value=False,
+                help="Set min/max for each selected graph, e.g. Gross Rate from 0 to 1000.",
+            )
+
+            if use_custom_y_scale and selected_features:
+                for feature in selected_features:
+                    vals = numeric_feature_series(data, feature).dropna() if feature in data.columns else pd.Series(dtype="float64")
+                    default_min = float(vals.min()) if not vals.empty else 0.0
+                    default_max = float(vals.max()) if not vals.empty else 1.0
+                    if default_min == default_max:
+                        default_max = default_min + 1.0
+
+                    st.markdown(f"**{column_label(feature)}**")
+                    cy1, cy2 = st.columns(2)
+                    with cy1:
+                        y_min = st.number_input(
+                            "Min",
+                            value=float(round(default_min, 3)),
+                            key=f"ymin_{feature_key_text(feature)}",
+                        )
+                    with cy2:
+                        y_max = st.number_input(
+                            "Max",
+                            value=float(round(default_max, 3)),
+                            key=f"ymax_{feature_key_text(feature)}",
+                        )
+
+                    if y_max > y_min:
+                        custom_y_ranges[feature] = [float(y_min), float(y_max)]
+                    else:
+                        st.warning(f"Max must be greater than Min for {column_label(feature)}")
+
+        fill_method = st.selectbox(
+            "Handle missing values",
+            ["No fill", "Linear interpolation by row"],
+            index=0,
+            help="This only affects the plotted/filtered copy, not the originally detected data.",
         )
 
-        if use_custom_y_scale and selected_features:
+        hide_zero_flow_rows = st.checkbox(
+            "Hide zero-flow/bypassed rows",
+            value=False,
+            help="Useful for multiphase-meter reports during bypass periods where oil, water, gas, and gross are all zero.",
+        )
+
+        plot_mode = st.selectbox(
+            "Plot style",
+            ["Separate panels like report", "Overlay actual values"],
+            index=0,
+            help="Use separate panels for normal reports. Use overlay to compare actual values on one axis.",
+        )
+
+        # Optional combined dual-axis charts.  These do not replace the normal
+        # multi-panel report; they add extra comparison charts above it.
+        dual_axis_charts = []
+        if len(numeric_cols) >= 2 and selected_features:
+            with st.expander("Combined charts with secondary Y-axis", expanded=False):
+                n_dual_axis_charts = st.number_input(
+                    "Number of combined secondary-axis charts",
+                    min_value=0,
+                    max_value=3,
+                    value=0,
+                    step=1,
+                    help="Use 0 for no combined charts. Use 1-3 when you want several custom overlays.",
+                )
+                dual_defaults = selected_features if selected_features else numeric_cols[:2]
+                for chart_i in range(int(n_dual_axis_charts)):
+                    st.markdown(f"**Combined chart {chart_i + 1}**")
+                    default_left = [dual_defaults[min(chart_i * 2, len(dual_defaults) - 1)]] if dual_defaults else [numeric_cols[0]]
+                    default_right_seed = dual_defaults[min(chart_i * 2 + 1, len(dual_defaults) - 1)] if len(dual_defaults) > 1 else numeric_cols[min(1, len(numeric_cols) - 1)]
+                    left_features_i = st.multiselect(
+                        f"Chart {chart_i + 1} - left Y-axis feature(s)",
+                        numeric_cols,
+                        default=[f for f in default_left if f in numeric_cols],
+                        format_func=column_label,
+                        key=f"dual_left_features_{chart_i}",
+                    )
+                    right_features_i = st.multiselect(
+                        f"Chart {chart_i + 1} - right Y-axis feature(s)",
+                        numeric_cols,
+                        default=[default_right_seed] if default_right_seed in numeric_cols else [],
+                        format_func=column_label,
+                        key=f"dual_right_features_{chart_i}",
+                    )
+                    chart_title_i = st.text_input(
+                        f"Chart {chart_i + 1} title suffix",
+                        value="",
+                        placeholder="Optional, e.g. Rates vs Pumping Pressure",
+                        key=f"dual_title_suffix_{chart_i}",
+                    ).strip()
+                    if left_features_i and right_features_i:
+                        dual_axis_charts.append({
+                            "left": left_features_i,
+                            "right": right_features_i,
+                            "title": chart_title_i or f"Combined chart {chart_i + 1}",
+                        })
+
+        # Keep markers off automatically on large datasets for speed/readability, but allow the user to turn them on.
+        estimated_points_for_speed = int(len(data)) if "data" in globals() else 0
+        default_markers = estimated_points_for_speed <= 350
+        show_points = st.checkbox("Show markers", value=default_markers)
+
+        value_label_mode = st.selectbox(
+            "Value labels on chart",
+            [
+                "Clean readable - recommended",
+                "Every 20 readings",
+                "Every 8 readings",
+                "Hourly + min/max",
+                "All values - use wide export",
+                "First and last only",
+                "Off",
+            ],
+            index=0,
+            help=(
+                "Clean readable keeps labels to important/non-crowded points. "
+                "Every 20 readings is usually best for long field-test reports. "
+                "Use All values only with a wide export."
+            ),
+        )
+
+        label_decimals_default = st.selectbox(
+            "Default number format on labels",
+            ["Auto", "0 decimals", "1 decimal", "2 decimals"],
+            index=0,
+        )
+        label_decimals_by_feature = {}
+        if selected_features:
+            with st.expander("Number format per graph", expanded=False):
+                for feature in selected_features:
+                    label_decimals_by_feature[feature] = st.selectbox(
+                        column_label(feature),
+                        ["Use default", "Auto", "0 decimals", "1 decimal", "2 decimals"],
+                        index=0,
+                        key=f"label_decimals_{feature_key_text(feature)}",
+                    )
+
+        with st.expander("Rename column labels for view/export", expanded=False):
+            current_overrides = dict(st.session_state.get("display_label_overrides", {}))
+            edited_overrides = dict(current_overrides)
             for feature in selected_features:
-                vals = numeric_feature_series(data, feature).dropna() if feature in data.columns else pd.Series(dtype="float64")
-                default_min = float(vals.min()) if not vals.empty else 0.0
-                default_max = float(vals.max()) if not vals.empty else 1.0
-                if default_min == default_max:
-                    default_max = default_min + 1.0
-
-                st.markdown(f"**{column_label(feature)}**")
-                cy1, cy2 = st.columns(2)
-                with cy1:
-                    y_min = st.number_input(
-                        "Min",
-                        value=float(round(default_min, 3)),
-                        key=f"ymin_{feature_key_text(feature)}",
-                    )
-                with cy2:
-                    y_max = st.number_input(
-                        "Max",
-                        value=float(round(default_max, 3)),
-                        key=f"ymax_{feature_key_text(feature)}",
-                    )
-
-                if y_max > y_min:
-                    custom_y_ranges[feature] = [float(y_min), float(y_max)]
-                else:
-                    st.warning(f"Max must be greater than Min for {column_label(feature)}")
-
-    fill_method = st.selectbox(
-        "Handle missing values",
-        ["No fill", "Linear interpolation by row"],
-        index=0,
-        help="This only affects the plotted/filtered copy, not the originally detected data.",
-    )
-
-    hide_zero_flow_rows = st.checkbox(
-        "Hide zero-flow/bypassed rows",
-        value=False,
-        help="Useful for EXPRO MPFM reports during bypass periods where oil, water, gas, and gross are all zero.",
-    )
-
-    plot_mode = st.selectbox(
-        "Plot style",
-        ["Separate panels like report", "Overlay actual values"],
-        index=0,
-        help="Use separate panels for normal reports. Use overlay to compare actual values on one axis.",
-    )
-
-    # Optional combined dual-axis charts.  These do not replace the normal
-    # multi-panel report; they add extra comparison charts above it.
-    dual_axis_charts = []
-    if len(numeric_cols) >= 2 and selected_features:
-        with st.expander("Combined charts with secondary Y-axis", expanded=False):
-            n_dual_axis_charts = st.number_input(
-                "Number of combined secondary-axis charts",
-                min_value=0,
-                max_value=3,
-                value=0,
-                step=1,
-                help="Use 0 for no combined charts. Use 1-3 when you want several custom overlays.",
-            )
-            dual_defaults = selected_features if selected_features else numeric_cols[:2]
-            for chart_i in range(int(n_dual_axis_charts)):
-                st.markdown(f"**Combined chart {chart_i + 1}**")
-                default_left = [dual_defaults[min(chart_i * 2, len(dual_defaults) - 1)]] if dual_defaults else [numeric_cols[0]]
-                default_right_seed = dual_defaults[min(chart_i * 2 + 1, len(dual_defaults) - 1)] if len(dual_defaults) > 1 else numeric_cols[min(1, len(numeric_cols) - 1)]
-                left_features_i = st.multiselect(
-                    f"Chart {chart_i + 1} - left Y-axis feature(s)",
-                    numeric_cols,
-                    default=[f for f in default_left if f in numeric_cols],
-                    format_func=column_label,
-                    key=f"dual_left_features_{chart_i}",
-                )
-                right_features_i = st.multiselect(
-                    f"Chart {chart_i + 1} - right Y-axis feature(s)",
-                    numeric_cols,
-                    default=[default_right_seed] if default_right_seed in numeric_cols else [],
-                    format_func=column_label,
-                    key=f"dual_right_features_{chart_i}",
-                )
-                chart_title_i = st.text_input(
-                    f"Chart {chart_i + 1} title suffix",
-                    value="",
-                    placeholder="Optional, e.g. Rates vs Pumping Pressure",
-                    key=f"dual_title_suffix_{chart_i}",
+                parser_label = _parser_column_label(feature)
+                edited_overrides[str(feature)] = st.text_input(
+                    parser_label,
+                    value=str(current_overrides.get(str(feature), parser_label)),
+                    key=f"display_label_{feature_key_text(feature)}",
                 ).strip()
-                if left_features_i and right_features_i:
-                    dual_axis_charts.append({
-                        "left": left_features_i,
-                        "right": right_features_i,
-                        "title": chart_title_i or f"Combined chart {chart_i + 1}",
-                    })
+            c_save, c_clear = st.columns(2)
+            with c_save:
+                if st.button("Save label names"):
+                    save_display_label_overrides(edited_overrides)
+                    st.session_state["display_label_overrides"] = edited_overrides
+                    st.success("Saved label names for future uploads.")
+            with c_clear:
+                if st.button("Reset saved label names"):
+                    try:
+                        DISPLAY_LABEL_FILE.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    st.session_state["display_label_overrides"] = {}
+                    st.success("Saved label names cleared.")
 
-    # Keep markers off automatically on large datasets for speed/readability, but allow the user to turn them on.
-    estimated_points_for_speed = int(len(data)) if "data" in globals() else 0
-    default_markers = estimated_points_for_speed <= 350
-    show_points = st.checkbox("Show markers", value=default_markers)
+        note_color_theme = "Theme adaptive"
 
-    value_label_mode = st.selectbox(
-        "Value labels on chart",
-        [
-            "Clean readable - recommended",
-            "Every 20 readings",
-            "Every 8 readings",
-            "Hourly + min/max",
-            "All values - use wide export",
-            "First and last only",
-            "Off",
-        ],
-        index=0,
-        help=(
-            "Clean readable keeps labels to important/non-crowded points. "
-            "Every 20 readings is usually best for long field-test reports. "
-            "Use All values only with a wide export."
-        ),
-    )
-
-    label_decimals_default = st.selectbox(
-        "Default number format on labels",
-        ["Auto", "0 decimals", "1 decimal", "2 decimals"],
-        index=0,
-    )
-    label_decimals_by_feature = {}
-    if selected_features:
-        with st.expander("Number format per graph", expanded=False):
-            for feature in selected_features:
-                label_decimals_by_feature[feature] = st.selectbox(
-                    column_label(feature),
-                    ["Use default", "Auto", "0 decimals", "1 decimal", "2 decimals"],
-                    index=0,
-                    key=f"label_decimals_{feature_key_text(feature)}",
-                )
-
-    with st.expander("Rename column labels for view/export", expanded=False):
-        current_overrides = dict(st.session_state.get("display_label_overrides", {}))
-        edited_overrides = dict(current_overrides)
-        for feature in selected_features:
-            parser_label = _parser_column_label(feature)
-            edited_overrides[str(feature)] = st.text_input(
-                parser_label,
-                value=str(current_overrides.get(str(feature), parser_label)),
-                key=f"display_label_{feature_key_text(feature)}",
-            ).strip()
-        c_save, c_clear = st.columns(2)
-        with c_save:
-            if st.button("Save label names"):
-                save_display_label_overrides(edited_overrides)
-                st.session_state["display_label_overrides"] = edited_overrides
-                st.success("Saved label names for future uploads.")
-        with c_clear:
-            if st.button("Reset saved label names"):
-                try:
-                    DISPLAY_LABEL_FILE.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                st.session_state["display_label_overrides"] = {}
-                st.success("Saved label names cleared.")
-
-    note_color_theme = "High contrast"
-
-    show_internal_names = False
-
+        show_internal_names = False
 with st.sidebar.expander("7. Events & Notes", expanded=False):
 
     auto_hide_crowded_notes = st.checkbox(
@@ -3349,7 +3486,7 @@ with st.sidebar.expander("7. Events & Notes", expanded=False):
 
     note_label_input = st.text_input(
         "Operation note",
-        placeholder="SIWHP = 2000 psi, Well_1 choke 10%, Well_2 choke 50%, Start lifting...",
+        placeholder="Shut-in pressure = 2000 psi, choke changed, start lifting...",
         key="operation_note_input",
     )
 
@@ -3377,6 +3514,7 @@ with st.sidebar.expander("7. Events & Notes", expanded=False):
             "Start time",
             value=default_event_dt.time().replace(second=0, microsecond=0) if default_event_dt else None,
             key="note_start_time_picker",
+            step=900,
         )
 
     note_start_time_text = st.text_input(
@@ -3411,6 +3549,7 @@ with st.sidebar.expander("7. Events & Notes", expanded=False):
                 "End time",
                 value=default_event_dt.time().replace(second=0, microsecond=0) if default_event_dt else None,
                 key="note_end_time_picker",
+                step=900,
             )
         note_end_time_text = st.text_input(
             "Or type end time",
@@ -3430,18 +3569,18 @@ with st.sidebar.expander("7. Events & Notes", expanded=False):
                 st.warning("End date/time must be after start date/time.")
             else:
                 st.session_state.operation_intervals_table.append(
-                    {"start": start_dt_note, "end": end_dt_note, "label": note_label_input.strip(), "target": note_target}
+                    {"start": start_dt_note, "end": end_dt_note, "label": sanitize_share_text(note_label_input.strip()), "target": note_target}
                 )
-                st.success(f"Added interval: {start_dt_note:%Y-%m-%d %H:%M} to {end_dt_note:%Y-%m-%d %H:%M} | {note_label_input.strip()}")
+                st.success(f"Added interval: {start_dt_note:%Y-%m-%d %H:%M} to {end_dt_note:%Y-%m-%d %H:%M} | {sanitize_share_text(note_label_input.strip())}")
         else:
             st.session_state.manual_events_table.append(
                 {
                     "datetime": start_dt_note,
-                    "label": note_label_input.strip(),
+                    "label": sanitize_share_text(note_label_input.strip()),
                     "target": note_target,
                 }
             )
-            st.success(f"Added event: {start_dt_note:%Y-%m-%d %H:%M} | {note_label_input.strip()}")
+            st.success(f"Added event: {start_dt_note:%Y-%m-%d %H:%M} | {sanitize_share_text(note_label_input.strip())}")
 
     if st.session_state.manual_events_table:
         st.caption("Current point notes")
@@ -3538,6 +3677,16 @@ if selected_wells:
 if "test_id" in filtered.columns and selected_tests:
     filtered = filtered[filtered["test_id"].astype(str).isin(selected_tests)]
 
+if analysis_view == "Production history":
+    # Convert thousands of within-test readings into one stabilized point per test.
+    # This is substantially faster to render and is the correct view for multi-year performance.
+    filtered = build_production_history(
+        filtered,
+        selected_features,
+        final_readings=6,
+        trend_window=3,
+    )
+
 if hide_zero_flow_rows:
     # Prefer gross-rate columns when available, because some bypass periods still
     # carry constant pressure/choke/salinity values while the real production is zero.
@@ -3594,10 +3743,11 @@ if "datetime" in filtered.columns and filtered["datetime"].notna().any():
             & (filtered["datetime"] <= pd.Timestamp(end_dt))
         ]
 
-# Optional aggregation/resampling for long tests.
-filtered = aggregate_time_data(filtered, time_aggregation)
+# Optional aggregation/resampling applies only to the detailed within-test view.
+if analysis_view == "Test detail":
+    filtered = aggregate_time_data(filtered, time_aggregation)
 
-if selected_features:
+if selected_features and analysis_view == "Test detail":
     filtered = apply_fill_method(filtered, selected_features, fill_method)
 
 manual_events = []
@@ -3607,8 +3757,8 @@ for e in st.session_state.get("manual_events_table", []):
     try:
         manual_events.append({
             "datetime": pd.Timestamp(e["datetime"]),
-            "label": str(e["label"]),
-            "target": str(e.get("target", "All selected wells")),
+            "label": sanitize_share_text(e["label"]),
+            "target": sanitize_share_text(e.get("target", "All selected wells")),
         })
     except Exception:
         pass
@@ -3621,7 +3771,7 @@ operation_intervals = []
 for i in st.session_state.get("operation_intervals_table", []):
     try:
         operation_intervals.append(
-            {"start": pd.Timestamp(i["start"]), "end": pd.Timestamp(i["end"]), "label": str(i.get("label", "")), "target": str(i.get("target", "All selected wells"))}
+            {"start": pd.Timestamp(i["start"]), "end": pd.Timestamp(i["end"]), "label": sanitize_share_text(i.get("label", "")), "target": sanitize_share_text(i.get("target", "All selected wells"))}
         )
     except Exception:
         pass
@@ -3633,7 +3783,7 @@ render_section_title("Engineering Snapshot")
 quality_count = int(_quality_mask.sum()) if "_quality_mask" in globals() else 0
 c1, c2, c3, c4, c5, c6 = st.columns(6)
 c1.metric("Detected readings", f"{len(data):,}")
-c2.metric("Active readings", f"{len(filtered):,}")
+c2.metric("Plotted tests" if analysis_view == "Production history" else "Active readings", f"{len(filtered):,}")
 c3.metric("Wells", f"{data['well'].nunique() if 'well' in data.columns else 0:,}")
 c4.metric("Test periods", f"{data['test_id'].nunique() if 'test_id' in data.columns else 0:,}")
 c5.metric("Signals", f"{len(numeric_cols):,}")
@@ -3655,7 +3805,7 @@ with st.expander("Detected data preview", expanded=False):
         )
 
 if selected_features and not filtered.empty:
-    render_section_title("Production Test Visualization")
+    render_section_title("Production History" if analysis_view == "Production history" else "Production Test Visualization")
 
     # Protect the browser from very wide selections and very dense tests. The
     # complete filtered data remains available to exports; only the interactive
@@ -3672,6 +3822,8 @@ if selected_features and not filtered.empty:
         )
     if interactive_was_reduced:
         st.info("Interactive chart optimized for speed; prepared exports still use all filtered readings.")
+    if analysis_view == "Production history":
+        st.caption("Markers = average of the final 6 valid readings in each test · Dashed line = 3-test moving average")
 
     series_count_for_hint = interactive_filtered["series_label"].dropna().astype(str).nunique() if "series_label" in interactive_filtered.columns else 1
     if x_axis_mode == "Real calendar time":
@@ -3694,27 +3846,14 @@ if selected_features and not filtered.empty:
     x_axis_title = x_axis_title_from_mode(x_axis_mode)
 
     NOTE_COLOR_PALETTES = {
-        "Automatic multi-color": [
-            "#92400e", "#1d4ed8", "#15803d", "#7c3aed", "#dc2626",
-            "#0f766e", "#c2410c", "#be185d", "#0369a1", "#4d7c0f",
-        ],
-        "High contrast": [
-            "#000000", "#d97706", "#2563eb", "#16a34a", "#dc2626",
-            "#9333ea", "#0891b2", "#db2777", "#65a30d", "#ea580c",
-        ],
-        "Oilfield earth tones": [
-            "#92400e", "#78350f", "#a16207", "#854d0e", "#7f1d1d",
-            "#166534", "#365314", "#475569", "#713f12", "#431407",
-        ],
-        "Blue / green": [
-            "#1d4ed8", "#0369a1", "#0f766e", "#15803d", "#4d7c0f",
-            "#0e7490", "#1e40af", "#065f46", "#2563eb", "#059669",
-        ],
-        "Monochrome dark": ["#111827"],
+        "Light": ["#111827", "#1F2937", "#243B53", "#374151"],
+        "Dark": ["#FFD166", "#66D9EF", "#FF8A72", "#8FE388", "#C9A7FF", "#F9A8D4"],
     }
 
     def note_palette():
-        return NOTE_COLOR_PALETTES.get(note_color_theme, NOTE_COLOR_PALETTES["Automatic multi-color"])
+        # Notes stay dark on a light report and switch to luminous colors on a
+        # dark report so interval arrows, text, and borders remain readable.
+        return NOTE_COLOR_PALETTES["Dark" if ACTIVE_THEME_NAME == "Dark" else "Light"]
 
     def note_color(idx):
         palette = note_palette()
@@ -3957,6 +4096,46 @@ if selected_features and not filtered.empty:
             return df["time_text"]
         return df.index
 
+    def history_trend_values(frame, feature):
+        trend_col = history_trend_column(feature)
+        if analysis_view != "Production history" or trend_col not in frame.columns:
+            return pd.Series(np.nan, index=frame.index, dtype="float64")
+        return numeric_feature_series(frame, trend_col)
+
+    def add_history_trend_plotly(fig, frame, feature, color, *, row=None, col=None, secondary_y=None, showlegend=True, name="3-test trend"):
+        if analysis_view != "Production history" or frame is None or frame.empty:
+            return
+        ordered = frame.sort_values("datetime", kind="stable") if "datetime" in frame.columns else frame
+        trend = history_trend_values(ordered, feature)
+        if trend.notna().sum() < 2:
+            return
+        trace = go.Scatter(
+            x=x_values(ordered),
+            y=trend,
+            mode="lines",
+            name=name,
+            legendgroup=name,
+            showlegend=showlegend,
+            line=dict(color=color, width=4.2, dash="dash"),
+            hovertemplate="%{x}<br>3-test trend: %{y:.3g}<extra></extra>",
+        )
+        kwargs = {}
+        if row is not None:
+            kwargs.update(row=row, col=col or 1)
+        if secondary_y is not None:
+            kwargs["secondary_y"] = secondary_y
+        fig.add_trace(trace, **kwargs)
+
+    def add_history_trend_matplotlib(ax, frame, feature, color, *, label="3-test trend"):
+        if analysis_view != "Production history" or frame is None or frame.empty:
+            return
+        ordered = frame.sort_values("datetime", kind="stable") if "datetime" in frame.columns else frame
+        trend = history_trend_values(ordered, feature)
+        if trend.notna().sum() < 2:
+            return
+        x = _matplotlib_x_values(ordered)
+        ax.plot(x, trend, linewidth=3.6, linestyle="--", color=color, alpha=0.95, label=label)
+
     def max_points_per_trace(df):
         if "series_label" in df.columns:
             return int(df.groupby("series_label").size().max())
@@ -4119,7 +4298,13 @@ if selected_features and not filtered.empty:
         return {i for i in idxs if 0 <= i < n}
 
     def build_text_and_positions(g, feature):
-        if value_label_mode in ["Clean readable - recommended", "Hourly + min/max"]:
+        if analysis_view == "Production history":
+            values_for_labels = numeric_feature_series(g, feature, reset_index=True)
+            valid_for_labels = values_for_labels.dropna()
+            idxs = set()
+            if not valid_for_labels.empty:
+                idxs = {int(valid_for_labels.index[0]), int(valid_for_labels.index[-1]), int(valid_for_labels.idxmin()), int(valid_for_labels.idxmax())}
+        elif value_label_mode in ["Clean readable - recommended", "Hourly + min/max"]:
             idxs = report_label_indices(g.reset_index(drop=True), feature)
         else:
             idxs = label_indices(len(g), value_label_mode)
@@ -4196,6 +4381,15 @@ if selected_features and not filtered.empty:
                             secondary_y=secondary,
                         )
                         first_segment = False
+                    add_history_trend_plotly(
+                        fig,
+                        g_all,
+                        feature,
+                        color,
+                        secondary_y=secondary,
+                        showlegend=(series_idx == 0),
+                        name=f"{column_label(feature)} · 3-test trend",
+                    )
 
             fig.update_layout(
                 height=850 if chart_view_mode != "Mobile-friendly" else 680,
@@ -4231,7 +4425,7 @@ if selected_features and not filtered.empty:
             return fig
 
         if mode == "Separate panels like report":
-            show_chart_legend = len(series_values) > 1
+            show_chart_legend = len(series_values) > 1 or analysis_view == "Production history"
             rows_count = len(features)
             if rows_count <= 1:
                 vertical_gap = 0.03
@@ -4280,6 +4474,16 @@ if selected_features and not filtered.empty:
                             col=1,
                         )
                         first_segment = False
+                    add_history_trend_plotly(
+                        fig,
+                        g_all,
+                        feature,
+                        color,
+                        row=row_idx,
+                        col=1,
+                        showlegend=(row_idx == 1 and series_label == series_values[0]),
+                        name="3-test trend",
+                    )
 
                 y_range = padded_range(pd.concat(feature_data_for_range), feature) if feature_data_for_range else None
                 fig.update_yaxes(
@@ -4388,6 +4592,14 @@ if selected_features and not filtered.empty:
                         )
                     )
                     first_segment = False
+                add_history_trend_plotly(
+                    fig,
+                    g_all,
+                    feature,
+                    color,
+                    showlegend=(series_label == series_values[0]),
+                    name=f"{column_label(feature)} · 3-test trend",
+                )
 
         fig.update_layout(
             height=850,
@@ -4610,6 +4822,11 @@ if selected_features and not filtered.empty:
         """Use the same readable label logic for exports as the interactive chart."""
         g2 = g.reset_index(drop=True)
         n = len(g2)
+        if analysis_view == "Production history":
+            vals = numeric_feature_series(g2, feature, reset_index=True).dropna()
+            if vals.empty:
+                return set()
+            return {int(vals.index[0]), int(vals.index[-1]), int(vals.idxmin()), int(vals.idxmax())}
         if value_label_mode in ["Clean readable - recommended", "Hourly + min/max"]:
             return report_label_indices(g2, feature)
         idxs = label_indices(n, value_label_mode)
@@ -4719,6 +4936,13 @@ if selected_features and not filtered.empty:
                                 bbox=dict(boxstyle="round,pad=0.12", fc=EXPORT_LABEL_BG, ec=EXPORT_LABEL_EDGE, alpha=0.65),
                             )
                         first_segment = False
+                    add_history_trend_matplotlib(
+                        ax,
+                        g_all,
+                        feature,
+                        color,
+                        label=(f"{series_label} trend" if len(series_values) > 1 else "3-test trend"),
+                    )
 
                 if feature in custom_y_ranges:
                     ax.set_ylim(custom_y_ranges[feature][0], custom_y_ranges[feature][1])
@@ -4742,7 +4966,7 @@ if selected_features and not filtered.empty:
                 ax.tick_params(axis="both", labelsize=12)
 
                 if x_axis_mode == "Real calendar time" and "datetime" in df.columns and df["datetime"].notna().any():
-                    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+                    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y" if analysis_view == "Production history" else "%d-%b\n%H:%M"))
                     ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=8, maxticks=16))
                     fig_m.autofmt_xdate(rotation=0)
                 elif is_aligned_elapsed_mode(x_axis_mode):
@@ -4820,6 +5044,13 @@ if selected_features and not filtered.empty:
                             fontweight="bold",
                             bbox=dict(boxstyle="round,pad=0.12", fc=EXPORT_LABEL_BG, ec=EXPORT_LABEL_EDGE, alpha=0.7),
                         )
+                    add_history_trend_matplotlib(
+                        ax,
+                        g,
+                        feature,
+                        color,
+                        label=(f"{series_label} trend" if len(series_values) > 1 else "3-test trend"),
+                    )
 
                 if feature in custom_y_ranges:
                     ax.set_ylim(custom_y_ranges[feature][0], custom_y_ranges[feature][1])
@@ -4887,7 +5118,7 @@ if selected_features and not filtered.empty:
                 ax.tick_params(axis="both", labelsize=13)
 
                 if x_axis_mode == "Real calendar time" and "datetime" in df.columns and df["datetime"].notna().any():
-                    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+                    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y" if analysis_view == "Production history" else "%d-%b\n%H:%M"))
                     ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=8, maxticks=16))
                     fig_m.autofmt_xdate(rotation=0)
                 elif is_aligned_elapsed_mode(x_axis_mode):
@@ -5130,6 +5361,13 @@ if selected_features and not filtered.empty:
                             bbox=dict(boxstyle="round,pad=0.10", fc=EXPORT_LABEL_BG, ec=EXPORT_LABEL_EDGE, alpha=0.72),
                         )
                     first_segment = False
+                add_history_trend_matplotlib(
+                    ax,
+                    g_all,
+                    feature,
+                    color,
+                    label=(f"{series_label} trend" if len(series_values) > 1 else "3-test trend"),
+                )
 
             if feature in custom_y_ranges:
                 ax.set_ylim(custom_y_ranges[feature][0], custom_y_ranges[feature][1])
@@ -5228,6 +5466,13 @@ if selected_features and not filtered.empty:
                             bbox=dict(boxstyle="round,pad=0.10", fc=EXPORT_LABEL_BG, ec=EXPORT_LABEL_EDGE, alpha=0.70),
                         )
                     first_segment = False
+                add_history_trend_matplotlib(
+                    ax,
+                    g_all,
+                    feature,
+                    color,
+                    label=(f"{series_label} trend" if len(series_values) > 1 else "3-test trend"),
+                )
 
             vals = numeric_feature_series(df, feature).dropna()
             if not vals.empty:
@@ -5257,7 +5502,7 @@ if selected_features and not filtered.empty:
             output.seek(0)
 
             safe_feature = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in column_label(feature))[:80]
-            outputs[f"tmu_{safe_feature}.png"] = output.getvalue()
+            outputs[f"production_test_{safe_feature}.png"] = output.getvalue()
 
         return outputs
 

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-"""Unified robust ingestion layer for the TMU dashboard.
+"""Unified robust ingestion layer for the production-test dashboard.
 
-This module intentionally keeps the mature OCR/PDF/WhatsApp ZIP logic from the
+This module intentionally keeps the mature OCR/PDF/chat-export ZIP logic from the
 previous parser in ``tmu_parser_legacy.py`` and replaces the fragile tabular
 loading path with one deterministic pipeline for Excel, CSV and pasted reports.
 
@@ -481,7 +481,7 @@ def clean_well_name_value(value: object) -> str:
     text = re.sub(r"\s+", "", text)
     text = text.replace("_", "-")
     text = re.sub(r"-{2,}", "-", text).strip("-")
-    # Canonicalize compound well names while preserving ordinary B15-40/S8-58.
+    # Canonicalize compound well names while preserving ordinary compound field identifiers.
     compound = re.fullmatch(r"([A-Z]\d{1,2})-([A-Z]\d+)-(\d+)", text)
     if compound:
         text = f"{compound.group(1)}{compound.group(2)}-{compound.group(3)}"
@@ -507,7 +507,7 @@ def guess_well_from_name(value: object) -> str:
         candidate = clean_well_name_value(candidate)
         if candidate != "Unknown":
             return candidate
-    # File/sheet names: B15-40, B16C6-9, S8-58, B3C18-7, etc.
+    # File and sheet names containing compound field identifiers.
     candidates = re.findall(r"\b[A-Z]\d{0,2}(?:[ _-]*[A-Z]?\d+){1,3}\b", text)
     candidates = [clean_well_name_value(c) for c in candidates]
     candidates = [c for c in candidates if c != "Unknown" and not re.fullmatch(r"TMU-?\d+", c)]
@@ -1438,7 +1438,7 @@ def split_messages(text: str) -> List[str]:
     cleaned = _clean_whatsapp_text(text)
     if not cleaned:
         return []
-    header = re.compile(r"(?im)^\s*(?:PICO\s*TMU|TMU)\s*[- ]?\s*\d+\b[^\n]*")
+    header = re.compile(r"(?im)^\s*(?:[A-Z][A-Z0-9_-]*\s+)?T\s*M\s*U\s*[- ]?\s*\d+\b[^\n]*")
     starts = [match.start() for match in header.finditer(cleaned)]
     if not starts:
         starts = [match.start() for match in re.finditer(r"(?im)^\s*date\s*[:=@-]?\s*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", cleaned)]
@@ -1794,7 +1794,7 @@ def apply_user_column_mappings(df: pd.DataFrame, mappings: Mapping[str, str]) ->
 for _name in [
     "suggest_links_for_ocr_rows", "approve_suggested_ocr_links",
     "parse_ctu_all_data_screen_image", "parse_whatsapp_export_text",
-    "parse_whatsapp_export_messages", "parse_expro_mpfm_text",
+    "parse_whatsapp_export_messages", "parse_vendor_mpfm_text",
 ]:
     if hasattr(legacy, _name) and _name not in globals():
         globals()[_name] = getattr(legacy, _name)
@@ -2811,7 +2811,7 @@ def _extract_whatsapp_fields_v68(text: str) -> Dict[str, str]:
         value = re.sub(r"^[\s:=@-]+", "", value)
         value = re.sub(r"[\n;]+$", "", value).strip()
         # Avoid swallowing the next report header or generic production-test marker.
-        value = re.split(r"(?im)\n\s*(?:PICO\s*TMU|TMU)\s*[- ]?\d+", value, maxsplit=1)[0].strip()
+        value = re.split(r"(?im)\n\s*(?:[A-Z][A-Z0-9_-]*\s+)?T\s*M\s*U\s*[- ]?\d+", value, maxsplit=1)[0].strip()
         value = re.split(r"(?im)\n\s*production\s+test\s*$", value, maxsplit=1)[0].strip()
         if value and key not in fields:
             fields[key] = value
@@ -2822,7 +2822,7 @@ def split_messages(text: str) -> List[str]:
     cleaned = _clean_whatsapp_text_v68(text)
     if not cleaned:
         return []
-    header = re.compile(r"(?im)^\s*(?:PICO\s*TMU|TMU)\s*[- ]?\s*\d+\b[^\n]*")
+    header = re.compile(r"(?im)^\s*(?:[A-Z][A-Z0-9_-]*\s+)?T\s*M\s*U\s*[- ]?\s*\d+\b[^\n]*")
     starts = [match.start() for match in header.finditer(cleaned)]
     if len(starts) <= 1:
         # Multiple reports without repeated TMU header: split on repeated Date labels.
@@ -2879,7 +2879,7 @@ def parse_tmu_message(message: str, source_name: str = "WhatsApp_Text") -> Dict[
     well = clean_well_name_value(fields.get("well", ""))
     if well == "Unknown":
         well = guess_well_from_name(text)
-    unit_match = re.search(r"(?im)^\s*((?:PICO\s*)?TMU\s*[- ]?\s*\d+)\b", text)
+    unit_match = re.search(r"(?im)^\s*((?:[A-Z][A-Z0-9_-]*\s+)?T\s*M\s*U\s*[- ]?\s*\d+)\b", text)
     test_unit = re.sub(r"\s+", " ", unit_match.group(1)).strip() if unit_match else "WhatsApp"
 
     row: Dict[str, object] = {
@@ -3178,7 +3178,7 @@ BASE_NON_PLOT_COLS.update({
 # =============================================================================
 # v70 finalization: OCR audit schema + conservative gas-balance reconciliation
 # =============================================================================
-PARSER_BUILD_ID_V72 = "v72-ui-contrast-srp-expro-gas-unit-fix-20260626"
+PARSER_BUILD_ID_V72 = "v82-share-safe-generic-compat-20260628"
 PARSER_BUILD_ID = PARSER_BUILD_ID_V72
 
 COLUMN_LABELS.update({

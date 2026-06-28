@@ -1,0 +1,52 @@
+PRODUCTION TEST DASHBOARD v83 — VALIDATION RESULTS
+==================================================
+
+Build
+-----
+UI: v83-detail-history-fast-ui-20260628
+Parser: existing validated comprehensive v82 parser build
+History module: final-6 stabilized result + 3-test moving average
+
+Static and regression checks
+----------------------------
+Python compilation: PASS
+Existing v82 parser self-test: PASS
+v83 production-history self-test: PASS
+Existing v82 UI safeguards smoke test: PASS
+v83 analysis-view UI smoke test: PASS
+
+Supplied ESP.xlsx validation
+----------------------------
+Parsed raw readings: 3,672
+Detected well count: 1
+Detected test periods: 54
+Production-history points: 54
+History series count after reduction: 1 continuous well curve
+First test end: 2021-01-26 05:00
+Latest test end: 2026-04-17 02:30
+
+Stabilized point calculation
+----------------------------
+Each signal uses its own final 6 valid readings within each detected test.
+First Gross Rate history point:
+  Expected final-6 average: 885.6666666667 BBL/D
+  Produced history value:  885.6666666667 BBL/D
+Result: exact match
+
+Trend calculation
+-----------------
+Trend type: 3-test moving average
+Trend values available: 53 of 54 history points
+The first point has no trend value because fewer than two tests exist at that time.
+
+Performance measurement in this environment
+-------------------------------------------
+ESP workbook parse: approximately 5.29 seconds
+History reduction after parsing: approximately 0.16 seconds
+Interactive point reduction: 3,672 -> 54 points (98.5% fewer)
+
+Limitations
+-----------
+A live Streamlit browser session was not available in this environment because
+Streamlit is not installed. Application syntax, parser regression, history
+logic, static UI integration, and the supplied workbook calculations passed.

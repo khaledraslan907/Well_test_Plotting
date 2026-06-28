@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-"""Stable v79 parser facade.
+"""Stable share-safe parser facade.
 
-Historical capabilities remain available through ``tmu_parser_compat`` while a
+Compatibility capabilities remain available through ``tmu_parser_compat`` while a
 clean adaptive engine independently interprets Excel/CSV tables.  The facade
 scores both interpretations and selects the more credible result.  This avoids
 regressions caused by repeatedly redefining the same parser functions in one
@@ -23,7 +23,7 @@ import pandas as pd
 import tmu_parser_compat as compat
 import smart_tabular_v75 as smart
 
-PARSER_BUILD_ID = "v79-direct-whatsapp-zip-parser-20260627"
+PARSER_BUILD_ID = "v82-share-safe-generic-ingestion-20260628"
 
 COLUMN_LABELS: Dict[str, str] = dict(getattr(compat, "COLUMN_LABELS", {}))
 COLUMN_LABELS.update(smart.FIELD_LABELS)
@@ -470,7 +470,7 @@ def _parse_whatsapp_text_payload(data: bytes, source_name: str, member_name: str
 
     ZIP parsing previously sent ``_chat.txt`` through the recursive generic file
     loader and swallowed any exception.  That made text-only WhatsApp exports
-    appear empty even though the chat contained valid PICO/TMU reports.  This
+    appear empty even though the chat contained valid timestamped production-test reports.  This
     routine deliberately tries the mature export parser and the robust block
     parser, then keeps the strongest non-empty interpretation.
     """
@@ -600,7 +600,7 @@ def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: 
                     chat_members_parsed += 1
                     tables.append(frame)
                 else:
-                    diagnostics.append(f"{member_name}: no complete timestamped TMU/PICO readings detected")
+                    diagnostics.append(f"{member_name}: no complete timestamped production-test readings detected")
 
             # Pass 2: parse tabular/PDF/image attachments.  Audio, video and
             # stickers are intentionally ignored and do not make the ZIP fail.

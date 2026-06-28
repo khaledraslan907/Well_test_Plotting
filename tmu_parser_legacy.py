@@ -16,7 +16,7 @@ PARSER_BUILD_ID_V58 = "v58-persistent-units-test-separation-20260621"
 PARSER_BUILD_ID_V57 = PARSER_BUILD_ID_V58
 PARSER_BUILD_ID_V56 = PARSER_BUILD_ID_V57
 
-PARSER_COMPAT_BUILD_ID_V72 = "v72-expro-column-alignment-20260626"
+PARSER_COMPAT_BUILD_ID_V72 = "v82-generic-mpfm-alignment-20260628"
 KEYWORDS = [
     "date", "time", "well", "choke", "whp", "w.h.p", "wellhead", "sep", "separator",
     "gas", "formation", "gross", "oil", "water", "bsw", "bs&w", "wc", "salinity",
@@ -235,7 +235,7 @@ def row_looks_like_data(row: pd.Series) -> bool:
         return True
 
     if re.match(r"^\d{1,2}[:.]\d{2}(:\d{2})?$", first_txt):
-        # EXPRO/PDF rows that start with time.
+        # vendor PDF rows that start with time.
         return True
 
     if re.match(r"^\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}(\s+\d{1,2}[:.]\d{2})?", first_txt):
@@ -656,7 +656,7 @@ def best_canonical_name(column_name: str) -> Optional[str]:
     if re.search(r"\bco2\b|co₂", c):
         return "co2_mole_pct"
 
-    # MPFM/EXPRO explicit columns.
+    # MPFM/vendor explicit columns.
     if "qoil" in c and "(s" in c:
         return "qoil_s_stbd"
     if "qwat" in c and "(s" in c:
@@ -1217,12 +1217,8 @@ def normalize_well_name(value: object) -> Optional[str]:
     # Normalize common forms.
     up = s.upper()
 
-    # BAHGA 11 -> BAHGA-11
-    up = re.sub(r"\b(BAHGA|ASSIL|KARAM|MAGD|ELMAGD|BED|SITRA|BAPETCO)\s+(\d)", r"\1-\2", up)
-
-    # MAGD C 86-4 / ELMAGD 86-4 kept readable.
-    up = re.sub(r"\bMAGD-C-", "MAGD C-", up)
-    up = re.sub(r"\bELMAGD-", "ELMAGD-", up)
+    # Normalize an alphabetic field prefix followed by a numeric identifier.
+    up = re.sub(r"\b([A-Z][A-Z0-9]{2,})\s+(\d+[A-Z]?)\b", r"\1-\2", up)
 
     # Remove duplicate spaces and spaces around hyphens.
     up = re.sub(r"\s*-\s*", "-", up)
@@ -1243,12 +1239,9 @@ def guess_well_from_name(name: str) -> Optional[str]:
     s_clean = re.sub(r"\b\d{4}[-_]\d{2}[-_]\d{2}\b", " ", s_clean)
 
     patterns = [
-        r"\b(BAHGA\s*#?\s*\d+[A-Z]?)\b",
-        r"\b(MAGD\s*C\s*\d+\s*[-_]\s*\d+[A-Z]?)\b",
-        r"\b(ELMAGD\s*\d+\s*[-_]\s*\d+[A-Z]?)\b",
-        r"\b(BED\s*\d+[A-Z]?\s*[-_]\s*\d+[A-Z]?)\b",
-        r"\b(B\d+[A-Z]*\d*\s*[-_]\s*\d+[A-Z]?)\b",
-        r"\b([A-Z][A-Z0-9]*\s*C?\s*\d+\s*[-_]\s*\d+[A-Z]?)\b",
+        r"\b([A-Z]{1,8}\d*[A-Z]*\s*[-_]\s*\d+[A-Z]?)\b",
+        r"\b([A-Z][A-Z0-9]{1,10}\s+[A-Z]?\s*\d+\s*[-_]\s*\d+[A-Z]?)\b",
+        r"\b([A-Z][A-Z0-9_-]{2,}\s*#?\s*\d+[A-Z]?)\b",
     ]
 
     for pat in patterns:
@@ -1277,7 +1270,7 @@ def extract_well_from_raw(raw_df: pd.DataFrame, source_name: str = "", sheet_nam
                 if not txt:
                     continue
 
-                # Cell contains the whole value: "WELL: Bahga#9"
+                # Cell contains the whole value after a WELL label
                 m = re.search(r"(?i)\bwell\s*(?:name|no\.?)?\s*[:=#-]+\s*([A-Za-z0-9# \-_]+)", txt)
                 if m:
                     well = normalize_well_name(m.group(1))
@@ -1953,8 +1946,8 @@ def filter_usable_tables(tables: List[pd.DataFrame]) -> List[pd.DataFrame]:
 
 
 
-def parse_expro_mpfm_text(text: str, source_name: str = "EXPRO_MPFM_PDF") -> pd.DataFrame:
-    """Parse EXPRO MPFM PDF Data & Events text rows.
+def parse_vendor_mpfm_text(text: str, source_name: str = "MPFM_PDF") -> pd.DataFrame:
+    """Parse structured MPFM PDF Data & Events text rows.
 
     Keeps only rows where the time is followed by the full numeric MPFM reading set.
     Skips event/comment rows such as 'BS&W is ...', 'bypassed the meter', etc.
@@ -1970,11 +1963,11 @@ def parse_expro_mpfm_text(text: str, source_name: str = "EXPRO_MPFM_PDF") -> pd.
 
     current_date = pd.NaT
     rows = []
-    # EXPRO Data & Events rows contain one choke column followed by 24 MPFM
+    # MPFM Data & Events rows contain one choke column followed by 24 MPFM
     # measurements. Older builds inserted an extra ``choke_ambiguous`` slot,
     # shifting every value one column to the right (for example QGross became
     # BS&W). Keep the schema exactly aligned with the report header.
-    expro_cols = [
+    mpfm_cols = [
         "choke_size_64", "whp_psi", "flow_press_psi", "flow_temp_c",
         "mpfm_press_psig", "mpfm_temp_f", "dp_mbar",
         "qoil_s_stbd", "qwat_s_bpd", "qgas_s_mmscfd",
@@ -2006,13 +1999,13 @@ def parse_expro_mpfm_text(text: str, source_name: str = "EXPRO_MPFM_PDF") -> pd.
             continue
 
         nums = re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", rest.replace(",", ""))
-        if len(nums) < len(expro_cols):
+        if len(nums) < len(mpfm_cols):
             continue
 
-        vals = [float(x) for x in nums[: len(expro_cols)]]
-        row = dict(zip(expro_cols, vals))
+        vals = [float(x) for x in nums[: len(mpfm_cols)]]
+        row = dict(zip(mpfm_cols, vals))
         row["source"] = source_name
-        row["sheet"] = "EXPRO_MPFM_Data_Events"
+        row["sheet"] = "MPFM_Data_Events"
         row["well"] = well
         row["date"] = current_date
         row["time"] = time_txt
@@ -2158,12 +2151,12 @@ def load_tabular_file_base(uploaded_file) -> List[pd.DataFrame]:
 
                 all_text = "\n".join(safe_text(x) for x in full_text)
 
-                # Special support for EXPRO MPFM PDF reports where the Data & Events
+                # Special support for structured MPFM PDF reports where the Data & Events
                 # table is embedded as text rather than a clean extractable table.
                 # If this detailed parser succeeds, keep it and discard summary/event-only tables.
-                expro_rows = parse_expro_mpfm_text(all_text, source_name=name)
-                if not expro_rows.empty:
-                    tables = [expro_rows]
+                mpfm_rows = parse_vendor_mpfm_text(all_text, source_name=name)
+                if not mpfm_rows.empty:
+                    tables = [mpfm_rows]
                 else:
                     msg_rows = parse_many_tmu_messages(all_text, source_name=name)
                     if is_usable_single_message_table(msg_rows):
@@ -2211,7 +2204,7 @@ def parse_tmu_message(message: str, source_name: str = "WhatsApp_Text") -> Dict[
 
     row: Dict[str, object] = {"source": source_name, "sheet": "WhatsApp_Text"}
 
-    tmu = re.search(r"\b(PICO\s*T\s*MU[-\s]*\d+|PICO\s*TMU[-\s]*\d+|TMU[-\s]*\d+)\b", text, flags=re.I)
+    tmu = re.search(r"\b((?:[A-Z][A-Z0-9_-]*\s+)?T\s*M\s*U[-\s]*\d+)\b", text, flags=re.I)
     if tmu:
         row["test_unit"] = re.sub(r"\s+", " ", tmu.group(1).upper()).replace("T MU", "TMU")
 
@@ -2282,7 +2275,7 @@ def parse_tmu_message(message: str, source_name: str = "WhatsApp_Text") -> Dict[
 
 
 def split_messages(text: str) -> List[str]:
-    markers = list(re.finditer(r"(?=PICO\s*T?\s*MU|TMU[-\s]*\d+|Date\s*:)", text, flags=re.I))
+    markers = list(re.finditer(r"(?=(?:[A-Z][A-Z0-9_-]*\s+)?T\s*M\s*U[-\s]*\d+|Date\s*:)", text, flags=re.I))
     if len(markers) <= 1:
         return [text]
 
@@ -2553,7 +2546,7 @@ def _best_number_from_ocr_text(txt: str):
 
 
 def _ocr_numeric_region_pil(crop_img):
-    """OCR a numeric value from a CTU/PICO HMI ROI using multiple simple preprocesses."""
+    """OCR a numeric value from a CTU/HMI region using multiple simple preprocesses."""
     Image, ImageOps, ImageEnhance, pytesseract = _try_import_ocr_libs()
     if Image is None:
         return np.nan, 0.0, "ocr_dependency_missing"
@@ -2679,7 +2672,7 @@ CTU_ALL_DATA_ROIS = {
 
 
 def parse_ctu_all_data_screen_image(uploaded_file, source_name="Image_OCR") -> pd.DataFrame:
-    """Parse CTU/PICO ALL DATA screen photos as auxiliary OCR rows.
+    """Parse CTU/HMI ALL DATA screen photos as auxiliary OCR rows.
 
     Safety rule: OCR rows are never treated as confirmed well-test readings by
     themselves. If the image does not explicitly carry a well/date, the row is
@@ -3324,7 +3317,7 @@ def clean_well_name_value(value: object) -> str:
     """Clean WhatsApp/Excel well names without inventing a well.
 
     Examples:
-      '*S8-58*' -> 'S8-58'
+      a markdown-wrapped well identifier -> a clean identifier
       '*'       -> 'Unknown'
     """
     s = safe_text(value)
@@ -3337,7 +3330,7 @@ def clean_well_name_value(value: object) -> str:
     if not s or s.lower() in {"nan", "nat", "none", "unknown", "null", "-"}:
         return "Unknown"
     # Prefer the first token/candidate containing at least one digit, which is how
-    # almost all field well names appear: S8-58, B3C18-7, A-C83-1, BED15-33.
+    # field identifiers commonly use letters, digits, and hyphens.
     token_match = re.search(r"[A-Za-z0-9]+(?:[-/][A-Za-z0-9]+)*", s)
     if token_match:
         candidate = token_match.group(0).strip("-_/ .")
@@ -3461,9 +3454,8 @@ def guess_well_from_name(name: str) -> Optional[str]:
         return clean_well_name_value(base) if 'clean_well_name_value' in globals() else base
     s = re.sub(r"[*_`~]+", "", str(name or ""))
     extra_patterns = [
-        r"\b(OB\s*[-_ ]\s*\d+[A-Z]?)\b",          # Obaiyed OB-69
-        r"\b(S\d+\s*[-_ ]\s*\d+[A-Z]?)\b",        # S8-58
-        r"\b([A-Z]{1,4}\d+[A-Z]*\s*[-_ ]\s*\d+[A-Z]?)\b",
+        r"\b([A-Z]{1,8}\d*[A-Z]*\s*[-_ ]\s*\d+[A-Z]?)\b",
+        r"\b([A-Z][A-Z0-9_-]{2,}\s*#?\s*\d+[A-Z]?)\b",
     ]
     for pat in extra_patterns:
         m = re.search(pat, s, flags=re.I)
@@ -3507,7 +3499,7 @@ def parse_tmu_message(message: str, source_name: str = "WhatsApp_Text") -> Dict[
         row["note"] = append_note(row.get("note"), "CTU operation")
     return row
 
-# v44.2 final well cleaning: keep prefixes like OB-69, S8-58, B3C18-7, A-C83-1.
+# v44.2 final well cleaning: keep compound alpha-numeric prefixes.
 def clean_well_name_value(value: object) -> str:
     s = safe_text(value)
     s = s.replace("\u200e", "").replace("\u200f", "")
@@ -3529,7 +3521,7 @@ def clean_well_name_value(value: object) -> str:
             continue
         candidates.append(cand)
     if candidates:
-        # Prefer the last candidate because strings like 'Obaiyed OB-69' contain
+        # Prefer the last candidate because strings containing a descriptive field name plus an identifier contain
         # a field name first and the actual well token at the end.
         return candidates[-1].upper()
     return "Unknown"
@@ -3611,7 +3603,7 @@ def assign_test_ids(df: pd.DataFrame, gap_hours: float = 12.0) -> pd.DataFrame:
 # -----------------------------------------------------------------------------
 # Purpose:
 # 1) Completely disable nearest-time CTU/OCR suggestions and any automatic OCR link.
-# 2) Prevent pandas dtype errors when text well names such as '*S8-58*' are assigned.
+# 2) Prevent pandas dtype errors when markdown-wrapped well identifiers are assigned.
 # 3) Interpret max_ocr_images=0 as no limit; image OCR is skipped only when parse_images=False.
 
 PARSER_BUILD = "v45_whatsapp_zip_ctu_ocr_safe_no_nearest_link"
@@ -3680,7 +3672,7 @@ def clean_well_name_value(value: object) -> str:
     # Pure numeric values are usually BS&W/salinity/rates from partial WhatsApp messages, not well names.
     if re.fullmatch(r"\d+(?:\.\d+)?", s):
         return "Unknown"
-    # Examples: S8-58, OB-69, B3C18-7, A-C83-1, BED15-33.
+    # Examples are generic alpha-numeric field identifiers.
     pat = r"\b(?:[A-Za-z]{1,12}[-/ ]*)?[A-Za-z0-9]*\d[A-Za-z0-9]*(?:[-/][A-Za-z0-9]+)*\b"
     candidates = []
     for m in re.finditer(pat, s):
@@ -3967,8 +3959,8 @@ def _is_probably_full_tmu_reading_v46(body: str) -> bool:
     b = normalize_text(body)
     if is_system_or_noise_message(b):
         return False
-    # Accept normal PICO/TMU production reports, not comments like "return oil & water".
-    has_identity = bool(re.search(r"\b(pico\s*t?mu|tmu[-\s]*\d+|well\s*name|well\s*:)", b, flags=re.I))
+    # Accept normal production-unit reports, not comments like "return oil & water".
+    has_identity = bool(re.search(r"\b((?:[a-z][a-z0-9_-]*\s+)?t\s*m\s*u[-\s]*\d+|well\s*name|well\s*:)", b, flags=re.I))
     numeric_line_hits = 0
     for pat in [
         r"\bchoke\b\s*[:=@]", r"\bw\.?\s*h\.?\s*p\.?\b\s*[:=@]", r"\bsep\.?\s*p\.?\b\s*[:=@]",
@@ -4071,7 +4063,7 @@ def _normalize_ctu_ocr_value_v46(field: str, value: object) -> float:
 _parse_ctu_all_data_screen_image_base_v46 = parse_ctu_all_data_screen_image
 
 def parse_ctu_all_data_screen_image(uploaded_file, source_name="Image_OCR") -> pd.DataFrame:
-    """v46: stricter CTU/PICO screen OCR.
+    """v46: stricter CTU/HMI screen OCR.
 
     Only returns a row when enough plausible CTU fields are detected. Random chat
     photos are ignored instead of becoming rubbish OCR rows.
@@ -4905,7 +4897,7 @@ def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: 
 
 # -----------------------------------------------------------------------------
 # v52: very fast XML-based pumping-pressure rescue for hidden/far-right columns.
-# This solves templates such as S8-58 where Pumping Pressure is in hidden/far
+# This solves templates where pressure is stored where Pumping Pressure is in hidden/far
 # right column EG with header "pumping.p" / unit "psi".  It reads the XLSX XML
 # directly instead of relying only on the main table parser, so Excel hidden
 # columns, styled empty columns, and max-column=16384 artifacts do not hide the
@@ -5052,8 +5044,7 @@ def _excel_datetime_from_values_v52(date_val, time_val):
 
 def _well_from_sheet_or_file_v52(sheet_name: str, name: str) -> str:
     source = f"{sheet_name} {name}"
-    # Preserve field names like B3 C18-7 / B3C18-7.  Older generic guessing may
-    # return only C18-7, which blocks well+datetime merging.
+    # Preserve complete compound field identifiers so well+datetime merging remains reliable.
     m = re.search(r"\b(B\d+)\s*[-_ ]?\s*(C\d{1,3}[-_ ]?\d+)\b", source, flags=re.I)
     if m:
         return (m.group(1) + m.group(2)).replace(" ", "").replace("_", "-").upper()
@@ -6311,8 +6302,8 @@ def _clean_pasted_whatsapp_text_v65(text: object) -> str:
 def split_messages(text: str) -> List[str]:
     """Split pasted text into complete TMU reports, one row per report.
 
-    The older zero-width lookahead matched both ``PICO TMU-04`` and the nested
-    ``TMU-04`` substring. That produced extra one-word ``PICO`` chunks and could
+    The older zero-width lookahead matched both a vendor-prefixed unit header and the nested
+    unit substring. That produced extra prefix-only chunks and could
     behave inconsistently when several reports were pasted together. This
     version uses non-overlapping full-line report headers.
     """
@@ -6321,7 +6312,7 @@ def split_messages(text: str) -> List[str]:
         return []
 
     header_re = re.compile(
-        r"(?im)^\s*(?:PICO\s*T\s*MU|PICO\s*TMU|TMU)\s*[- ]?\s*\d+\b[^\n]*"
+        r"(?im)^\s*(?:[A-Z][A-Z0-9_-]*\s+)?T\s*M\s*U\s*[- ]?\s*\d+\b[^\n]*"
     )
     starts = [m.start() for m in header_re.finditer(s)]
 

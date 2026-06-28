@@ -1,0 +1,48 @@
+PRODUCTION TEST DASHBOARD v82 - VALIDATION RESULTS
+==================================================
+
+Build
+-----
+Parser: v82-share-safe-generic-ingestion-20260628
+Interface: v82 share-safe labels, event-time scrollbar, adaptive note colors
+
+Parser regression
+-----------------
+Generic SRP workbook: 12 readings
+Production workbook A: 10 readings
+Production workbook B: 92 readings
+Chat-export ZIP: 74 readings
+Generic pasted production report: PASS
+Generic unfamiliar Excel layout: PASS
+
+Privacy checks
+--------------
+Share-safe labels enabled by default: PASS
+Well identifiers mapped to Well 1, Well 2, ...: PASS
+Source filenames and worksheet names masked: PASS
+Provider/test-unit and sender names masked: PASS
+Upload filename chips hidden in share-safe mode: PASS
+Notes, captions, checks and test IDs sanitized: PASS
+Raw OCR text hidden in share-safe mode: PASS
+Known private identifiers absent from deployment source/docs: PASS
+No private field files included in package: PASS
+
+Event controls
+--------------
+Start time 15-minute dropdown: PASS
+End time 15-minute dropdown: PASS
+Body-level dropdown scrollbar styling: PASS
+Typed custom times retained: PASS
+
+Theme note visibility
+---------------------
+Light note color #111827 on #FFFFFF contrast: 17.74:1
+Dark note color #FFD166 on #0C1B25 contrast: 12.15:1
+Interactive Plotly notes use adaptive palette: PASS
+PNG/PDF Matplotlib notes use adaptive palette: PASS
+
+Static checks
+-------------
+Python compilation: PASS
+Parser self-test: PASS
+UI smoke test: PASS
