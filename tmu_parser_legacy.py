@@ -3,6 +3,7 @@ import re
 import warnings
 import io
 import zipfile
+import threading
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -6658,8 +6659,16 @@ PARSER_BUILD_ID = PARSER_BUILD_ID_V68
 # This override is intentionally appended at the end of the legacy module so all
 # older ZIP/image loaders resolve this implementation at runtime.
 
-CTU_OCR_BUILD_ID_V70 = "v89-zip-batch-timeout-safe-ocr-20260628"
+CTU_OCR_BUILD_ID_V70 = "v91-ocr-continuity-canonical-pressure-20260628"
 CTU_TESSERACT_TIMEOUT_SEC_V89 = 6.0
+_CTU_OCR_THREAD_V91 = threading.local()
+
+def _ocr_timeout_v91():
+    """Per-image OCR timeout; ZIP workers use a shorter safe budget."""
+    try:
+        return float(getattr(_CTU_OCR_THREAD_V91, "seconds", CTU_TESSERACT_TIMEOUT_SEC_V89))
+    except Exception:
+        return CTU_TESSERACT_TIMEOUT_SEC_V89
 
 CTU_SCREEN_SIZE_V70 = (1200, 750)
 CTU_VALUE_ROIS_V70 = {
@@ -6698,7 +6707,7 @@ CTU_TARGET_ROIS_V70 = {
     "ctu_lt_weight_lbf": (760, 100, 1140, 190),
     "ctu_wellhead_pressure_psi": (280, 240, 620, 330),
     "ctu_circulation_pressure_psi": (760, 240, 1140, 330),
-    "ctu_reel_depth_ft": (280, 365, 620, 455),
+    "ctu_reel_depth_ft": (180, 365, 650, 455),
     "ctu_reel_speed_ftmin": (760, 365, 1140, 455),
     "ctu_fluid_rate_bpm": (280, 490, 620, 570),
     "ctu_n2_rate_scfm": (760, 490, 1140, 570),
@@ -6877,7 +6886,7 @@ def _field_for_ocr_box_v70(left, top, width, height):
     return None
 
 
-def _full_screen_candidates_v70(rectified_image):
+def _full_screen_candidates_v70(rectified_image, fast_batch=False):
     try:
         import cv2
         import numpy as _np
@@ -6891,10 +6900,11 @@ def _full_screen_candidates_v70(rectified_image):
     median = cv2.medianBlur(gray, 3)
     otsu = cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
     variants = {
-        "raw": bgr,
         "median": median,
         "otsu": otsu,
     }
+    if not fast_batch:
+        variants = {"raw": bgr, **variants}
     output = {field: [] for field in CTU_VALUE_ROIS_V70}
     for variant_name, image in variants.items():
         try:
@@ -6902,7 +6912,7 @@ def _full_screen_candidates_v70(rectified_image):
                 image,
                 config="--oem 3 --psm 11",
                 output_type=pytesseract.Output.DATAFRAME,
-                timeout=CTU_TESSERACT_TIMEOUT_SEC_V89,
+                timeout=_ocr_timeout_v91(),
             )
         except Exception:
             continue
@@ -6955,7 +6965,7 @@ def _adaptive_joined_screen_candidates_v77(rectified_image):
             adaptive,
             config="--oem 3 --psm 11 -c tessedit_char_whitelist=-0123456789.",
             output_type=pytesseract.Output.DATAFRAME,
-            timeout=CTU_TESSERACT_TIMEOUT_SEC_V89,
+            timeout=_ocr_timeout_v91(),
         )
     except Exception:
         return {field: [] for field in CTU_VALUE_ROIS_V70}
@@ -7035,15 +7045,15 @@ def _targeted_special_candidates_v77(rectified_image, field):
         return []
     output = []
 
-    def _read_candidates(image, variant_prefix, psms=(8, 13), confidence=0.94):
+    def _read_candidates(image, variant_prefix, psms=(8, 13), confidence=0.94, scale=3.0):
         local = []
-        enlarged = cv2.resize(image, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+        enlarged = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
         for psm in psms:
             try:
                 text = pytesseract.image_to_string(
                     enlarged,
                     config=f"--oem 3 --psm {psm} -c tessedit_char_whitelist=-0123456789.",
-                    timeout=CTU_TESSERACT_TIMEOUT_SEC_V89,
+                    timeout=_ocr_timeout_v91(),
                 ).strip()
             except Exception:
                 continue
@@ -7065,9 +7075,11 @@ def _targeted_special_candidates_v77(rectified_image, field):
 
     if field == "ctu_wellhead_pressure_psi":
         blue, green, red = cv2.split(bgr)
-        red_score = (red.astype(_np.int16) * 2 - green.astype(_np.int16) - blue.astype(_np.int16)).clip(0)
+        # Red-minus-green preserves faint leading digits under glare better
+        # than the older 2R-G-B score (e.g. 20.34 and 212.76).
+        red_score = (red.astype(_np.int16) - green.astype(_np.int16)).clip(0)
         red_score = cv2.normalize(red_score, None, 0, 255, cv2.NORM_MINMAX).astype(_np.uint8)
-        output.extend(_read_candidates(red_score, "targeted_red_v77", confidence=0.97))
+        output.extend(_read_candidates(red_score, "targeted_red_v91", psms=(7,), confidence=0.97, scale=4.0))
 
     elif field == "ctu_lt_weight_lbf":
         # The HMI displays a sign on the left and the magnitude on the right.
@@ -7082,7 +7094,7 @@ def _targeted_special_candidates_v77(rectified_image, field):
                 text = pytesseract.image_to_string(
                     enlarged_right,
                     config=f"--oem 3 --psm {psm} -c tessedit_char_whitelist=0123456789",
-                    timeout=CTU_TESSERACT_TIMEOUT_SEC_V89,
+                    timeout=_ocr_timeout_v91(),
                 ).strip()
             except Exception:
                 continue
@@ -7095,7 +7107,7 @@ def _targeted_special_candidates_v77(rectified_image, field):
             sign_text = pytesseract.image_to_string(
                 cv2.resize(left_red, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_CUBIC),
                 config="--oem 3 --psm 8 -c tessedit_char_whitelist=-",
-                timeout=CTU_TESSERACT_TIMEOUT_SEC_V89,
+                timeout=_ocr_timeout_v91(),
             ).strip()
             sign_negative = "-" in sign_text
         except Exception:
@@ -7168,7 +7180,7 @@ def _refine_leading_counter_digit_v70(processed, text):
             processed,
             config="--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789.",
             output_type=pytesseract.Output.DICT,
-            timeout=CTU_TESSERACT_TIMEOUT_SEC_V89,
+            timeout=_ocr_timeout_v91(),
         )
     except Exception:
         return original, False
@@ -7216,7 +7228,7 @@ def _refine_leading_counter_digit_v70(processed, text):
             read = pytesseract.image_to_string(
                 first_cell,
                 config=f"--oem 3 --psm {psm} -c tessedit_char_whitelist=0123456789",
-                timeout=CTU_TESSERACT_TIMEOUT_SEC_V89,
+                timeout=_ocr_timeout_v91(),
             ).strip()
         except Exception:
             continue
@@ -7281,7 +7293,7 @@ def _targeted_field_candidates_v70(rectified_image, field):
         text = pytesseract.image_to_string(
             processed,
             config=f"--oem 3 --psm {psm} -c tessedit_char_whitelist=-0123456789.",
-            timeout=CTU_TESSERACT_TIMEOUT_SEC_V89,
+            timeout=_ocr_timeout_v91(),
         ).strip()
     except Exception:
         return []
@@ -7371,42 +7383,89 @@ def _select_ctu_candidate_v70(field, candidates):
                 return -round(magnitude, 2), confidence, str(best_signed.get("raw_text", ""))[:250], "accepted"
 
     if field == "ctu_reel_depth_ft":
-        joined = [c for c in candidates if str(c.get("variant", "")) == "adaptive_joined_v77"]
-        targeted_precise = [
+        # Prefer two independent precise reads over the adaptive token join.
+        # The join is useful for glare (9003.4) but can prepend a stray edge
+        # digit (9473.8 -> 29473.8).  A targeted/full-screen consensus wins.
+        precise = [
             c for c in candidates
-            if c.get("targeted")
-            and str(c.get("variant", "")).startswith("targeted_psm")
+            if str(c.get("variant", "")) != "adaptive_joined_v77"
             and "." in str(c.get("raw_text", ""))
-            and float(c.get("confidence", 0.0)) >= 0.75
+            and float(c.get("confidence", 0.0)) >= 0.65
+            and float(c.get("value", 0.0)) >= 100.0
         ]
-        if targeted_precise:
-            best_target = max(targeted_precise, key=lambda item: float(item.get("confidence", 0.0)))
-            raw = str(best_target.get("raw_text", "")).strip().lstrip("+-")
-            target_value = abs(float(best_target["value"]))
-            # A leading zero such as 0149.6 is a known glare case where the
-            # adaptive joined pass can recover the missing leading digits
-            # (10149.6). Otherwise reject a joined value that appended an
-            # unrelated token from the edge of the value box (4182.2 | 9).
-            if not raw.startswith("0"):
-                if not joined or all(
-                    abs(float(item["value"]) - target_value) > max(2.0, 0.02 * max(target_value, 1.0))
-                    for item in joined
-                ):
-                    return round(target_value, 1), min(0.99, float(best_target.get("confidence", 0.8)) + 0.08), str(best_target.get("raw_text", ""))[:250], "accepted"
+        precise_groups = []
+        for candidate in precise:
+            placed = False
+            for group in precise_groups:
+                center = float(np.median([float(x["value"]) for x in group]))
+                if abs(float(candidate["value"]) - center) <= max(2.0, 0.01 * max(abs(center), 1.0)):
+                    group.append(candidate)
+                    placed = True
+                    break
+            if not placed:
+                precise_groups.append([candidate])
+        if precise_groups:
+            best_group = max(
+                precise_groups,
+                key=lambda group: (
+                    len({str(x.get("variant", "")) for x in group}),
+                    any(x.get("targeted") for x in group),
+                    max(float(x.get("confidence", 0.0)) for x in group),
+                ),
+            )
+            variants = len({str(x.get("variant", "")) for x in best_group})
+            if variants >= 2 or any(x.get("targeted") for x in best_group):
+                value = round(float(np.median([float(x["value"]) for x in best_group])), 1)
+                raw = " | ".join(sorted({str(x.get("raw_text", "")) for x in best_group if x.get("raw_text")}))
+                conf = max(float(x.get("confidence", 0.0)) for x in best_group)
+                return value, min(0.99, conf + 0.06), raw[:250], "accepted"
+        joined = [c for c in candidates if str(c.get("variant", "")) == "adaptive_joined_v77"]
         if joined:
             best = max(joined, key=lambda item: (float(item.get("confidence", 0.0)), int(item.get("digit_count", 0))))
             value = round(float(best["value"]), 1)
-            return value, min(0.99, float(best.get("confidence", 0.8)) + 0.08), str(best.get("raw_text", ""))[:250], "accepted"
+            return value, min(0.99, float(best.get("confidence", 0.8)) + 0.05), str(best.get("raw_text", ""))[:250], "review_required"
 
     if field == "ctu_circulation_pressure_psi":
+        # Do not blindly prefer the joined token.  Use agreement across OCR
+        # variants first; this prevents 1800.95 becoming 800.95.
+        pressure_candidates = [
+            c for c in candidates
+            if float(c.get("confidence", 0.0)) >= 0.60
+            and "." in str(c.get("raw_text", ""))
+            and float(c.get("value", 0.0)) >= 0.0
+        ]
+        pressure_groups = []
+        for candidate in pressure_candidates:
+            placed = False
+            for group in pressure_groups:
+                center = float(np.median([float(x["value"]) for x in group]))
+                if _values_close_v70(field, center, float(candidate["value"])):
+                    group.append(candidate)
+                    placed = True
+                    break
+            if not placed:
+                pressure_groups.append([candidate])
+        if pressure_groups:
+            best_group = max(
+                pressure_groups,
+                key=lambda group: (
+                    len({str(x.get("variant", "")) for x in group}),
+                    max(float(x.get("confidence", 0.0)) for x in group),
+                ),
+            )
+            if len({str(x.get("variant", "")) for x in best_group}) >= 2:
+                value = round(float(np.median([float(x["value"]) for x in best_group])), 2)
+                raw = " | ".join(sorted({str(x.get("raw_text", "")) for x in best_group if x.get("raw_text")}))
+                conf = max(float(x.get("confidence", 0.0)) for x in best_group)
+                return value, min(0.99, conf + 0.04), raw[:250], "accepted"
         joined = [c for c in candidates if str(c.get("variant", "")) == "adaptive_joined_v77"]
         if joined:
             best = max(joined, key=lambda item: (float(item.get("confidence", 0.0)), int(item.get("digit_count", 0))))
             value = round(float(best["value"]), 2)
-            return value, min(0.99, float(best.get("confidence", 0.8)) + 0.08), str(best.get("raw_text", ""))[:250], "accepted"
+            return value, min(0.95, float(best.get("confidence", 0.8)) + 0.03), str(best.get("raw_text", ""))[:250], "review_required"
 
     if field == "ctu_wellhead_pressure_psi":
-        red = [c for c in candidates if str(c.get("variant", "")).startswith("targeted_red_v77")]
+        red = [c for c in candidates if str(c.get("variant", "")).startswith("targeted_red_v")]
         if red:
             groups = {}
             for item in red:
@@ -7502,7 +7561,7 @@ def _select_ctu_candidate_v70(field, candidates):
     return best_value, confidence, raw[:250], status
 
 
-def parse_ctu_all_data_screen_image(uploaded_file, source_name="Image_OCR") -> pd.DataFrame:
+def parse_ctu_all_data_screen_image(uploaded_file, source_name="Image_OCR", fast_batch=False) -> pd.DataFrame:
     """v70 CTU/HMI OCR for direct images and images inside WhatsApp ZIPs.
 
     It rectifies the display, combines four full-screen OCR passes, performs
@@ -7513,6 +7572,7 @@ def parse_ctu_all_data_screen_image(uploaded_file, source_name="Image_OCR") -> p
     if Image is None:
         return pd.DataFrame()
     try:
+        _CTU_OCR_THREAD_V91.seconds = 2.25 if fast_batch else CTU_TESSERACT_TIMEOUT_SEC_V89
         if hasattr(uploaded_file, "seek"):
             uploaded_file.seek(0)
         original = Image.open(uploaded_file).convert("RGB")
@@ -7520,22 +7580,87 @@ def parse_ctu_all_data_screen_image(uploaded_file, source_name="Image_OCR") -> p
         file_name = getattr(uploaded_file, "name", source_name)
         dt_from_name = parse_datetime_from_filename(file_name)
 
-        all_candidates = _full_screen_candidates_v70(rectified)
-        adaptive_joined = _adaptive_joined_screen_candidates_v77(rectified)
-        for field, candidates in adaptive_joined.items():
-            all_candidates.setdefault(field, []).extend(candidates)
-        # Always reinforce the historically difficult boxes; for all other boxes,
-        # use targeted OCR only when the full-screen candidate set is weak.
-        difficult = {
-            "ctu_lt_weight_lbf", "ctu_circulation_pressure_psi", "ctu_reel_depth_ft",
-            "ctu_reel_speed_ftmin", "ctu_n2_rate_scfm", "ctu_n2_total_scf",
-        }
+        all_candidates = _full_screen_candidates_v70(rectified, fast_batch=bool(fast_batch))
+        # The ZIP path uses one whole-screen pass plus focused value-box OCR.
+        # The adaptive full-screen join is reserved for direct image review,
+        # where the user is waiting on only one or two images.
+        run_adaptive = not bool(fast_batch)
+        if run_adaptive:
+            adaptive_joined = _adaptive_joined_screen_candidates_v77(rectified)
+            for field, candidates in adaptive_joined.items():
+                all_candidates.setdefault(field, []).extend(candidates)
+        # Targeted OCR is expensive. Direct uploads use the robust multi-pass
+        # workflow. ZIP batches use only three high-value fallbacks (WHP,
+        # circulation/pumping pressure and reel depth) when the shared passes
+        # are missing or obviously weak. This keeps 20-30 image exports usable
+        # on Streamlit Cloud instead of multiplying Tesseract timeouts.
         for field in CTU_VALUE_ROIS_V70:
             current = all_candidates.get(field, [])
-            best_full_conf = max([float(item.get("confidence", 0.0)) for item in current] or [0.0])
-            if field in difficult or len(current) == 0 or best_full_conf < 0.75:
+            confidences = [float(item.get("confidence", 0.0)) for item in current]
+            best_full_conf = max(confidences or [0.0])
+            strong_values = [
+                float(item.get("value", np.nan)) for item in current
+                if float(item.get("confidence", 0.0)) >= 0.75 and pd.notna(item.get("value"))
+            ]
+            disagreement = False
+            if len(strong_values) >= 2:
+                center = float(np.median(strong_values))
+                disagreement = any(
+                    abs(value - center) > max(2.0, 0.04 * max(abs(center), 1.0))
+                    for value in strong_values
+                )
+
+            if fast_batch:
+                # Four fields are operationally critical and are vulnerable to
+                # leading-digit/sign loss under glare. One small-box pass is far
+                # cheaper than another whole-screen pass and prevents values
+                # such as 1800.95 -> 800.95 or 60.30 -> 0.30.
+                if field == "ctu_wellhead_pressure_psi":
+                    all_candidates[field].extend(_targeted_special_candidates_v77(rectified, field))
+                elif field in {
+                    "ctu_circulation_pressure_psi",
+                    "ctu_reel_depth_ft",
+                    "ctu_reel_speed_ftmin",
+                }:
+                    all_candidates[field].extend(_targeted_field_candidates_v70(rectified, field))
+                continue
+
+            needs_targeted = (
+                len(current) == 0
+                or best_full_conf < 0.75
+                or disagreement
+                or field in {"ctu_lt_weight_lbf", "ctu_reel_depth_ft"} and len(strong_values) < 2
+            )
+            if needs_targeted:
                 all_candidates[field].extend(_targeted_field_candidates_v70(rectified, field))
-            all_candidates[field].extend(_targeted_special_candidates_v77(rectified, field))
+
+            needs_special = False
+            if field == "ctu_wellhead_pressure_psi":
+                needs_special = not any(
+                    float(item.get("confidence", 0.0)) >= 0.75
+                    and float(item.get("penalty", 0.0)) <= 0.05
+                    and abs(float(item.get("value", 0.0)) - round(float(item.get("value", 0.0)))) > 1e-6
+                    for item in current
+                )
+            elif field == "ctu_lt_weight_lbf":
+                needs_special = needs_targeted
+            elif field in {"ctu_n2_rate_scfm", "ctu_n2_total_scf"}:
+                needs_special = len(current) == 0 or best_full_conf < 0.70
+            if needs_special:
+                all_candidates[field].extend(_targeted_special_candidates_v77(rectified, field))
+
+        if fast_batch:
+            # Reel depth is the one field where a leading digit is frequently
+            # hidden by glare. Run the adaptive joined pass only when the cheap
+            # full/targeted passes did not produce a confident depth.
+            depth_value, depth_conf, _, _ = _select_ctu_candidate_v70(
+                "ctu_reel_depth_ft", all_candidates.get("ctu_reel_depth_ft", [])
+            )
+            if pd.isna(depth_value) or float(depth_conf) < 0.70:
+                adaptive_depth = _adaptive_joined_screen_candidates_v77(rectified)
+                all_candidates["ctu_reel_depth_ft"].extend(
+                    adaptive_depth.get("ctu_reel_depth_ft", [])
+                )
 
         row = {
             "source": source_name,

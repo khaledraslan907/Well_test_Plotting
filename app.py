@@ -16,6 +16,14 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
+# Optional lightweight drag-and-drop ordering for plotted signals. The package is
+# included in requirements.txt, while the fallback keeps the app usable if a
+# deployment has not finished installing it yet.
+try:
+    from streamlit_sortables import sort_items as _sort_items
+except Exception:
+    _sort_items = None
+
 # Import parser module safely.  Streamlit Cloud often shows a redacted ImportError
 # if app.py was updated but tmu_parser.py is still an older file.  This block keeps
 # the app running and shows a clear message instead of a redacted crash.
@@ -59,6 +67,7 @@ parse_whatsapp_plain_or_export_text = getattr(
 )
 PARSER_BUILD_ID = getattr(_tmu_parser, 'PARSER_BUILD_ID', 'v70')
 assign_test_ids = getattr(_tmu_parser, "assign_test_ids", lambda df, gap_hours=12.0: df)
+normalize_ctu_ocr_signals = getattr(_tmu_parser, "normalize_ctu_ocr_signals", lambda df: df)
 
 from history_analysis import build_production_history
 
@@ -370,7 +379,7 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_UI_BUILD_ID = "v90-multiwell-history-axis-performance-fix-20260628"
+APP_UI_BUILD_ID = "v92-custom-intervals-drag-signal-order-20260628"
 print(f"Starting Production Test Dashboard: {APP_UI_BUILD_ID} | parser={PARSER_BUILD_ID}")
 
 UI_THEME_PRESETS = {
@@ -851,6 +860,10 @@ def feature_key_text(feature_name):
 
 
 def _compressed_scale_delta(scale):
+    scale = str(scale or "")
+    if scale.startswith("Custom:"):
+        parsed = _parse_interval_text(scale.split(":", 1)[1].strip())
+        return parsed.get("timedelta") if parsed else None
     return {
         "30 minutes": pd.Timedelta(minutes=30),
         "1 hour": pd.Timedelta(hours=1),
@@ -2475,6 +2488,7 @@ try:
         data = _tmu_parser.ensure_pumping_pressure_column_v48(data)
     if "pumping_pressure_psi" in data.columns:
         data["pumping_pressure_psi"] = pd.to_numeric(data["pumping_pressure_psi"], errors="coerce")
+    data = normalize_ctu_ocr_signals(data)
 except Exception:
     pass
 
@@ -2499,7 +2513,8 @@ if ocr_mask.any():
         ocr_cols = [c for c in ocr_meta_cols + ocr_numeric_cols if c in data.columns]
         review_df = data.loc[ocr_mask, ocr_cols].copy()
         review_df.insert(0, "row_id", review_df.index.astype(int))
-        review_df.insert(1, "Approve OCR", False)
+        _existing_approval = data.loc[ocr_mask, "ocr_approved"].fillna(False).astype(bool) if "ocr_approved" in data.columns else pd.Series(False, index=review_df.index)
+        review_df.insert(1, "Approve OCR", _existing_approval.reindex(review_df.index).fillna(False).to_numpy())
 
         # Preview directly uploaded field photos. ZIP-contained images still appear
         # by filename and can be reviewed after extraction outside the application.
@@ -2550,10 +2565,14 @@ if ocr_mask.any():
             column_config["test_id"] = st.column_config.SelectboxColumn(
                 "Test ID", options=["Unlinked_OCR_or_Unknown_Well"] + confirmed_test_options
             )
+        _ocr_review_labels = {
+            "ctu_circulation_pressure_psi": "Pumping Pressure (image OCR)",
+            "ctu_wellhead_pressure_psi": "WHP (image OCR)",
+        }
         for col in ocr_numeric_cols:
             if col in review_df.columns:
                 column_config[col] = st.column_config.NumberColumn(
-                    column_label(col), format="%.3f"
+                    _ocr_review_labels.get(col, column_label(col)), format="%.3f"
                 )
 
         editable_columns = {"Approve OCR", "datetime", "well", "test_id", *ocr_numeric_cols}
@@ -2574,6 +2593,20 @@ if ocr_mask.any():
                 if col in edited_review.columns and col in data.columns:
                     data.at[rid, col] = erow.get(col)
             approved = bool(erow.get("Approve OCR", False))
+            if "ocr_approved" not in data.columns:
+                data["ocr_approved"] = False
+            data.at[rid, "ocr_approved"] = approved
+            # The CTU screen's Circulation Pressure is the same engineering
+            # signal as Pumping Pressure; Wellhead Pressure is WHP. Keep the raw
+            # OCR fields for audit but update the canonical plotted channels.
+            if "ctu_circulation_pressure_psi" in data.columns:
+                data.at[rid, "pumping_pressure_psi"] = pd.to_numeric(
+                    pd.Series([data.at[rid, "ctu_circulation_pressure_psi"]]), errors="coerce"
+                ).iloc[0]
+            if "ctu_wellhead_pressure_psi" in data.columns:
+                data.at[rid, "whp_psi"] = pd.to_numeric(
+                    pd.Series([data.at[rid, "ctu_wellhead_pressure_psi"]]), errors="coerce"
+                ).iloc[0]
             well_ok = str(data.at[rid, "well"]).strip().lower() not in ["", "unknown", "nan"] if "well" in data.columns else False
             if approved:
                 data.at[rid, "link_status"] = "ocr_manually_verified"
@@ -2585,12 +2618,13 @@ if ocr_mask.any():
                         f"{_existing_note}; OCR values manually verified" if _existing_note
                         else "OCR values manually verified"
                     )
+        data = normalize_ctu_ocr_signals(data)
 
         unapproved = ocr_mask & data.get("review_required", pd.Series(True, index=data.index)).fillna(True).astype(bool)
         if unapproved.any():
             st.info(
                 f"{int(unapproved.sum())} OCR row(s) still require review. They remain visible for editing "
-                "but are clearly flagged in Engineering Data Checks."
+                "but are excluded from charts until approved."
             )
 
 
@@ -2621,7 +2655,178 @@ def parse_manual_events(text, reference_start=None):
     return events
 
 
+
+def _parse_interval_text(value, *, default_unit="minutes"):
+    """Parse user-friendly intervals such as 2 hours, 90 min, 1.5 days, 2 months.
+
+    Returns a dictionary with a pandas resampling rule, a Plotly tick value, and
+    a Timedelta approximation used by compressed timelines. Invalid or
+    non-positive values return None instead of raising an application error.
+    """
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    text = re.sub(r"\s+", " ", text)
+
+    # Accept compact forms such as 2h, 30m, 1d, 2w, 3M, and plain numbers.
+    compact = re.fullmatch(r"([0-9]*\.?[0-9]+)\s*([a-z]+)?", text)
+    if not compact:
+        return None
+    amount = float(compact.group(1))
+    unit = (compact.group(2) or default_unit).lower()
+    if not np.isfinite(amount) or amount <= 0:
+        return None
+
+    aliases = {
+        "s": "second", "sec": "second", "secs": "second", "second": "second", "seconds": "second",
+        "m": "minute", "min": "minute", "mins": "minute", "minute": "minute", "minutes": "minute",
+        "h": "hour", "hr": "hour", "hrs": "hour", "hour": "hour", "hours": "hour",
+        "d": "day", "day": "day", "days": "day",
+        "w": "week", "wk": "week", "wks": "week", "week": "week", "weeks": "week",
+        "mo": "month", "mos": "month", "month": "month", "months": "month",
+        "y": "year", "yr": "year", "yrs": "year", "year": "year", "years": "year",
+    }
+    unit = aliases.get(unit)
+    if unit is None:
+        return None
+
+    if unit in {"month", "year"}:
+        rounded = int(round(amount))
+        if rounded < 1 or abs(amount - rounded) > 1e-9:
+            return None
+        months = rounded if unit == "month" else rounded * 12
+        return {
+            "label": f"{rounded} {unit}{'' if rounded == 1 else 's'}",
+            "resample_rule": f"{months}MS",
+            "plotly_dtick": f"M{months}",
+            "timedelta": pd.Timedelta(days=30.4375 * months),
+        }
+
+    seconds_per_unit = {
+        "second": 1.0,
+        "minute": 60.0,
+        "hour": 3600.0,
+        "day": 86400.0,
+        "week": 7.0 * 86400.0,
+    }
+    total_seconds = amount * seconds_per_unit[unit]
+    if total_seconds < 0.001:
+        return None
+    total_ms = int(round(total_seconds * 1000.0))
+    # Pandas accepts milliseconds and avoids fractional rule strings.
+    return {
+        "label": f"{amount:g} {unit}{'' if amount == 1 else 's'}",
+        "resample_rule": f"{total_ms}ms",
+        "plotly_dtick": total_ms,
+        "timedelta": pd.Timedelta(milliseconds=total_ms),
+    }
+
+
+def _custom_interval_choice(preset, custom_text):
+    if str(preset) != "Custom":
+        return str(preset)
+    parsed = _parse_interval_text(custom_text)
+    return f"Custom: {parsed['label']}" if parsed else "Custom: invalid"
+
+
+def interval_select_with_custom(label, options, *, index=0, key, placeholder="e.g. 2 hours", help_text=None):
+    """Render a compact preset dropdown and a custom interval box beside it."""
+    c1, c2 = st.columns([1.35, 1.0], gap="small")
+    with c1:
+        preset = st.selectbox(
+            label,
+            [*options, "Custom"],
+            index=index,
+            key=f"{key}_preset",
+            help=help_text,
+        )
+    with c2:
+        custom_text = st.text_input(
+            "Custom",
+            value=str(st.session_state.get(f"{key}_custom_value", "")),
+            placeholder=placeholder,
+            key=f"{key}_custom_value",
+            disabled=preset != "Custom",
+            help="Type a positive interval such as 2 hours, 90 minutes, 1.5 days, 2 months, or 1 year.",
+        )
+    resolved = _custom_interval_choice(preset, custom_text)
+    if preset == "Custom" and resolved == "Custom: invalid":
+        st.warning(f"Enter a valid {label.lower()} such as 2 hours or 30 minutes.")
+    return resolved
+
+
+def _unique_signal_labels(features):
+    """Create unique readable labels for the drag-order component."""
+    counts = {}
+    labels = []
+    mapping = {}
+    for feature in features:
+        base = str(column_label(feature))
+        counts[base] = counts.get(base, 0) + 1
+        label = base if counts[base] == 1 else f"{base} · {counts[base]}"
+        labels.append(label)
+        mapping[label] = feature
+    return labels, mapping
+
+
+def draggable_signal_order(selected, *, key):
+    """Return selected signals in user-controlled drag order.
+
+    Selection remains a normal searchable multiselect. Reordering is handled by
+    a small drag list so users do not have to remove and re-add signals merely
+    to change panel order.
+    """
+    selected = list(dict.fromkeys([x for x in selected if x]))
+    if len(selected) <= 1:
+        return selected
+
+    state_key = f"{key}_state"
+    previous = [x for x in st.session_state.get(state_key, []) if x in selected]
+    ordered_seed = previous + [x for x in selected if x not in previous]
+    labels, label_to_feature = _unique_signal_labels(ordered_seed)
+
+    if _sort_items is None:
+        st.caption("Signal order follows the selected list until the drag-order component is installed.")
+        st.session_state[state_key] = ordered_seed
+        return ordered_seed
+
+    dark = ACTIVE_THEME_NAME == "Dark"
+    bg = "#0D2430" if dark else "#F4F8FB"
+    item_bg = "#173B4B" if dark else "#FFFFFF"
+    text = "#F2F7FA" if dark else "#102A43"
+    border = "#5D8DA3" if dark else "#9CB7C7"
+    custom_style = f"""
+    .sortable-component {{ background: transparent; padding: 0; }}
+    .sortable-container {{ background: {bg}; border: 1px solid {border}; border-radius: 9px; padding: 5px; }}
+    .sortable-container-header {{ color: {text}; font-weight: 700; background: transparent; padding: 3px 5px 7px 5px; }}
+    .sortable-container-body {{ background: transparent; }}
+    .sortable-item, .sortable-item:hover {{
+        background: {item_bg}; color: {text}; border: 1px solid {border};
+        border-radius: 7px; margin: 4px 0; padding: 8px 10px; cursor: grab;
+        font-weight: 600; line-height: 1.25;
+    }}
+    """
+    set_signature = hashlib.sha1("|".join(labels).encode("utf-8")).hexdigest()[:10]
+    try:
+        sorted_labels = _sort_items(
+            labels,
+            header="Drag to change plot order",
+            direction="vertical",
+            custom_style=custom_style,
+            key=f"{key}_{set_signature}_{ACTIVE_THEME_NAME}",
+        )
+        ordered = [label_to_feature[x] for x in sorted_labels if x in label_to_feature]
+        ordered += [x for x in selected if x not in ordered]
+    except Exception:
+        ordered = ordered_seed
+    st.session_state[state_key] = ordered
+    return ordered
+
 def time_aggregation_rule(choice):
+    choice = str(choice or "")
+    if choice.startswith("Custom:"):
+        parsed = _parse_interval_text(choice.split(":", 1)[1].strip())
+        return parsed.get("resample_rule") if parsed else None
     return {
         "Raw data": None,
         "5 minutes": "5min",
@@ -2673,6 +2878,21 @@ def aggregate_time_data(df, agg_choice):
 
 
 def x_axis_tick_kwargs(scale):
+    scale = str(scale or "")
+    if scale.startswith("Custom:"):
+        parsed = _parse_interval_text(scale.split(":", 1)[1].strip())
+        if parsed:
+            delta = parsed["timedelta"]
+            if delta >= pd.Timedelta(days=365):
+                tickformat = "%Y"
+            elif delta >= pd.Timedelta(days=28):
+                tickformat = "%b-%Y"
+            elif delta >= pd.Timedelta(days=1):
+                tickformat = "%d-%b-%Y"
+            else:
+                tickformat = "%d-%b-%Y<br>%H:%M"
+            return {"tickformat": tickformat, "dtick": parsed["plotly_dtick"]}
+        return {"tickformat": "%d-%b-%Y<br>%H:%M", "nticks": 10}
     if scale == "30 minutes":
         return {"tickformat": "%d-%b-%Y<br>%H:%M", "dtick": 30 * 60 * 1000}
     if scale == "1 hour":
@@ -2899,18 +3119,31 @@ def x_axis_title_from_mode(x_axis_mode):
     return "Time"
 
 
-def iter_plot_segments(g):
+def iter_plot_segments(g, feature=None):
+    """Return continuous segments containing actual values for one signal.
+
+    Combined WhatsApp ZIP data interleaves production rows, workbook rows and
+    OCR rows. A NaN from another source must not break the line for the selected
+    signal. Rows without that feature are removed before Plotly/Matplotlib sees
+    the trace; real zero readings are preserved.
+    """
     if g is None or g.empty:
         return []
     sort_col = "plot_x" if "plot_x" in g.columns else ("datetime" if "datetime" in g.columns else None)
-    if "series_segment_id" in g.columns:
-        segments = []
-        for _, seg in g.groupby("series_segment_id", dropna=False, sort=True):
-            seg2 = seg.sort_values(sort_col).reset_index(drop=True) if sort_col else seg.reset_index(drop=True)
-            if not seg2.empty:
-                segments.append(seg2)
-        return segments
-    return [g.sort_values(sort_col).reset_index(drop=True) if sort_col else g.reset_index(drop=True)]
+    source_segments = (
+        [seg for _, seg in g.groupby("series_segment_id", dropna=False, sort=True)]
+        if "series_segment_id" in g.columns else [g]
+    )
+    segments = []
+    for seg in source_segments:
+        seg2 = seg.sort_values(sort_col, kind="stable") if sort_col else seg
+        if feature is not None and feature in seg2.columns:
+            valid = numeric_feature_series(seg2, feature).notna()
+            seg2 = seg2.loc[valid]
+        seg2 = seg2.reset_index(drop=True)
+        if not seg2.empty:
+            segments.append(seg2)
+    return segments
 
 
 def interval_levels(intervals):
@@ -3339,16 +3572,21 @@ with st.sidebar.expander("4. Analysis View", expanded=True):
             index=0,
             help="Use Manual calendar/time for long tests where a slider is difficult.",
         )
-        time_aggregation = st.selectbox(
+        time_aggregation = interval_select_with_custom(
             "Average readings by time interval",
             ["Raw data", "5 minutes", "15 minutes", "30 minutes", "1 hour", "6 hours", "1 day", "1 month", "1 year"],
             index=0,
-            help="Use Raw data for normal tests. Choose an interval only when the chart is very dense.",
+            key="time_aggregation_interval",
+            placeholder="e.g. 2 hours",
+            help_text="Use Raw data for normal tests. Choose or type an interval only when the chart is very dense.",
         )
-        x_axis_scale = st.selectbox(
+        x_axis_scale = interval_select_with_custom(
             "X-axis tick scale",
             ["Auto readable", "30 minutes", "1 hour", "3 hours", "6 hours", "12 hours", "1 day", "1 month", "1 year"],
             index=0,
+            key="x_axis_tick_interval",
+            placeholder="e.g. 2 hours",
+            help_text="Choose a preset or select Custom and type the spacing required between X-axis labels.",
         )
         x_axis_mode = st.selectbox(
             "X-axis display mode",
@@ -3386,7 +3624,7 @@ with st.sidebar.expander("5. Wells & Signals", expanded=True):
         preferred = [
             "gross_rate_bpd", "oil_rate_stbd", "water_rate_bpd", "gas_rate_mmscfd",
             "whp_psi", "sep_p_psi", "pumping_pressure_psi", "bsw_pct",
-            "ctu_wellhead_pressure_psi", "ctu_circulation_pressure_psi", "ctu_reel_depth_ft",
+            "ctu_reel_depth_ft",
         ]
         for _c in preferred:
             if _c in _df.columns:
@@ -3422,12 +3660,13 @@ with st.sidebar.expander("5. Wells & Signals", expanded=True):
         c for c in [
             "gross_rate_bpd", "qgross_s_bpd", "oil_rate_stbd", "qoil_s_stbd",
             "water_rate_bpd", "qwat_s_bpd", "gas_rate_mmscfd", "gas_formation_mmscfd",
-            "pumping_pressure_psi", "ctu_circulation_pressure_psi", "ctu_wellhead_pressure_psi",
+            "pumping_pressure_psi", "whp_psi",
             "ctu_reel_depth_ft", "ctu_reel_speed_ftmin", "ctu_n2_rate_scfm",
             "bsw_pct", "wlr_s_pct", "whp_psi", "choke_unified",
             "flow_press_psi", "sep_p_psi", "salinity_kppm",
         ] if c in numeric_cols
     ] or numeric_cols[: min(6, len(numeric_cols))]
+    default_features = list(dict.fromkeys(default_features))
 
     feature_state_key = "selected_features_v58"
     desired_default_features = numeric_cols if select_all_features else default_features
@@ -3450,12 +3689,14 @@ with st.sidebar.expander("5. Wells & Signals", expanded=True):
                 if _raw_choke in numeric_cols and _raw_choke not in reconciled:
                     reconciled.append(_raw_choke)
         st.session_state[feature_state_key] = reconciled
-    selected_features = st.multiselect(
+    selected_feature_set = st.multiselect(
         "Signals to plot",
         numeric_cols,
         format_func=column_label,
         key=feature_state_key,
+        help="Select or remove signals here, then drag the selected signals below to control graph order.",
     )
+    selected_features = draggable_signal_order(selected_feature_set, key="plot_signal_order_v92")
     st.session_state[select_all_prev_key] = bool(select_all_features)
 
 
@@ -3537,18 +3778,30 @@ with st.sidebar.expander("6. Chart Options", expanded=False):
                     else:
                         st.warning(f"Max must be greater than Min for {column_label(feature)}")
 
-        value_label_mode = st.selectbox(
-            "Value labels",
-            [
-                "First, last + every 20 tests",
-                "First and last only",
-                "Clean readable - recommended",
-                "Off",
-            ],
-            index=0,
-            help="Default: label the first test, last test, and every twentieth test point.",
-            key="history_value_label_mode",
-        )
+        _vl1, _vl2 = st.columns([1.45, 0.85], gap="small")
+        with _vl1:
+            value_label_mode = st.selectbox(
+                "Value labels",
+                [
+                    "First, last + every N tests",
+                    "First and last only",
+                    "Clean readable - recommended",
+                    "Off",
+                ],
+                index=0,
+                help="Choose a simple label rule; N can be typed beside the list.",
+                key="history_value_label_mode",
+            )
+        with _vl2:
+            custom_value_label_step = int(st.number_input(
+                "Every N tests",
+                min_value=1,
+                max_value=500,
+                value=20,
+                step=1,
+                key="history_value_label_step",
+                disabled=value_label_mode != "First, last + every N tests",
+            ))
         label_decimals_default = "Auto"
         label_decimals_by_feature = {}
         note_color_theme = "Theme adaptive"
@@ -3661,24 +3914,34 @@ with st.sidebar.expander("6. Chart Options", expanded=False):
         default_markers = estimated_points_for_speed <= 350
         show_points = st.checkbox("Show markers", value=default_markers)
 
-        value_label_mode = st.selectbox(
-            "Value labels on chart",
-            [
-                "Clean readable - recommended",
-                "Every 20 readings",
-                "Every 8 readings",
-                "Hourly + min/max",
-                "All values - use wide export",
-                "First and last only",
-                "Off",
-            ],
-            index=0,
-            help=(
-                "Clean readable keeps labels to important/non-crowded points. "
-                "Every 20 readings is usually best for long field-test reports. "
-                "Use All values only with a wide export."
-            ),
-        )
+        _vl1, _vl2 = st.columns([1.45, 0.85], gap="small")
+        with _vl1:
+            value_label_mode = st.selectbox(
+                "Value labels on chart",
+                [
+                    "Clean readable - recommended",
+                    "Every N readings",
+                    "Hourly + min/max",
+                    "All values - use wide export",
+                    "First and last only",
+                    "Off",
+                ],
+                index=0,
+                help=(
+                    "Clean readable keeps labels to important/non-crowded points. "
+                    "Choose Every N readings and type the required spacing beside it."
+                ),
+            )
+        with _vl2:
+            custom_value_label_step = int(st.number_input(
+                "Every N readings",
+                min_value=1,
+                max_value=10000,
+                value=20,
+                step=1,
+                key="detail_value_label_step",
+                disabled=value_label_mode != "Every N readings",
+            ))
 
         label_decimals_default = st.selectbox(
             "Default number format on labels",
@@ -3955,6 +4218,10 @@ with st.sidebar.expander("7. Events & Notes", expanded=False):
                 st.rerun()
 
 filtered = data.copy()
+if "source_type" in filtered.columns:
+    _plot_ocr_mask = filtered["source_type"].astype(str).str.contains("ocr", case=False, na=False)
+    _plot_ocr_approved = filtered.get("ocr_approved", pd.Series(False, index=filtered.index)).fillna(False).astype(bool)
+    filtered = filtered.loc[~_plot_ocr_mask | _plot_ocr_approved].copy()
 if selected_wells:
     filtered = filtered[filtered["well"].astype(str).isin(selected_wells)]
 if "test_id" in filtered.columns and selected_tests:
@@ -4391,10 +4658,9 @@ if selected_features and not filtered.empty:
             return set()
         if mode == "All values - use wide export":
             return set(range(n))
-        if mode == "Every 8 readings":
-            return set(list(range(0, n, 8)) + [n - 1])
-        if mode in {"Every 20 readings", "First, last + every 20 tests"}:
-            return set([0, n - 1] + list(range(0, n, 20)))
+        if mode in {"Every N readings", "First, last + every N tests"}:
+            step = max(1, int(custom_value_label_step or 20))
+            return set([0, n - 1] + list(range(0, n, step)))
         if mode == "First and last only":
             return {0, n - 1}
 
@@ -4609,7 +4875,7 @@ if selected_features and not filtered.empty:
                         continue
                     color = feature_color(feature, series_idx + f_idx)
                     first_segment = True
-                    for g in iter_plot_segments(g_all):
+                    for g in iter_plot_segments(g_all, feature):
                         if g.empty:
                             continue
                         text, textposition = build_text_and_positions(g, feature)
@@ -4628,6 +4894,7 @@ if selected_features and not filtered.empty:
                                 showlegend=first_segment,
                                 line=dict(color=color, width=3.0, shape=("hv" if feature in {"choke_unified", "choke_pct", "choke_size_64", "choke_ambiguous"} else "linear")),
                                 marker=dict(color=color, size=6 if chart_view_mode == "Mobile-friendly" else 8),
+                                connectgaps=True,
                             ),
                             secondary_y=secondary,
                         )
@@ -4694,7 +4961,7 @@ if selected_features and not filtered.empty:
                     series_idx = series_values.index(series_label)
                     color = well_color(series_idx) if len(series_values) > 1 else feature_color(feature, series_idx)
                     first_segment = True
-                    for g in iter_plot_segments(g_all):
+                    for g in iter_plot_segments(g_all, feature):
                         if g.empty:
                             continue
                         text, textposition = build_text_and_positions(g, feature)
@@ -4712,6 +4979,7 @@ if selected_features and not filtered.empty:
                                 showlegend=(show_chart_legend and row_idx == 1 and first_segment),
                                 line=dict(color=color, width=3.0, shape=("hv" if feature in {"choke_unified", "choke_pct", "choke_size_64", "choke_ambiguous"} else "linear")),
                                 marker=dict(color=color, size=6 if chart_view_mode == "Mobile-friendly" else 8),
+                                connectgaps=True,
                             ),
                             row=row_idx,
                             col=1,
@@ -4810,7 +5078,7 @@ if selected_features and not filtered.empty:
                 series_idx = series_values.index(series_label)
                 color = feature_color(feature, series_idx)
                 first_segment = True
-                for g in iter_plot_segments(g_all):
+                for g in iter_plot_segments(g_all, feature):
                     y = g[feature].astype(float)
                     fig.add_trace(
                         go.Scatter(
@@ -4911,7 +5179,7 @@ if selected_features and not filtered.empty:
                     continue
                 color = feature_color(feature, series_idx + f_idx)
                 first_segment = True
-                for g in iter_plot_segments(g_all):
+                for g in iter_plot_segments(g_all, feature):
                     if g.empty:
                         continue
                     text, textposition = build_text_and_positions(g, feature)
@@ -5132,7 +5400,7 @@ if selected_features and not filtered.empty:
                         continue
                     color = feature_color(feature, wi)
                     first_segment = True
-                    for g in iter_plot_segments(g_all):
+                    for g in iter_plot_segments(g_all, feature):
                         x = g["plot_x"] if "plot_x" in g.columns and g["plot_x"].notna().any() else (
                             pd.to_datetime(g["datetime"], errors="coerce") if "datetime" in g.columns and g["datetime"].notna().any() else pd.Series(range(len(g)))
                         )
@@ -5549,7 +5817,7 @@ if selected_features and not filtered.empty:
 
                 color = well_color(wi) if len(series_values) > 1 else feature_color(feature, wi)
                 first_segment = True
-                for g in iter_plot_segments(g_all):
+                for g in iter_plot_segments(g_all, feature):
                     if g.empty:
                         continue
                     y = numeric_feature_series(g, feature)
@@ -5648,7 +5916,7 @@ if selected_features and not filtered.empty:
                 color = well_color(wi) if len(series_values) > 1 else feature_color(feature, wi)
                 first_segment = True
 
-                for g in iter_plot_segments(g_all):
+                for g in iter_plot_segments(g_all, feature):
                     x = _matplotlib_x_values(g)
                     y = numeric_feature_series(g, feature)
                     ax.plot(

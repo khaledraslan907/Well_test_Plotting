@@ -1,0 +1,76 @@
+Production Test Dashboard v91 validation
+=========================================
+
+Build
+-----
+UI build: v91-ocr-continuity-canonical-pressure-20260628
+Parser build: v91-ocr-continuity-canonical-pressure-20260628
+CTU OCR build: v91-ocr-continuity-canonical-pressure-20260628
+
+Code validation
+---------------
+Python compilation: PASS
+Parser self-test: PASS
+UI smoke test: PASS
+
+Plot continuity regression
+--------------------------
+Synthetic mixed-source test:
+- 7 interleaved rows
+- 4 Pumping Pressure readings
+- 3 rows belonging to other signals
+Result:
+- 1 continuous Pumping Pressure segment
+- Values retained: 1100, 1300, 1500, 1700 psi
+- Real zero values remain valid
+Status: PASS
+
+Canonical CTU pressure mapping
+------------------------------
+CTU Circulation Pressure 1909.09 psi -> Pumping Pressure 1909.09 psi: PASS
+CTU Wellhead Pressure 20.34 psi -> WHP 20.34 psi: PASS
+Raw CTU pressure aliases excluded from normal plot choices: PASS
+Canonical Pumping Pressure and WHP available for plotting: PASS
+
+OCR approval
+------------
+OCR rows default to unapproved: PASS
+Non-OCR source rows remain visible by default: PASS
+Unapproved OCR rows excluded from plots: PASS
+
+WhatsApp ZIP regression
+-----------------------
+Test archive without image OCR:
+- 81 merged rows
+- 47 WhatsApp text rows
+- 34 tabular attachment rows
+- 1 detected test period
+- Parse time in validation environment: approximately 2.6 seconds
+
+Same archive with one image enabled:
+- 82 merged rows
+- 1 OCR image row
+- Canonical Pumping Pressure populated from CTU Circulation Pressure
+- Parse time in validation environment: approximately 9.4 seconds
+
+Direct CTU screen OCR spot checks
+---------------------------------
+Screen 1:
+- WHP: 20.34 psi
+- Circulation/Pumping Pressure: 1909.09 psi
+- Reel Depth: 9003.4 ft
+- Reel Speed: 49.73 ft/min
+
+Screen 2:
+- WHP: 178.56 psi
+- Circulation/Pumping Pressure: 2188.97 psi
+- Reel Depth: 9473.8 ft
+- Reel Speed: 0.01 ft/min
+
+Screen 3:
+- WHP: 212.76 psi
+- Circulation/Pumping Pressure: 1800.95 psi
+- Reel Depth: 10419.9 ft
+- Reel Speed: 60.30 ft/min
+
+Status: PASS

@@ -14,6 +14,7 @@ import json
 import math
 import re
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence
 
@@ -23,10 +24,15 @@ import pandas as pd
 import tmu_parser_compat as compat
 import smart_tabular_v75 as smart
 
-PARSER_BUILD_ID = "v89-zip-ocr-pandas3-context-link-fix-20260628"
+PARSER_BUILD_ID = "v91-ocr-continuity-canonical-pressure-20260628"
 
 COLUMN_LABELS: Dict[str, str] = dict(getattr(compat, "COLUMN_LABELS", {}))
-COLUMN_LABELS.update(smart.FIELD_LABELS)
+COLUMN_LABELS.update({
+    "pumping_pressure_psi": "Pumping Pressure (psi)",
+    "whp_psi": "WHP (psi)",
+    "ctu_circulation_pressure_psi": "Pumping Pressure (image OCR)",
+    "ctu_wellhead_pressure_psi": "WHP (image OCR)",
+})
 
 # Public helper aliases used by the Streamlit app.
 def canonical_key(value: object) -> str:
@@ -102,6 +108,10 @@ def _numeric_columns(df: pd.DataFrame) -> List[str]:
         "image_file", "attachment_name", "source_member", "chat_sender",
         "caption_text", "suggested_well", "suggested_test_id",
         "suggested_link_reason", "test_start", "test_end",
+        # Raw OCR aliases are retained in the review/audit table.  They are
+        # merged into the canonical WHP/Pumping Pressure channels and should
+        # not appear as duplicate sparse plotting signals.
+        "ctu_circulation_pressure_psi", "ctu_wellhead_pressure_psi",
     }
     # Boolean/audit flags are not engineering curves.  pandas keeps bool dtype
     # after pd.to_numeric(), and subtracting bool min/max raises TypeError in
@@ -176,6 +186,120 @@ def apply_fill_method(df: pd.DataFrame, columns: Sequence[str], method: str) -> 
     return out
 
 
+
+def normalize_ctu_ocr_signals(df: pd.DataFrame) -> pd.DataFrame:
+    """Merge CTU screen terminology into the standard engineering channels.
+
+    The HMI label ``Circulation Pressure`` is the operation's pumping pressure,
+    not a separate physical signal.  Likewise, CTU ``Wellhead Pressure`` is WHP.
+    Raw OCR columns remain available for review, while charts use one continuous
+    canonical signal across spreadsheets, messages and images.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    alias_pairs = [
+        ("ctu_circulation_pressure_psi", "pumping_pressure_psi"),
+        ("ctu_wellhead_pressure_psi", "whp_psi"),
+    ]
+    for raw_col, canonical_col in alias_pairs:
+        if raw_col not in out.columns:
+            continue
+        raw = pd.to_numeric(out[raw_col], errors="coerce")
+        current = pd.to_numeric(
+            out.get(canonical_col, pd.Series(np.nan, index=out.index)),
+            errors="coerce",
+        )
+        out[canonical_col] = current.combine_first(raw).astype("float64")
+    if "source_type" in out.columns:
+        ocr_mask = out["source_type"].astype(str).str.contains("ocr", case=False, na=False)
+        if "ocr_approved" not in out.columns:
+            out["ocr_approved"] = False
+        out["ocr_approved"] = out["ocr_approved"].astype("boolean").fillna(False)
+        out.loc[~ocr_mask, "ocr_approved"] = True
+    return out
+
+
+def flag_ocr_temporal_outliers(df: pd.DataFrame) -> pd.DataFrame:
+    """Flag isolated OCR spikes without changing the displayed source value.
+
+    A point is flagged only when both neighbouring OCR readings agree with each
+    other and the middle value is far away.  Genuine operating steps therefore
+    remain valid.  The user can still correct/approve flagged fields in the OCR
+    review table.
+    """
+    if df is None or df.empty or "source_type" not in df.columns or "datetime" not in df.columns:
+        return df
+    out = df.copy()
+    ocr_mask = out["source_type"].astype(str).str.contains("ocr", case=False, na=False)
+    if int(ocr_mask.sum()) < 3:
+        return out
+    if "ocr_low_confidence_fields" not in out.columns:
+        out["ocr_low_confidence_fields"] = ""
+    if "data_quality_note" not in out.columns:
+        out["data_quality_note"] = ""
+    fields = {
+        "ctu_weight_lbf": (5000.0, 0.45),
+        "ctu_lt_weight_lbf": (500.0, 0.75),
+        "ctu_wellhead_pressure_psi": (150.0, 0.75),
+        "ctu_circulation_pressure_psi": (500.0, 0.70),
+        "ctu_reel_depth_ft": (1500.0, 0.35),
+        "ctu_reel_speed_ftmin": (50.0, 1.50),
+        "ctu_fluid_rate_bpm": (2.0, 2.00),
+        "ctu_n2_rate_scfm": (150.0, 1.00),
+    }
+    group_cols = [c for c in ("well", "test_id") if c in out.columns]
+    group_items = list(out.loc[ocr_mask].groupby(group_cols, dropna=False, sort=False)) if group_cols else [(None, out.loc[ocr_mask])]
+    for _, group in group_items:
+        g = group.sort_values("datetime", kind="stable")
+        for field, (abs_tol, rel_tol) in fields.items():
+            if field not in g.columns:
+                continue
+            vals = pd.to_numeric(g[field], errors="coerce")
+            valid_idx = list(vals.dropna().index)
+            for pos in range(1, len(valid_idx) - 1):
+                i0, i1, i2 = valid_idx[pos - 1], valid_idx[pos], valid_idx[pos + 1]
+                prev_v, cur_v, next_v = float(vals.loc[i0]), float(vals.loc[i1]), float(vals.loc[i2])
+                neighbour_scale = max(abs(prev_v), abs(next_v), 1.0)
+                neighbours_agree = abs(prev_v - next_v) <= max(abs_tol, rel_tol * neighbour_scale)
+                middle_far = min(abs(cur_v - prev_v), abs(cur_v - next_v)) > max(abs_tol * 1.5, rel_tol * 1.5 * neighbour_scale)
+                if not (neighbours_agree and middle_far):
+                    continue
+                status_col = f"ocr_status__{field}"
+                out.at[i1, status_col] = "temporal_outlier_review_required"
+                label = column_label(field)
+                old = str(out.at[i1, "ocr_low_confidence_fields"] or "").strip(" ;")
+                if label not in old:
+                    out.at[i1, "ocr_low_confidence_fields"] = f"{old}; {label}".strip(" ;")
+                note = str(out.at[i1, "data_quality_note"] or "").strip(" ;")
+                msg = f"OCR temporal outlier requires review: {label}"
+                if msg not in note:
+                    out.at[i1, "data_quality_note"] = f"{note}; {msg}".strip(" ;")
+                if "review_required" in out.columns:
+                    out.at[i1, "review_required"] = True
+    # Cumulative totals should not materially decrease.
+    for field in ("ctu_fluid_total_bbl", "ctu_n2_total_scf"):
+        if field not in out.columns:
+            continue
+        for _, group in group_items:
+            g = group.sort_values("datetime", kind="stable")
+            vals = pd.to_numeric(g[field], errors="coerce")
+            previous = None
+            for idx, value in vals.items():
+                if pd.isna(value):
+                    continue
+                value = float(value)
+                if previous is not None and value < previous * 0.80:
+                    out.at[idx, f"ocr_status__{field}"] = "counter_decrease_review_required"
+                    label = column_label(field)
+                    old = str(out.at[idx, "ocr_low_confidence_fields"] or "").strip(" ;")
+                    if label not in old:
+                        out.at[idx, "ocr_low_confidence_fields"] = f"{old}; {label}".strip(" ;")
+                    if "review_required" in out.columns:
+                        out.at[idx, "review_required"] = True
+                previous = max(previous, value) if previous is not None else value
+    return out
+
 def _safe_postprocess(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
@@ -205,6 +329,7 @@ def _safe_postprocess(df: pd.DataFrame) -> pd.DataFrame:
         out["parse_confidence"] = 0.85
     out["date"] = out["datetime"].dt.date
     out["time_text"] = out["datetime"].dt.strftime("%H:%M")
+    out = normalize_ctu_ocr_signals(out)
     out = _engineering_checks(out)
     return out.sort_values(["well", "datetime", "source", "sheet"], kind="stable").reset_index(drop=True)
 
@@ -547,6 +672,7 @@ def _zip_member_is_chat_text(member_name: str, payload: bytes) -> bool:
         return False
     return _looks_like_whatsapp_export_text(_decode_text_payload(payload), member_name)
 
+
 def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: int = 1000) -> List[pd.DataFrame]:
     data, name = _bytes_and_name(uploaded_file)
     suffix = Path(name).suffix.lower()
@@ -602,8 +728,10 @@ def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: 
                 else:
                     diagnostics.append(f"{member_name}: no complete timestamped production-test readings detected")
 
-            # Pass 2: parse tabular/PDF/image attachments.  Audio, video and
+            # Pass 2: parse tabular/PDF/image attachments. Audio, video and
             # stickers are intentionally ignored and do not make the ZIP fail.
+            # The mature compatibility image path is retained because it has
+            # already been validated on full WhatsApp media exports.
             supported = {".xlsx", ".xls", ".xlsm", ".csv", ".tsv", ".txt", ".docx", ".pdf", ".jpg", ".jpeg", ".png", ".webp"}
             image_exts = {".jpg", ".jpeg", ".png", ".webp"}
             for member in members:
@@ -640,6 +768,8 @@ def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: 
             merged = pd.concat(tables, ignore_index=True, sort=False)
             merged = _safe_postprocess(merged)
             merged = assign_test_ids(merged)
+            merged = flag_ocr_temporal_outliers(merged)
+            merged = normalize_ctu_ocr_signals(merged)
             return [merged]
 
         detail = ""

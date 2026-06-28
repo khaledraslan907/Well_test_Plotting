@@ -1,0 +1,50 @@
+Production Test Dashboard v92 validation
+========================================
+
+Build
+-----
+UI build: v92-custom-intervals-drag-signal-order-20260628
+Parser build: v91-ocr-continuity-canonical-pressure-20260628
+
+Static and regression tests
+---------------------------
+- Python compilation: PASS
+- v92 self-test: PASS
+- v92 UI smoke test: PASS
+- v91 OCR canonical pressure behavior retained: PASS
+- Mixed-source NaN continuity behavior retained: PASS
+
+Custom interval parsing
+-----------------------
+- 2 hours -> 7,200,000 ms: PASS
+- 90 min -> 5,400,000 ms: PASS
+- 1.5 days -> 36 hours: PASS
+- 2 months -> Plotly M2 / pandas 2MS: PASS
+- 1 year -> Plotly M12 / pandas 12MS: PASS
+- Custom resampling rule: PASS
+- Custom real-calendar tick spacing: PASS
+- Custom compressed-timeline spacing: PASS
+
+Streamlit AppTest
+-----------------
+- Pre-upload screen: 0 application exceptions
+- Pasted production-test data: 0 application exceptions
+- Custom average interval = 2 hours: PASS
+- Custom X-axis interval = 45 minutes: PASS
+- Invalid interval warning path: static validation PASS
+- Duplicate default signal removal: PASS
+
+Production history regression
+-----------------------------
+Input: ESP.xlsx
+- Parsed readings: 3,672
+- Detected history points: 54
+- Gross and oil history features: PASS
+- Parser elapsed in this test environment: approximately 9.84 seconds
+
+Drag-order behavior
+-------------------
+- streamlit-sortables dependency included: PASS
+- Selected signal list is the only data sent to drag component: PASS
+- Stable fallback when component import/render fails: PASS
+- Reordered selected_features drives plotting and export paths: PASS
