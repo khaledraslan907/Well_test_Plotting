@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Stable share-safe parser facade.
+"""Stable adaptive parser facade.
 
 Compatibility capabilities remain available through ``tmu_parser_compat`` while a
 clean adaptive engine independently interprets Excel/CSV tables.  The facade
@@ -23,7 +23,7 @@ import pandas as pd
 import tmu_parser_compat as compat
 import smart_tabular_v75 as smart
 
-PARSER_BUILD_ID = "v82-share-safe-generic-ingestion-20260628"
+PARSER_BUILD_ID = "v88-history-time-and-zip-media-status-20260628"
 
 COLUMN_LABELS: Dict[str, str] = dict(getattr(compat, "COLUMN_LABELS", {}))
 COLUMN_LABELS.update(smart.FIELD_LABELS)

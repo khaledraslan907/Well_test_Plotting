@@ -1,0 +1,53 @@
+PRODUCTION TEST DASHBOARD v88 — VALIDATION RESULTS
+==================================================
+
+Build IDs
+---------
+UI:     v88-history-time-and-zip-media-status-20260628
+Parser: v88-history-time-and-zip-media-status-20260628
+
+Production-history time axis
+----------------------------
+Short four-test history, 12-Jun-2026 to 16-Jun-2026:
+  Explicit visible labels: 12-Jun-2026, 13-Jun-2026, 14-Jun-2026, 16-Jun-2026
+  Result: PASS
+
+54-point multi-year history:
+  Representative labels from Jan-2021 through Jan-2026
+  First and last history dates retained
+  Result: PASS
+
+ESP.xlsx regression
+-------------------
+Raw rows: 3,672
+Detected production-history tests: 54
+Start: 26-Jan-2021 05:00
+End: 17-Apr-2026 02:30
+All history timestamps valid: PASS
+
+WhatsApp ZIP supplied by user
+-----------------------------
+File: WhatsApp Chat - Sitra8-58 clean & test(3).zip
+ZIP contents:
+  Image files: 0
+  Audio files: 1 OPUS
+  Chat image-omitted references: 146
+  Chat document-omitted references: 4
+Parsed production-test rows from _chat.txt: 74
+OCR rows expected: 0 because no image binaries exist
+Result: PASS
+
+ZIP image OCR functional test
+-----------------------------
+Synthetic WhatsApp ZIP containing the two supplied CTU/HMI JPEG files:
+  Image files detected: 2
+  OCR rows extracted: 2
+Result: PASS
+
+Additional checks
+-----------------
+Python compilation: PASS
+v88 parser/self-test: PASS
+v88 static UI smoke test: PASS
+Generic unfamiliar Excel layout: PASS
+Duplicate `Well Well 1` title prevention: PASS

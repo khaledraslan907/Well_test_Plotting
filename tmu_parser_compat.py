@@ -3178,7 +3178,7 @@ BASE_NON_PLOT_COLS.update({
 # =============================================================================
 # v70 finalization: OCR audit schema + conservative gas-balance reconciliation
 # =============================================================================
-PARSER_BUILD_ID_V72 = "v82-share-safe-generic-compat-20260628"
+PARSER_BUILD_ID_V72 = "v87-image-upload-privacy-migration-compat-20260628"
 PARSER_BUILD_ID = PARSER_BUILD_ID_V72
 
 COLUMN_LABELS.update({

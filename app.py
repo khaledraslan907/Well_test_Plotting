@@ -356,7 +356,7 @@ def chart_title_from_data(df, custom_title: str = "") -> str:
     wells = [w for w in wells if w and w.lower() != "unknown"]
 
     if len(wells) == 1:
-        return f"Well {wells[0]}"
+        return well_title_text(wells[0])
     if len(wells) > 1:
         shown = " vs ".join(wells[:5])
         suffix = "" if len(wells) <= 5 else f" +{len(wells) - 5} more"
@@ -370,7 +370,8 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_UI_BUILD_ID = "v85-scrollable-note-time-picker-ui-20260628"
+APP_UI_BUILD_ID = "v88-history-time-and-zip-media-status-20260628"
+print(f"Starting Production Test Dashboard: {APP_UI_BUILD_ID} | parser={PARSER_BUILD_ID}")
 
 UI_THEME_PRESETS = {
     "Light": {
@@ -455,11 +456,10 @@ UI_THEME_PRESETS = {
 
 if st.session_state.get("ui_theme") not in UI_THEME_PRESETS:
     st.session_state["ui_theme"] = "Light"
-if "share_safe_mode" not in st.session_state:
-    # Enabled by default so screenshots, exports, and a shared deployment do not
-    # expose uploaded well, source-file, service-provider, or sender names.
-    st.session_state["share_safe_mode"] = True
-SHARE_SAFE_MODE = bool(st.session_state.get("share_safe_mode", True))
+# Clear obsolete privacy state left by older deployments. Privacy is handled by
+# generic built-in placeholders only; user-uploaded identifiers remain visible.
+st.session_state.pop("share_safe_mode", None)
+st.session_state.pop("share_safe_replacements", None)
 ACTIVE_THEME_NAME = st.session_state.get("ui_theme", "Light")
 ACTIVE_THEME = UI_THEME_PRESETS.get(ACTIVE_THEME_NAME, UI_THEME_PRESETS["Light"])
 CHART_PAPER_BG = ACTIVE_THEME["chart_paper"]
@@ -1534,9 +1534,6 @@ st.markdown(
     [data-testid="stProgress"] > div > div {{ background-color: var(--petro-accent) !important; }}
     hr {{ border-color: var(--petro-border) !important; }}
 
-    /* Share-safe mode hides original upload filenames in the browser UI. */
-    {('[data-testid="stFileChipName"] {{ font-size: 0 !important; }} [data-testid="stFileChipName"]::after {{ content: "Uploaded file"; font-size: .86rem; color: var(--petro-text-strong); }}' if SHARE_SAFE_MODE else '')}
-
     /* Uploaded-file chips were rendered with a light background in Dark mode. */
     [data-testid="stFileChips"] {{ gap: .45rem !important; }}
     [data-testid="stFileChip"] {{
@@ -1922,11 +1919,6 @@ with st.sidebar:
         horizontal=True,
         key="ui_theme",
     )
-    st.checkbox(
-        "Share-safe labels",
-        key="share_safe_mode",
-        help="Masks well names, source filenames, service-provider/unit names, and sender names on screen and in exports. Parsing still uses the original uploaded values.",
-    )
 
 with st.sidebar.expander("1. Data Sources", expanded=True):
     uploaded_files = st.file_uploader(
@@ -1961,6 +1953,8 @@ with st.sidebar.expander("1. Data Sources", expanded=True):
             except Exception:
                 pass
 
+    st.caption("The interface uses generic examples before upload. Names from your own uploaded data are shown normally after parsing.")
+
     whatsapp_text = st.text_area(
         "Paste field-test messages",
         height=180,
@@ -1992,7 +1986,8 @@ with st.sidebar.expander("2. Processing", expanded=False):
     enable_ctu_ocr = st.checkbox(
         "Read images inside chat export ZIPs",
         value=False,
-        help="Direct image uploads are always read. Enable this only when the ZIP contains CTU/HMI screens.",
+        help=("Direct image uploads are always read. For ZIP OCR, the JPG/PNG/WebP files must be physically "
+              "included in the archive; text saying 'image omitted' cannot be OCR-read."),
     )
     if enable_ctu_ocr:
         max_ocr_images = st.number_input(
@@ -2006,86 +2001,62 @@ with st.sidebar.expander("2. Processing", expanded=False):
         max_ocr_images = 1000
 
 
-def _natural_alias_map(values, prefix: str) -> dict:
-    clean = sorted({str(v).strip() for v in values if str(v).strip() and str(v).strip().casefold() not in {"nan", "none", "unknown"}})
-    return {value: f"{prefix} {idx + 1}" for idx, value in enumerate(clean)}
-
-
-def _replace_sensitive_tokens(text, replacements: dict) -> str:
-    value = "" if text is None else str(text)
-    # Longest first avoids partial replacement where one identifier contains another.
-    for old in sorted((k for k in replacements if k), key=len, reverse=True):
-        value = re.sub(re.escape(old), replacements[old], value, flags=re.I)
-    # Generic unit/provider prefixes are not needed for plotting or reporting.
-    value = re.sub(r"\b(?:[A-Z][A-Z0-9_-]*\s+)?TMU\s*[- ]?\d+\b", "Test Unit", value, flags=re.I)
-    return value
+def sanitize_share_text(value) -> str:
+    """Return user-entered text unchanged; uploaded identifiers are user-owned data."""
+    return "" if value is None else str(value)
 
 
 def apply_share_safe_anonymization(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
-    """Mask operational identifiers without changing engineering measurements."""
-    if df is None or df.empty or not SHARE_SAFE_MODE:
-        return df, {}
-    out = df.copy(deep=False)
-    well_values = out.get("well", pd.Series(dtype=object)).dropna().astype(str).tolist() if "well" in out.columns else []
-    well_map = _natural_alias_map(well_values, "Well")
-    source_values = out.get("source", pd.Series(dtype=object)).dropna().astype(str).tolist() if "source" in out.columns else []
-    source_map = _natural_alias_map(source_values, "Uploaded file")
-    sheet_values = out.get("sheet", pd.Series(dtype=object)).dropna().astype(str).tolist() if "sheet" in out.columns else []
-    sheet_map = _natural_alias_map(sheet_values, "Data table")
-    sender_values = out.get("chat_sender", pd.Series(dtype=object)).dropna().astype(str).tolist() if "chat_sender" in out.columns else []
-    sender_map = _natural_alias_map(sender_values, "Sender")
-    image_values = out.get("image_file", pd.Series(dtype=object)).dropna().astype(str).tolist() if "image_file" in out.columns else []
-    image_map = _natural_alias_map(image_values, "Uploaded image")
-    replacements = {**well_map, **source_map, **sheet_map, **sender_map, **image_map}
-
-    if "well" in out.columns:
-        out["well"] = out["well"].astype(str).map(lambda x: well_map.get(x.strip(), "Unknown" if x.strip().casefold() == "unknown" else "Well"))
-    if "source" in out.columns:
-        out["source"] = out["source"].astype(str).map(lambda x: source_map.get(x.strip(), "Uploaded file"))
-    if "sheet" in out.columns:
-        out["sheet"] = out["sheet"].astype(str).map(lambda x: sheet_map.get(x.strip(), "Data table"))
-    if "chat_sender" in out.columns:
-        out["chat_sender"] = out["chat_sender"].astype(str).map(lambda x: sender_map.get(x.strip(), "Sender"))
-    if "test_unit" in out.columns:
-        out["test_unit"] = out["test_unit"].where(out["test_unit"].isna(), "Test Unit")
-    if "image_file" in out.columns:
-        out["_private_image_file"] = out["image_file"]
-        out["image_file"] = out["image_file"].astype(str).map(lambda x: image_map.get(x.strip(), "Uploaded image"))
-
-    for col, label in {
-        "attachment_name": "Attachment",
-        "file_name": "Uploaded file",
-        "suggested_well": "Well",
-    }.items():
-        if col in out.columns:
-            out[col] = out[col].where(out[col].isna(), label)
-
-    for col in ["test_id", "suggested_test_id", "source_group", "caption_text", "note", "data_quality_note", "rejected_values", "link_status", "whatsapp_message_body"]:
-        if col in out.columns:
-            out[col] = out[col].map(lambda x: _replace_sensitive_tokens(x, replacements) if pd.notna(x) else x)
-    if "source_member" in out.columns:
-        out["source_member"] = out["source_member"].where(out["source_member"].isna(), "Attachment")
-    if "source_type" in out.columns:
-        out["source_type"] = out["source_type"].astype(str).map(
-            lambda x: "chat_export_text" if "whatsapp" in x.casefold() else ("message_text" if "pasted" in x.casefold() else x)
-        )
-    if "parser_engine" in out.columns:
-        out["parser_engine"] = out["parser_engine"].astype(str).map(
-            lambda x: "message_parser" if "whatsapp" in x.casefold() else x
-        )
-    if "ocr_template" in out.columns:
-        out["ocr_template"] = out["ocr_template"].where(out["ocr_template"].isna(), "ctu_hmi_screen")
-    for col in [c for c in out.columns if str(c).startswith("ocr_raw_") or str(c) == "ocr_raw_text"]:
-        out[col] = "Hidden in share-safe mode"
-
-    st.session_state["share_safe_replacements"] = replacements
-    return out, replacements
+    """Deprecated compatibility shim: uploaded user data must remain unchanged."""
+    return df, {}
 
 
-def sanitize_share_text(value) -> str:
-    if not SHARE_SAFE_MODE:
-        return "" if value is None else str(value)
-    return _replace_sensitive_tokens(value, st.session_state.get("share_safe_replacements", {}))
+def inspect_chat_zip_media(file_name: str, file_bytes: bytes) -> dict:
+    """Inspect a ZIP without extracting it and report whether OCR media exists."""
+    summary = {
+        "file": str(file_name),
+        "image_files": 0,
+        "audio_files": 0,
+        "data_attachments": 0,
+        "image_omitted_references": 0,
+        "document_omitted_references": 0,
+        "ocr_rows": 0,
+        "invalid_zip": False,
+    }
+    if Path(str(file_name)).suffix.lower() != ".zip":
+        return summary
+    try:
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+            names = [n for n in zf.namelist() if not n.endswith("/") and not n.startswith("__MACOSX/")]
+            image_exts = {".jpg", ".jpeg", ".png", ".webp"}
+            audio_exts = {".opus", ".ogg", ".mp3", ".m4a", ".wav", ".aac"}
+            data_exts = {".xlsx", ".xls", ".xlsm", ".csv", ".tsv", ".pdf", ".docx"}
+            summary["image_files"] = sum(Path(n).suffix.lower() in image_exts for n in names)
+            summary["audio_files"] = sum(Path(n).suffix.lower() in audio_exts for n in names)
+            summary["data_attachments"] = sum(Path(n).suffix.lower() in data_exts for n in names)
+            chat_parts = []
+            for n in names:
+                if Path(n).suffix.lower() != ".txt":
+                    continue
+                try:
+                    payload = zf.read(n)
+                except Exception:
+                    continue
+                decoded = ""
+                for enc in ("utf-8-sig", "utf-16", "utf-8", "cp1256", "latin-1"):
+                    try:
+                        decoded = payload.decode(enc)
+                        break
+                    except Exception:
+                        continue
+                if decoded:
+                    chat_parts.append(decoded)
+            chat_text = "\n".join(chat_parts)
+            summary["image_omitted_references"] = len(re.findall(r"(?i)(?:image|photo)\s+omitted|<media omitted>", chat_text))
+            summary["document_omitted_references"] = len(re.findall(r"(?i)document\s+omitted", chat_text))
+    except Exception:
+        summary["invalid_zip"] = True
+    return summary
 
 
 def load_uploaded_file_once(file_name: str, file_bytes: bytes, parse_images: bool, max_ocr_images: int, parser_build_id: str):
@@ -2101,6 +2072,7 @@ def load_uploaded_file_once(file_name: str, file_bytes: bytes, parse_images: boo
 
 frames = []
 errors = []
+zip_media_summaries = []
 
 
 def _uploaded_file_identity_v58(uploaded_file):
@@ -2135,27 +2107,36 @@ if uploaded_files:
     if cached_bundle is not None and cached_key == upload_key:
         frames.extend(cached_bundle.get("frames", []))
         errors.extend(list(cached_bundle.get("errors", [])))
+        zip_media_summaries.extend(list(cached_bundle.get("zip_media_summaries", [])))
     else:
         # A new upload invalidates merged data and prepared reports immediately.
         # This prevents stale large objects from accumulating across file changes.
         _clear_heavy_session_state_v83(include_uploads=False)
         parsed_frames = []
         parsed_errors = []
+        parsed_zip_media_summaries = []
         upload_progress = st.progress(0.0, text="Reading uploaded files...") if len(uploaded_files) > 1 else None
         for upload_order, f in enumerate(uploaded_files):
             try:
                 if upload_progress is not None:
                     upload_progress.progress(
                         upload_order / max(len(uploaded_files), 1),
-                        text=(f"Reading {upload_order + 1}/{len(uploaded_files)}" if SHARE_SAFE_MODE else f"Reading {upload_order + 1}/{len(uploaded_files)}: {f.name}"),
+                        text=f"Reading {upload_order + 1}/{len(uploaded_files)}: {f.name}",
                     )
                 file_bytes = bytes(f.getbuffer()) if hasattr(f, "getbuffer") else f.getvalue()
                 _suffix = Path(str(f.name)).suffix.lower()
+                _zip_media_summary = inspect_chat_zip_media(f.name, file_bytes) if _suffix == ".zip" else None
                 _is_direct_image = _suffix in {".jpg", ".jpeg", ".png", ".webp"}
                 _parse_images_for_file = bool(enable_ctu_ocr) or _is_direct_image
                 parsed_tables = load_uploaded_file_once(
                     f.name, file_bytes, _parse_images_for_file, int(max_ocr_images), PARSER_BUILD_ID
                 )
+                if _zip_media_summary is not None:
+                    _zip_media_summary["ocr_rows"] = int(sum(
+                        table.get("source_type", pd.Series(dtype=str)).astype(str).str.contains("ocr", case=False, na=False).sum()
+                        for table in (parsed_tables or []) if table is not None and not table.empty
+                    ))
+                    parsed_zip_media_summaries.append(_zip_media_summary)
                 if parsed_tables:
                     for table_order, table in enumerate(parsed_tables):
                         if table is None or table.empty:
@@ -2166,12 +2147,14 @@ if uploaded_files:
                         parsed_frames.append(table)
                 else:
                     parsed_errors.append(
-                        (("Uploaded file" if SHARE_SAFE_MODE else f.name) + ": no usable time-series table detected. "
-                         "The file may be blank or may not contain date/time plus engineering readings.")
+                        f"{f.name}: no usable time-series table detected. "
+                        "The file may be blank or may not contain date/time plus engineering readings."
                     )
             except Exception as e:
-                parsed_errors.append(f"{'Uploaded file' if SHARE_SAFE_MODE else f.name}: {e}")
-                with st.expander("Technical details" if SHARE_SAFE_MODE else f"Technical details: {f.name}", expanded=False):
+                if locals().get("_zip_media_summary") is not None and _zip_media_summary not in parsed_zip_media_summaries:
+                    parsed_zip_media_summaries.append(_zip_media_summary)
+                parsed_errors.append(f"{f.name}: {e}")
+                with st.expander(f"Technical details: {f.name}", expanded=False):
                     st.code(traceback.format_exc())
             finally:
                 try:
@@ -2189,9 +2172,11 @@ if uploaded_files:
         st.session_state["upload_parse_bundle_v83"] = {
             "frames": parsed_frames,
             "errors": list(parsed_errors),
+            "zip_media_summaries": list(parsed_zip_media_summaries),
         }
         frames.extend(parsed_frames)
         errors.extend(parsed_errors)
+        zip_media_summaries.extend(parsed_zip_media_summaries)
         gc.collect()
 else:
     # Removing all uploads should also release the previous workbook data and
@@ -2209,6 +2194,32 @@ if whatsapp_text.strip():
             errors.append("WhatsApp text: no recognizable production-test report detected")
     except Exception as e:
         errors.append(f"WhatsApp text: {e}")
+
+for _zip_status in zip_media_summaries:
+    _zip_name = _zip_status.get("file", "Chat export ZIP")
+    _image_files = int(_zip_status.get("image_files", 0) or 0)
+    _omitted_refs = int(_zip_status.get("image_omitted_references", 0) or 0)
+    _ocr_rows = int(_zip_status.get("ocr_rows", 0) or 0)
+    if _zip_status.get("invalid_zip"):
+        st.warning(f"{_zip_name}: the ZIP could not be inspected for media files.")
+    elif enable_ctu_ocr and _image_files == 0 and _omitted_refs > 0:
+        st.warning(
+            f"{_zip_name}: ZIP image reading is enabled, but the archive contains no JPG/PNG/WebP files. "
+            f"The chat contains {_omitted_refs:,} 'image omitted' reference(s), which means it was exported without media. "
+            "Export the WhatsApp chat again and choose Include media, then upload the new ZIP."
+        )
+    elif enable_ctu_ocr and _image_files > 0:
+        if _ocr_rows > 0:
+            st.success(f"{_zip_name}: found {_image_files:,} image file(s) and extracted {_ocr_rows:,} OCR row(s).")
+        else:
+            st.warning(
+                f"{_zip_name}: found {_image_files:,} image file(s), but none produced a usable CTU/HMI OCR row. "
+                "Open OCR Review to inspect supported screens or upload the photos directly."
+            )
+    elif not enable_ctu_ocr and _image_files > 0:
+        st.info(
+            f"{_zip_name}: contains {_image_files:,} image file(s). Enable 'Read images inside chat export ZIPs' to process them."
+        )
 
 if errors:
     st.warning("Some files/messages were skipped or could not be parsed:\n\n" + "\n".join(f"- {e}" for e in errors))
@@ -2308,7 +2319,6 @@ def _auto_link_ocr_rows_by_time_context(df: pd.DataFrame, max_gap_hours: float =
 
 
 data = _auto_link_ocr_rows_by_time_context(data, max_gap_hours=3.0)
-data, share_safe_replacements = apply_share_safe_anonymization(data)
 
 # Parser-level quality review. Impossible physical values are excluded from
 # plotted canonical columns but retained in Rejected Values for audit.
@@ -2423,10 +2433,7 @@ if ocr_mask.any():
         ]
         if preview_names:
             def _preview_display_name(private_name):
-                if not SHARE_SAFE_MODE:
-                    return str(private_name)
-                rows = data.loc[data.get("_private_image_file", pd.Series(index=data.index, dtype=object)).astype(str).eq(str(private_name)), "image_file"]
-                return str(rows.iloc[0]) if not rows.empty else "Uploaded image"
+                return str(private_name)
             selected_preview = st.selectbox(
                 "Image preview", preview_names, format_func=_preview_display_name, key="ocr_image_preview_v70"
             )
@@ -2606,6 +2613,60 @@ def x_axis_tick_kwargs(scale):
     return {"tickformat": "%d-%b-%Y<br>%H:%M", "nticks": 10}
 
 
+def history_axis_tick_kwargs(df: pd.DataFrame, max_ticks: int = 9) -> dict:
+    """Always show readable dates for production-history points.
+
+    A fixed one-year dtick can produce no visible labels when the selected
+    history spans only days or months. Explicit ticks guarantee that the first
+    and last test dates, plus representative dates in between, are shown.
+    """
+    if df is None or df.empty or "datetime" not in df.columns:
+        return {}
+    dts = pd.to_datetime(df["datetime"], errors="coerce").dropna().drop_duplicates().sort_values().reset_index(drop=True)
+    if dts.empty:
+        return {}
+    max_ticks = max(2, int(max_ticks or 9))
+    if len(dts) <= max_ticks:
+        idxs = list(range(len(dts)))
+    else:
+        idxs = sorted(set(np.linspace(0, len(dts) - 1, max_ticks).round().astype(int).tolist()))
+        idxs = sorted(set([0, len(dts) - 1] + idxs))
+
+    span = pd.Timestamp(dts.iloc[-1]) - pd.Timestamp(dts.iloc[0])
+    if span <= pd.Timedelta(days=3):
+        fmt = "%d-%b-%Y<br>%H:%M"
+    elif span <= pd.Timedelta(days=120):
+        fmt = "%d-%b-%Y"
+    else:
+        fmt = "%b-%Y"
+
+    tickvals = [pd.Timestamp(dts.iloc[i]).to_pydatetime() for i in idxs]
+    ticktext = [pd.Timestamp(dts.iloc[i]).strftime(fmt.replace("<br>", "\n")).replace("\n", "<br>") for i in idxs]
+    return {
+        "type": "date",
+        "tickmode": "array",
+        "tickvals": tickvals,
+        "ticktext": ticktext,
+        "tickangle": 0,
+        "showticklabels": True,
+    }
+
+
+def history_matplotlib_date_format(df: pd.DataFrame) -> str:
+    """Match exported PNG/PDF date labels to the adaptive history axis."""
+    if df is None or df.empty or "datetime" not in df.columns:
+        return "%d-%b-%Y"
+    dts = pd.to_datetime(df["datetime"], errors="coerce").dropna()
+    if dts.empty:
+        return "%d-%b-%Y"
+    span = dts.max() - dts.min()
+    if span <= pd.Timedelta(days=3):
+        return "%d-%b-%Y\n%H:%M"
+    if span <= pd.Timedelta(days=120):
+        return "%d-%b-%Y"
+    return "%b-%Y"
+
+
 def short_test_label(value, max_len=34):
     s = str(value or "").strip()
     if not s:
@@ -2623,6 +2684,14 @@ def clean_well_label(value):
     s = str(value or "Unknown").strip()
     s = re.sub(r"\s+", " ", s)
     return s or "Unknown"
+
+
+def well_title_text(value) -> str:
+    """Return a readable chart title without duplicating the word Well."""
+    label = clean_well_label(value)
+    if re.match(r"(?i)^well(?:\s|[-_:]|$)", label):
+        return label
+    return f"Well {label}"
 
 
 def compressed_time_mapping(datetimes: pd.Series, continuous_gap_hours: float = 2.0, compressed_gap_hours: float = 0.75):
@@ -3160,7 +3229,7 @@ with st.sidebar.expander("4. Analysis View", expanded=True):
         # one arithmetic-average point per detected test, connected chronologically.
         time_filter_mode = "All data"
         time_aggregation = "Raw data"
-        x_axis_scale = "1 year"
+        x_axis_scale = "Auto history dates"
         x_axis_mode = "Real calendar time"
         continuous_gap_hours = 2.0
         compressed_gap_hours = 0.75
@@ -3302,18 +3371,22 @@ with st.sidebar.expander("5. Wells & Signals", expanded=True):
             auto_chart_header = " vs ".join(selected_tests[:3]) + (f" +{len(selected_tests) - 3} more" if len(selected_tests) > 3 else "")
     elif selected_wells:
         if len(selected_wells) == 1:
-            auto_chart_header = f"Well {selected_wells[0]}"
+            auto_chart_header = well_title_text(selected_wells[0])
         else:
             auto_chart_header = " vs ".join(selected_wells[:5]) + (f" +{len(selected_wells) - 5} more" if len(selected_wells) > 5 else "")
     else:
         auto_chart_header = "Well Production Test"
 
     data_title_signature = "_".join([str(x) for x in sorted(data.get("source", pd.Series(dtype=str)).dropna().astype(str).unique())[:3]])[:80]
+    chart_header_key = f"chart_header_{abs(hash(data_title_signature))}_{len(data)}"
+    if chart_header_key in st.session_state:
+        old_header = str(st.session_state.get(chart_header_key, ""))
+        st.session_state[chart_header_key] = re.sub(r"(?i)^well\s+well\s+", "Well ", old_header).strip()
     custom_chart_title = st.text_input(
         "Chart header / title",
         value=auto_chart_header,
         help="Edit this header if you want a different title. The default uses selected well/test only.",
-        key=f"chart_header_{abs(hash(data_title_signature))}_{len(data)}",
+        key=chart_header_key,
     )
 
 with st.sidebar.expander("6. Chart Options", expanded=False):
@@ -3938,7 +4011,9 @@ if selected_features and not filtered.empty:
         st.caption("Each marker = average of all valid readings in one test · one line connects tests in chronological order")
 
     series_count_for_hint = interactive_filtered["series_label"].dropna().astype(str).nunique() if "series_label" in interactive_filtered.columns else 1
-    if x_axis_mode == "Real calendar time":
+    if analysis_view == "Production history":
+        axis_tick_settings = history_axis_tick_kwargs(filtered, max_ticks=9)
+    elif x_axis_mode == "Real calendar time":
         axis_tick_settings = x_axis_tick_kwargs(x_axis_scale)
     elif is_aligned_elapsed_mode(x_axis_mode):
         axis_tick_settings = elapsed_axis_tick_kwargs(filtered, max_ticks=8 if chart_view_mode == "Mobile-friendly" else 12)
@@ -5002,8 +5077,8 @@ if selected_features and not filtered.empty:
                 ax.tick_params(axis="both", labelsize=12)
 
                 if x_axis_mode == "Real calendar time" and "datetime" in df.columns and df["datetime"].notna().any():
-                    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y" if analysis_view == "Production history" else "%d-%b\n%H:%M"))
-                    ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=8, maxticks=16))
+                    ax.xaxis.set_major_formatter(mdates.DateFormatter(history_matplotlib_date_format(df) if analysis_view == "Production history" else "%d-%b\n%H:%M"))
+                    ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=3 if analysis_view == "Production history" else 8, maxticks=9 if analysis_view == "Production history" else 16))
                     fig_m.autofmt_xdate(rotation=0)
                 elif is_aligned_elapsed_mode(x_axis_mode):
                     tick_settings = elapsed_axis_tick_kwargs(df)
@@ -5147,8 +5222,8 @@ if selected_features and not filtered.empty:
                 ax.tick_params(axis="both", labelsize=13)
 
                 if x_axis_mode == "Real calendar time" and "datetime" in df.columns and df["datetime"].notna().any():
-                    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y" if analysis_view == "Production history" else "%d-%b\n%H:%M"))
-                    ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=8, maxticks=16))
+                    ax.xaxis.set_major_formatter(mdates.DateFormatter(history_matplotlib_date_format(df) if analysis_view == "Production history" else "%d-%b\n%H:%M"))
+                    ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=3 if analysis_view == "Production history" else 8, maxticks=9 if analysis_view == "Production history" else 16))
                     fig_m.autofmt_xdate(rotation=0)
                 elif is_aligned_elapsed_mode(x_axis_mode):
                     tick_settings = elapsed_axis_tick_kwargs(df)
@@ -5206,9 +5281,14 @@ if selected_features and not filtered.empty:
         import matplotlib.dates as mdates
         if x_axis_mode == "Real calendar time" and "datetime" in df_for_ticks.columns and df_for_ticks["datetime"].notna().any():
             dt_all = pd.to_datetime(df_for_ticks["datetime"], errors="coerce").dropna()
-            fmt = "%d-%b-%Y\n%H:%M" if (not dt_all.empty and (dt_all.dt.year.nunique() > 1 or (dt_all.max() - dt_all.min()).days >= 330)) else "%d-%b\n%H:%M"
+            if analysis_view == "Production history":
+                fmt = history_matplotlib_date_format(df_for_ticks)
+                locator = mdates.AutoDateLocator(minticks=3, maxticks=9)
+            else:
+                fmt = "%d-%b-%Y\n%H:%M" if (not dt_all.empty and (dt_all.dt.year.nunique() > 1 or (dt_all.max() - dt_all.min()).days >= 330)) else "%d-%b\n%H:%M"
+                locator = mdates.AutoDateLocator(minticks=6, maxticks=12)
             ax.xaxis.set_major_formatter(mdates.DateFormatter(fmt))
-            ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=6, maxticks=12))
+            ax.xaxis.set_major_locator(locator)
         elif is_aligned_elapsed_mode(x_axis_mode):
             tick_settings = elapsed_axis_tick_kwargs(df_for_ticks, max_ticks=8 if chart_view_mode == "Mobile-friendly" else 12)
             if tick_settings:

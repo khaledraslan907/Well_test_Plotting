@@ -6658,7 +6658,7 @@ PARSER_BUILD_ID = PARSER_BUILD_ID_V68
 # This override is intentionally appended at the end of the legacy module so all
 # older ZIP/image loaders resolve this implementation at runtime.
 
-CTU_OCR_BUILD_ID_V70 = "v70-rectified-screen-consensus-ocr-20260624"
+CTU_OCR_BUILD_ID_V70 = "v87-signed-speed-depth-token-guard-20260628"
 
 CTU_SCREEN_SIZE_V70 = (1200, 750)
 CTU_VALUE_ROIS_V70 = {
@@ -7334,12 +7334,66 @@ def _select_ctu_candidate_v70(field, candidates):
                 "accepted" if float(best.get("confidence", 0.0)) >= 0.9 else "review_required",
             )
 
-    if field in {"ctu_circulation_pressure_psi", "ctu_reel_depth_ft"}:
+    # Preserve a displayed negative reel-speed sign when a dedicated targeted
+    # pass reads it and independent OCR passes agree on the magnitude. Generic
+    # full-screen OCR often drops a standalone minus sign.
+    if field == "ctu_reel_speed_ftmin":
+        signed_targets = [
+            c for c in candidates
+            if c.get("targeted")
+            and float(c.get("value", 0.0)) < 0
+            and "-" in str(c.get("raw_text", ""))
+            and float(c.get("confidence", 0.0)) >= 0.70
+        ]
+        if signed_targets:
+            best_signed = max(signed_targets, key=lambda item: float(item.get("confidence", 0.0)))
+            magnitude = abs(float(best_signed["value"]))
+            corroborating = [
+                c for c in candidates
+                if float(c.get("value", 0.0)) >= 0
+                and float(c.get("confidence", 0.0)) >= 0.50
+                and _values_close_v70(field, magnitude, abs(float(c.get("value", 0.0))))
+            ]
+            if corroborating:
+                confidence = min(
+                    0.99,
+                    max(float(best_signed.get("confidence", 0.0)), max(float(c.get("confidence", 0.0)) for c in corroborating)) + 0.02,
+                )
+                return -round(magnitude, 2), confidence, str(best_signed.get("raw_text", ""))[:250], "accepted"
+
+    if field == "ctu_reel_depth_ft":
+        joined = [c for c in candidates if str(c.get("variant", "")) == "adaptive_joined_v77"]
+        targeted_precise = [
+            c for c in candidates
+            if c.get("targeted")
+            and str(c.get("variant", "")).startswith("targeted_psm")
+            and "." in str(c.get("raw_text", ""))
+            and float(c.get("confidence", 0.0)) >= 0.75
+        ]
+        if targeted_precise:
+            best_target = max(targeted_precise, key=lambda item: float(item.get("confidence", 0.0)))
+            raw = str(best_target.get("raw_text", "")).strip().lstrip("+-")
+            target_value = abs(float(best_target["value"]))
+            # A leading zero such as 0149.6 is a known glare case where the
+            # adaptive joined pass can recover the missing leading digits
+            # (10149.6). Otherwise reject a joined value that appended an
+            # unrelated token from the edge of the value box (4182.2 | 9).
+            if not raw.startswith("0"):
+                if not joined or all(
+                    abs(float(item["value"]) - target_value) > max(2.0, 0.02 * max(target_value, 1.0))
+                    for item in joined
+                ):
+                    return round(target_value, 1), min(0.99, float(best_target.get("confidence", 0.8)) + 0.08), str(best_target.get("raw_text", ""))[:250], "accepted"
+        if joined:
+            best = max(joined, key=lambda item: (float(item.get("confidence", 0.0)), int(item.get("digit_count", 0))))
+            value = round(float(best["value"]), 1)
+            return value, min(0.99, float(best.get("confidence", 0.8)) + 0.08), str(best.get("raw_text", ""))[:250], "accepted"
+
+    if field == "ctu_circulation_pressure_psi":
         joined = [c for c in candidates if str(c.get("variant", "")) == "adaptive_joined_v77"]
         if joined:
             best = max(joined, key=lambda item: (float(item.get("confidence", 0.0)), int(item.get("digit_count", 0))))
-            value = float(best["value"])
-            value = round(value, 2 if field == "ctu_circulation_pressure_psi" else 1)
+            value = round(float(best["value"]), 2)
             return value, min(0.99, float(best.get("confidence", 0.8)) + 0.08), str(best.get("raw_text", ""))[:250], "accepted"
 
     if field == "ctu_wellhead_pressure_psi":
@@ -7464,7 +7518,7 @@ def parse_ctu_all_data_screen_image(uploaded_file, source_name="Image_OCR") -> p
         # Always reinforce the historically difficult boxes; for all other boxes,
         # use targeted OCR only when the full-screen candidate set is weak.
         difficult = {
-            "ctu_lt_weight_lbf", "ctu_circulation_pressure_psi",
+            "ctu_lt_weight_lbf", "ctu_circulation_pressure_psi", "ctu_reel_depth_ft",
             "ctu_reel_speed_ftmin", "ctu_n2_rate_scfm", "ctu_n2_total_scf",
         }
         for field in CTU_VALUE_ROIS_V70:
