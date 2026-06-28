@@ -1,0 +1,62 @@
+PRODUCTION TEST DASHBOARD v90 — VALIDATION RESULTS
+=================================================
+
+Build
+-----
+UI:     v90-multiwell-history-axis-performance-fix-20260628
+Parser: v89 ZIP OCR / pandas 3 context-link parser
+
+Static and regression checks
+----------------------------
+Python compilation: PASS
+v90 parser/UI self-test: PASS
+v90 UI smoke test: PASS
+Unsafe **axis_tick_settings calls remaining: 0
+History tick dictionary contains showticklabels: NO
+Plotly shared-subplot history-axis update: PASS
+
+Production-history validation
+-----------------------------
+Input: ESP.xlsx
+Raw readings: 3,672
+Detected tests: 54
+Production-history points: 54
+History reduction time after parsing: approximately 0.09 seconds
+Result: one average point per test remains connected chronologically.
+
+Multi-well title validation
+---------------------------
+ALASSIL-4 selected: Well ALASSIL-4
+BAHGA-11 selected: Well BAHGA-11
+Both selected: Well comparison: ALASSIL-4 vs BAHGA-11
+Selection-scoped title state: PASS
+
+Compressed x-axis validation
+----------------------------
+Synthetic periods: December 2014 and September 2020
+Auto-readable labels: capped at 8
+12-hour selection: produced a different tick set from Auto
+Overlapping labels after compressed long gap: pruned
+Full year/date context retained: PASS
+Plotly axis uirevision changes with scale/selection: PASS
+
+Performance protections
+-----------------------
+Interactive total-point target: 8,000
+Interactive per-group target: 2,000
+Large fixed chart widths removed: PASS
+Multi-well/dense hover mode: closest
+Upload parsing remains session-cached across chart reruns: PASS (static code review)
+
+Parser compatibility spot checks
+--------------------------------
+ESP.xlsx parse: 3,672 rows / 54 tests
+WhatsApp S8-58 text ZIP parse without OCR: 74 rows
+Generic unfamiliar Excel template: PASS
+pandas 3 OCR context linking: PASS
+
+Environment limitation
+----------------------
+A live Streamlit browser server was not installed in this execution environment.
+Validation used Python compilation, parser regression tests, Plotly figure-axis
+construction, real uploaded-file parsing, and pure UI-helper tests.

@@ -6658,7 +6658,8 @@ PARSER_BUILD_ID = PARSER_BUILD_ID_V68
 # This override is intentionally appended at the end of the legacy module so all
 # older ZIP/image loaders resolve this implementation at runtime.
 
-CTU_OCR_BUILD_ID_V70 = "v87-signed-speed-depth-token-guard-20260628"
+CTU_OCR_BUILD_ID_V70 = "v89-zip-batch-timeout-safe-ocr-20260628"
+CTU_TESSERACT_TIMEOUT_SEC_V89 = 6.0
 
 CTU_SCREEN_SIZE_V70 = (1200, 750)
 CTU_VALUE_ROIS_V70 = {
@@ -6901,6 +6902,7 @@ def _full_screen_candidates_v70(rectified_image):
                 image,
                 config="--oem 3 --psm 11",
                 output_type=pytesseract.Output.DATAFRAME,
+                timeout=CTU_TESSERACT_TIMEOUT_SEC_V89,
             )
         except Exception:
             continue
@@ -6953,6 +6955,7 @@ def _adaptive_joined_screen_candidates_v77(rectified_image):
             adaptive,
             config="--oem 3 --psm 11 -c tessedit_char_whitelist=-0123456789.",
             output_type=pytesseract.Output.DATAFRAME,
+            timeout=CTU_TESSERACT_TIMEOUT_SEC_V89,
         )
     except Exception:
         return {field: [] for field in CTU_VALUE_ROIS_V70}
@@ -7040,6 +7043,7 @@ def _targeted_special_candidates_v77(rectified_image, field):
                 text = pytesseract.image_to_string(
                     enlarged,
                     config=f"--oem 3 --psm {psm} -c tessedit_char_whitelist=-0123456789.",
+                    timeout=CTU_TESSERACT_TIMEOUT_SEC_V89,
                 ).strip()
             except Exception:
                 continue
@@ -7078,6 +7082,7 @@ def _targeted_special_candidates_v77(rectified_image, field):
                 text = pytesseract.image_to_string(
                     enlarged_right,
                     config=f"--oem 3 --psm {psm} -c tessedit_char_whitelist=0123456789",
+                    timeout=CTU_TESSERACT_TIMEOUT_SEC_V89,
                 ).strip()
             except Exception:
                 continue
@@ -7090,6 +7095,7 @@ def _targeted_special_candidates_v77(rectified_image, field):
             sign_text = pytesseract.image_to_string(
                 cv2.resize(left_red, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_CUBIC),
                 config="--oem 3 --psm 8 -c tessedit_char_whitelist=-",
+                timeout=CTU_TESSERACT_TIMEOUT_SEC_V89,
             ).strip()
             sign_negative = "-" in sign_text
         except Exception:
@@ -7162,6 +7168,7 @@ def _refine_leading_counter_digit_v70(processed, text):
             processed,
             config="--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789.",
             output_type=pytesseract.Output.DICT,
+            timeout=CTU_TESSERACT_TIMEOUT_SEC_V89,
         )
     except Exception:
         return original, False
@@ -7209,6 +7216,7 @@ def _refine_leading_counter_digit_v70(processed, text):
             read = pytesseract.image_to_string(
                 first_cell,
                 config=f"--oem 3 --psm {psm} -c tessedit_char_whitelist=0123456789",
+                timeout=CTU_TESSERACT_TIMEOUT_SEC_V89,
             ).strip()
         except Exception:
             continue
@@ -7273,6 +7281,7 @@ def _targeted_field_candidates_v70(rectified_image, field):
         text = pytesseract.image_to_string(
             processed,
             config=f"--oem 3 --psm {psm} -c tessedit_char_whitelist=-0123456789.",
+            timeout=CTU_TESSERACT_TIMEOUT_SEC_V89,
         ).strip()
     except Exception:
         return []

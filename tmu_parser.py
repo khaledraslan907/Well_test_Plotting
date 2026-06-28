@@ -23,7 +23,7 @@ import pandas as pd
 import tmu_parser_compat as compat
 import smart_tabular_v75 as smart
 
-PARSER_BUILD_ID = "v88-history-time-and-zip-media-status-20260628"
+PARSER_BUILD_ID = "v89-zip-ocr-pandas3-context-link-fix-20260628"
 
 COLUMN_LABELS: Dict[str, str] = dict(getattr(compat, "COLUMN_LABELS", {}))
 COLUMN_LABELS.update(smart.FIELD_LABELS)
@@ -825,21 +825,63 @@ def assign_test_ids(
     return out.drop(columns=["__segment_key"], errors="ignore")
 
 
+_OCR_LINK_TEXT_COLUMNS = (
+    "well", "test_id", "source_type", "link_status",
+    "suggested_well", "suggested_test_id", "suggested_link_reason",
+)
+
+
+def _ensure_assignable_ocr_link_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Prepare mixed OCR-link metadata for pandas 3 / Arrow-backed frames.
+
+    pandas 3 no longer silently upcasts a numeric or Arrow column when a string
+    is assigned. ZIP ingestion can create all-null suggestion columns that are
+    inferred as float/Arrow dtypes, so they must be made explicitly object-like
+    before row-level context linking.
+    """
+    out = df.copy()
+    for col in _OCR_LINK_TEXT_COLUMNS:
+        if col not in out.columns:
+            out[col] = pd.Series([None] * len(out), index=out.index, dtype="object")
+        else:
+            out[col] = out[col].astype("object")
+    if "test_sequence" not in out.columns:
+        out["test_sequence"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
+    else:
+        out["test_sequence"] = pd.to_numeric(out["test_sequence"], errors="coerce").astype("Int64")
+    return out
+
+
+def _plain_context_text(value: object) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace").strip()
+    return str(value).strip()
+
+
 def auto_link_ocr_rows_by_time_context(df: pd.DataFrame, max_gap_hours: float = 3.0) -> pd.DataFrame:
     """Safely inherit well/test context for timestamped OCR rows.
 
     A link is made only when all nearby non-OCR readings belong to one unique
     test ID. OCR measurements remain review-required; only context is inherited.
+    Text/status columns are explicitly object dtype so pandas 3 cannot fail when
+    ZIP OCR rows are linked to a spreadsheet or WhatsApp text context.
     """
     if df is None or df.empty or "datetime" not in df.columns or "source_type" not in df.columns:
         return df
-    out = df.copy()
+    out = _ensure_assignable_ocr_link_columns(df)
     out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
     ocr_mask = out["source_type"].astype(str).str.contains("ocr", case=False, na=False)
     if not ocr_mask.any():
         return out
-    well_text = out.get("well", pd.Series("Unknown", index=out.index)).fillna("Unknown").astype(str).str.strip()
-    test_text = out.get("test_id", pd.Series("", index=out.index)).fillna("").astype(str).str.strip()
+    well_text = out["well"].fillna("Unknown").astype(str).str.strip()
+    test_text = out["test_id"].fillna("").astype(str).str.strip()
     anchors = out[
         (~ocr_mask)
         & out["datetime"].notna()
@@ -856,12 +898,18 @@ def auto_link_ocr_rows_by_time_context(df: pd.DataFrame, max_gap_hours: float = 
             continue
         nearest_idx = deltas.loc[nearby.index].idxmin()
         anchor = anchors.loc[nearest_idx]
-        for col in ["well", "test_id", "test_sequence"]:
-            if col in anchor.index and pd.notna(anchor[col]):
-                out.at[idx, col] = anchor[col]
+        anchor_well = _plain_context_text(anchor.get("well", ""))
+        anchor_test_id = _plain_context_text(anchor.get("test_id", ""))
+        if anchor_well:
+            out.at[idx, "well"] = anchor_well
+            out.at[idx, "suggested_well"] = anchor_well
+        if anchor_test_id:
+            out.at[idx, "test_id"] = anchor_test_id
+            out.at[idx, "suggested_test_id"] = anchor_test_id
+        seq = pd.to_numeric(pd.Series([anchor.get("test_sequence", pd.NA)]), errors="coerce").iloc[0]
+        if pd.notna(seq):
+            out.at[idx, "test_sequence"] = int(seq)
         out.at[idx, "link_status"] = "ocr_auto_linked_by_timestamp"
-        out.at[idx, "suggested_well"] = anchor.get("well", "")
-        out.at[idx, "suggested_test_id"] = anchor.get("test_id", "")
         gap_minutes = float(deltas.loc[nearest_idx].total_seconds() / 60.0)
         out.at[idx, "suggested_link_reason"] = f"Unique nearby test reading ({gap_minutes:.1f} min)"
     return out

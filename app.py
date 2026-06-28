@@ -370,7 +370,7 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_UI_BUILD_ID = "v88-history-time-and-zip-media-status-20260628"
+APP_UI_BUILD_ID = "v90-multiwell-history-axis-performance-fix-20260628"
 print(f"Starting Production Test Dashboard: {APP_UI_BUILD_ID} | parser={PARSER_BUILD_ID}")
 
 UI_THEME_PRESETS = {
@@ -573,8 +573,8 @@ def optimize_interactive_plot_frame(
     frame: pd.DataFrame,
     features: list[str],
     *,
-    max_total_points: int = 12000,
-    max_points_per_group: int = 3000,
+    max_total_points: int = 8000,
+    max_points_per_group: int = 2000,
 ) -> tuple[pd.DataFrame, bool]:
     """Reduce only the browser chart payload while preserving full source data.
 
@@ -850,8 +850,26 @@ def feature_key_text(feature_name):
     return re.sub(r"[^A-Za-z0-9_]+", "_", str(feature_name))
 
 
-def compressed_axis_tick_kwargs(df, max_ticks_per_series=4, max_total_ticks=22):
-    """Build readable x-axis labels for the global compressed timeline."""
+def _compressed_scale_delta(scale):
+    return {
+        "30 minutes": pd.Timedelta(minutes=30),
+        "1 hour": pd.Timedelta(hours=1),
+        "3 hours": pd.Timedelta(hours=3),
+        "6 hours": pd.Timedelta(hours=6),
+        "12 hours": pd.Timedelta(hours=12),
+        "1 day": pd.Timedelta(days=1),
+        "1 month": pd.Timedelta(days=30),
+        "1 year": pd.Timedelta(days=365),
+    }.get(str(scale or ""))
+
+
+def compressed_axis_tick_kwargs(df, scale="Auto readable", max_ticks_per_series=4, max_total_ticks=22):
+    """Build readable ticks for a compressed real-date timeline.
+
+    The selected tick scale changes which real dates are considered. Labels are
+    then pruned by their visual compressed positions to prevent overlap when
+    wells have widely separated calendar periods.
+    """
     if df.empty or "plot_x" not in df.columns or "datetime" not in df.columns:
         return {}
 
@@ -860,34 +878,71 @@ def compressed_axis_tick_kwargs(df, max_ticks_per_series=4, max_total_ticks=22):
         return {}
     pts["plot_x"] = pd.to_numeric(pts["plot_x"], errors="coerce")
     pts["datetime"] = pd.to_datetime(pts["datetime"], errors="coerce")
-    pts = pts.dropna().drop_duplicates(subset=["plot_x"]).sort_values("plot_x").reset_index(drop=True)
+    pts = pts.dropna().sort_values(["datetime", "plot_x"], kind="stable")
+    pts = pts.drop_duplicates(subset=["plot_x"], keep="first").reset_index(drop=True)
     if pts.empty:
         return {}
 
     max_total_ticks = max(3, int(max_total_ticks or 10))
+    delta = _compressed_scale_delta(scale)
     n = len(pts)
-    if n <= max_total_ticks:
-        idxs = list(range(n))
-    else:
-        idxs = sorted(set(np.linspace(0, n - 1, max_total_ticks).round().astype(int).tolist()))
 
-    # Include year only when the displayed data spans more than one year.
-    # This keeps normal short tests clean, but prevents 2014 vs 2026 comparisons
-    # from looking like the same month/day.
-    years = pts["datetime"].dt.year.dropna().unique()
-    show_year = len(years) > 1 or (pts["datetime"].max() - pts["datetime"].min()).days >= 330
-
-    tickvals = []
-    ticktext = []
-    for i in idxs:
-        dt = pd.Timestamp(pts.loc[i, "datetime"])
-        tickvals.append(float(pts.loc[i, "plot_x"]))
-        if show_year:
-            ticktext.append(dt.strftime("%d-%b-%Y<br>%H:%M"))
+    if delta is None:
+        if n <= max_total_ticks:
+            candidate_idxs = list(range(n))
         else:
-            ticktext.append(dt.strftime("%d-%b<br>%H:%M"))
+            candidate_idxs = sorted(set(np.linspace(0, n - 1, max_total_ticks).round().astype(int).tolist()))
+    else:
+        candidate_idxs = [0]
+        last_dt = pd.Timestamp(pts.loc[0, "datetime"])
+        for i in range(1, max(n - 1, 1)):
+            dt = pd.Timestamp(pts.loc[i, "datetime"])
+            if dt - last_dt >= delta:
+                candidate_idxs.append(i)
+                last_dt = dt
+        if n > 1:
+            candidate_idxs.append(n - 1)
+        candidate_idxs = sorted(set(candidate_idxs))
+        if len(candidate_idxs) > max_total_ticks:
+            pick = np.linspace(0, len(candidate_idxs) - 1, max_total_ticks).round().astype(int)
+            candidate_idxs = sorted(set(candidate_idxs[int(i)] for i in pick))
 
-    return {"tickmode": "array", "tickvals": tickvals, "ticktext": ticktext, "tickangle": 0}
+    x_min = float(pts["plot_x"].min())
+    x_max = float(pts["plot_x"].max())
+    x_span = max(x_max - x_min, 0.0)
+    min_visual_gap = x_span / max(max_total_ticks - 1, 1) * 0.62 if x_span > 0 else 0.0
+    pruned = []
+    for idx in candidate_idxs:
+        x = float(pts.loc[idx, "plot_x"])
+        if not pruned or x - float(pts.loc[pruned[-1], "plot_x"]) >= min_visual_gap:
+            pruned.append(idx)
+    if n > 1 and (not pruned or pruned[-1] != n - 1):
+        if len(pruned) > 1 and x_max - float(pts.loc[pruned[-1], "plot_x"]) < min_visual_gap * 0.65:
+            pruned[-1] = n - 1
+        else:
+            pruned.append(n - 1)
+    candidate_idxs = sorted(set(pruned or [0]))
+
+    span = pd.Timestamp(pts["datetime"].max()) - pd.Timestamp(pts["datetime"].min())
+    selected_dts = [pd.Timestamp(pts.loc[i, "datetime"]) for i in candidate_idxs]
+    duplicate_days = len({dt.date() for dt in selected_dts}) < len(selected_dts)
+    if delta is not None and delta < pd.Timedelta(days=1):
+        fmt = "%d-%b-%Y<br>%H:%M"
+    elif str(scale) == "1 day":
+        fmt = "%d-%b-%Y"
+    elif str(scale) in {"1 month", "1 year"}:
+        fmt = "%b-%Y"
+    elif duplicate_days:
+        fmt = "%d-%b-%Y<br>%H:%M"
+    elif span <= pd.Timedelta(days=730):
+        fmt = "%d-%b-%Y"
+    else:
+        fmt = "%b-%Y"
+
+    tickvals = [float(pts.loc[i, "plot_x"]) for i in candidate_idxs]
+    ticktext = [dt.strftime(fmt.replace("<br>", "\n")).replace("\n", "<br>") for dt in selected_dts]
+    angle = -35 if len(tickvals) >= 6 or "<br>" in fmt else 0
+    return {"tickmode": "array", "tickvals": tickvals, "ticktext": ticktext, "tickangle": angle}
 
 
 def elapsed_axis_tick_kwargs(df, max_ticks=10):
@@ -2273,7 +2328,25 @@ def _auto_link_ocr_rows_by_time_context(df: pd.DataFrame, max_gap_hours: float =
     """
     parser_linker = getattr(_tmu_parser, "auto_link_ocr_rows_by_time_context", None)
     if parser_linker is not None:
-        return parser_linker(df, max_gap_hours=max_gap_hours)
+        # pandas 3 uses strict assignment rules for Arrow/numeric columns. ZIP
+        # concatenation can infer all-null OCR suggestion columns as non-text,
+        # so normalize them before calling the parser-level linker.
+        safe_df = df.copy()
+        for _col in (
+            "well", "test_id", "source_type", "link_status",
+            "suggested_well", "suggested_test_id", "suggested_link_reason",
+        ):
+            if _col not in safe_df.columns:
+                safe_df[_col] = pd.Series([None] * len(safe_df), index=safe_df.index, dtype="object")
+            else:
+                safe_df[_col] = safe_df[_col].astype("object")
+        try:
+            return parser_linker(safe_df, max_gap_hours=max_gap_hours)
+        except (TypeError, ValueError) as link_error:
+            # Never terminate the full app because optional OCR context linking
+            # failed. The OCR rows remain available for manual review/linking.
+            safe_df.attrs["ocr_context_link_warning"] = str(link_error)
+            return safe_df
     if df is None or df.empty or "datetime" not in df.columns or "source_type" not in df.columns:
         return df
     out = df.copy()
@@ -2319,6 +2392,12 @@ def _auto_link_ocr_rows_by_time_context(df: pd.DataFrame, max_gap_hours: float =
 
 
 data = _auto_link_ocr_rows_by_time_context(data, max_gap_hours=3.0)
+_ocr_link_warning = str(data.attrs.pop("ocr_context_link_warning", "") or "").strip()
+if _ocr_link_warning:
+    st.warning(
+        "Image OCR rows were loaded, but automatic well/test linking was skipped safely. "
+        "You can still review and link the OCR rows manually."
+    )
 
 # Parser-level quality review. Impossible physical values are excluded from
 # plotted canonical columns but retained in Rejected Values for audit.
@@ -2647,8 +2726,7 @@ def history_axis_tick_kwargs(df: pd.DataFrame, max_ticks: int = 9) -> dict:
         "tickmode": "array",
         "tickvals": tickvals,
         "ticktext": ticktext,
-        "tickangle": 0,
-        "showticklabels": True,
+        "tickangle": -25 if len(tickvals) >= 7 else 0,
     }
 
 
@@ -2692,6 +2770,23 @@ def well_title_text(value) -> str:
     if re.match(r"(?i)^well(?:\s|[-_:]|$)", label):
         return label
     return f"Well {label}"
+
+
+def automatic_chart_header(selected_wells, selected_tests=None) -> str:
+    """Build a title that follows the current well/test selection."""
+    tests = [str(x).strip() for x in (selected_tests or []) if str(x).strip()]
+    wells = [clean_well_label(x) for x in (selected_wells or []) if str(x).strip()]
+    if tests:
+        if len(tests) == 1:
+            return tests[0]
+        shown = " vs ".join(tests[:3])
+        return shown + (f" +{len(tests) - 3} more" if len(tests) > 3 else "")
+    if wells:
+        if len(wells) == 1:
+            return well_title_text(wells[0])
+        shown = " vs ".join(wells[:4])
+        return "Well comparison: " + shown + (f" +{len(wells) - 4} more" if len(wells) > 4 else "")
+    return "Well Production Test"
 
 
 def compressed_time_mapping(datetimes: pd.Series, continuous_gap_hours: float = 2.0, compressed_gap_hours: float = 0.75):
@@ -3364,28 +3459,26 @@ with st.sidebar.expander("5. Wells & Signals", expanded=True):
     st.session_state[select_all_prev_key] = bool(select_all_features)
 
 
-    if selected_tests:
-        if len(selected_tests) == 1:
-            auto_chart_header = selected_tests[0]
-        else:
-            auto_chart_header = " vs ".join(selected_tests[:3]) + (f" +{len(selected_tests) - 3} more" if len(selected_tests) > 3 else "")
-    elif selected_wells:
-        if len(selected_wells) == 1:
-            auto_chart_header = well_title_text(selected_wells[0])
-        else:
-            auto_chart_header = " vs ".join(selected_wells[:5]) + (f" +{len(selected_wells) - 5} more" if len(selected_wells) > 5 else "")
-    else:
-        auto_chart_header = "Well Production Test"
+    auto_chart_header = automatic_chart_header(selected_wells, selected_tests)
 
     data_title_signature = "_".join([str(x) for x in sorted(data.get("source", pd.Series(dtype=str)).dropna().astype(str).unique())[:3]])[:80]
-    chart_header_key = f"chart_header_{abs(hash(data_title_signature))}_{len(data)}"
-    if chart_header_key in st.session_state:
+    chart_header_key = f"chart_header_{hashlib.sha1(data_title_signature.encode('utf-8')).hexdigest()[:10]}_{len(data)}"
+    chart_header_selection_key = chart_header_key + "_selection"
+    selection_signature = json.dumps(
+        {"view": analysis_view, "wells": list(selected_wells), "tests": list(selected_tests)},
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    if st.session_state.get(chart_header_selection_key) != selection_signature:
+        st.session_state[chart_header_key] = auto_chart_header
+        st.session_state[chart_header_selection_key] = selection_signature
+    elif chart_header_key in st.session_state:
         old_header = str(st.session_state.get(chart_header_key, ""))
         st.session_state[chart_header_key] = re.sub(r"(?i)^well\s+well\s+", "Well ", old_header).strip()
     custom_chart_title = st.text_input(
         "Chart header / title",
         value=auto_chart_header,
-        help="Edit this header if you want a different title. The default uses selected well/test only.",
+        help="The title updates automatically when selected wells change. You can still edit it for the current selection.",
         key=chart_header_key,
     )
 
@@ -4023,8 +4116,11 @@ if selected_features and not filtered.empty:
             density_ticks = min(density_ticks, 7)
         elif chart_view_mode == "Wide report view":
             density_ticks = max(density_ticks, 14)
+        if series_count_for_hint > 1:
+            density_ticks = min(density_ticks, 8)
         axis_tick_settings = compressed_axis_tick_kwargs(
             filtered,
+            scale=x_axis_scale,
             max_ticks_per_series=3,
             max_total_ticks=density_ticks,
         )
@@ -4487,6 +4583,15 @@ if selected_features and not filtered.empty:
             sorted(df["well"].dropna().astype(str).unique()) if "well" in df.columns else ["All"]
         )
         line_mode = "lines+markers" if show_points else "lines"
+        hover_mode = "closest" if len(series_values) > 1 or len(df) > 3000 else "x unified"
+        plot_uirevision = hashlib.sha1(
+            f"{analysis_view}|{x_axis_mode}|{x_axis_scale}|{selection_signature}|{mode}".encode("utf-8")
+        ).hexdigest()[:12]
+
+        def merged_xaxis_kwargs(**overrides):
+            merged = dict(axis_tick_settings or {})
+            merged.update(overrides)
+            return merged
 
         if mode == "Overlay two features with secondary Y-axis":
             dual_features = [f for f in features if f in df.columns][:2]
@@ -4530,10 +4635,11 @@ if selected_features and not filtered.empty:
 
             fig.update_layout(
                 height=850 if chart_view_mode != "Mobile-friendly" else 680,
-                width=None if chart_view_mode == "Mobile-friendly" else 1700,
+                width=None,
                 title=dict(text=chart_title_from_data(df, custom_chart_title), font=dict(size=28, color=CHART_TEXT, family="Segoe UI Semibold, Arial, sans-serif")),
                 xaxis_title=x_axis_title,
-                hovermode="x unified",
+                hovermode=hover_mode,
+                uirevision=plot_uirevision,
                 margin=dict(l=85, r=90, t=185, b=80),
                 plot_bgcolor=CHART_PLOT_BG,
                 paper_bgcolor=CHART_PAPER_BG,
@@ -4542,7 +4648,7 @@ if selected_features and not filtered.empty:
                 title_x=0.5,
                 title_xanchor="center",
             )
-            fig.update_xaxes(showgrid=True, gridcolor=CHART_GRID, zeroline=False, tickfont=dict(size=14, color=CHART_TEXT), **axis_tick_settings)
+            fig.update_xaxes(**merged_xaxis_kwargs(showgrid=True, gridcolor=CHART_GRID, zeroline=False, tickfont=dict(size=14, color=CHART_TEXT)))
             fig.update_yaxes(
                 title_text=column_label(left_feature),
                 secondary_y=False,
@@ -4628,7 +4734,8 @@ if selected_features and not filtered.empty:
             layout_kwargs = dict(
                 height=max(620, panel_height * len(features)),
                 title=dict(text=chart_title_from_data(df, custom_chart_title), font=dict(size=26 if mobile_view else 30, color=CHART_TEXT, family="Segoe UI Semibold, Arial, sans-serif")),
-                hovermode="x unified",
+                hovermode=hover_mode,
+                uirevision=plot_uirevision,
                 margin=dict(l=85, r=50, t=185, b=80),
                 uniformtext_minsize=8,
                 uniformtext_mode="hide",
@@ -4645,8 +4752,6 @@ if selected_features and not filtered.empty:
                 title_x=0.5,
                 title_xanchor="center",
             )
-            if not mobile_view:
-                layout_kwargs["width"] = max(1400, min(3200 if wide_view else 2600, n_points * (52 if wide_view else 42)))
             if mobile_view and show_chart_legend:
                 layout_kwargs["legend"] = dict(
                     orientation="h",
@@ -4665,15 +4770,16 @@ if selected_features and not filtered.empty:
                 fig.update_xaxes(
                     row=r,
                     col=1,
-                    showgrid=True,
-                    gridcolor=CHART_GRID,
-                    zeroline=False,
-                    showticklabels=True,
-                    tickfont=dict(size=11 if chart_view_mode == "Mobile-friendly" else 15, color=CHART_TEXT),
-                    title_text=x_axis_title if r == len(features) else "",
-                    title_font=dict(size=16 if chart_view_mode == "Mobile-friendly" else 20, color=CHART_TEXT),
-                    automargin=True,
-                    **axis_tick_settings,
+                    **merged_xaxis_kwargs(
+                        showgrid=True,
+                        gridcolor=CHART_GRID,
+                        zeroline=False,
+                        showticklabels=True,
+                        tickfont=dict(size=11 if chart_view_mode == "Mobile-friendly" else 15, color=CHART_TEXT),
+                        title_text=x_axis_title if r == len(features) else "",
+                        title_font=dict(size=16 if chart_view_mode == "Mobile-friendly" else 20, color=CHART_TEXT),
+                        automargin=True,
+                    ),
                 )
                 fig.update_yaxes(
                     row=r,
@@ -4722,11 +4828,12 @@ if selected_features and not filtered.empty:
 
         fig.update_layout(
             height=850,
-            width=1700,
+            width=None,
             title=dict(text=chart_title_from_data(df, custom_chart_title), font=dict(size=30, color=CHART_TEXT, family="Segoe UI Semibold, Arial, sans-serif")),
             yaxis_title=y_title,
             xaxis_title=x_axis_title,
-            hovermode="x unified",
+            hovermode=hover_mode,
+                uirevision=plot_uirevision,
             margin=dict(l=85, r=50, t=185, b=80),
             plot_bgcolor=CHART_PLOT_BG,
             paper_bgcolor=CHART_PAPER_BG,
@@ -4740,14 +4847,13 @@ if selected_features and not filtered.empty:
             title_x=0.5,
             title_xanchor="center",
         )
-        fig.update_xaxes(
+        fig.update_xaxes(**merged_xaxis_kwargs(
             showgrid=True,
             gridcolor=CHART_GRID,
             zeroline=False,
             title_font=dict(size=20, color=CHART_TEXT),
             tickfont=dict(size=15, color=CHART_TEXT),
-            **axis_tick_settings,
-        )
+        ))
         fig.update_yaxes(
             showgrid=True,
             gridcolor=CHART_GRID_SOFT,
@@ -4784,6 +4890,16 @@ if selected_features and not filtered.empty:
         series_values = sorted(df["series_label"].dropna().astype(str).unique()) if "series_label" in df.columns else (
             sorted(df["well"].dropna().astype(str).unique()) if "well" in df.columns else ["All"]
         )
+        hover_mode = "closest" if len(series_values) > 1 or len(df) > 3000 else "x unified"
+        plot_uirevision = hashlib.sha1(
+            f"{analysis_view}|{x_axis_mode}|{x_axis_scale}|{selection_signature}|dual|{chart_name}".encode("utf-8")
+        ).hexdigest()[:12]
+
+        def merged_xaxis_kwargs(**overrides):
+            merged = dict(axis_tick_settings or {})
+            merged.update(overrides)
+            return merged
+
         fig = make_subplots(specs=[[{"secondary_y": True}]])
         line_mode = "lines+markers" if show_points else "lines"
         plot_items = [(f, False) for f in left_features] + [(f, True) for f in right_features]
@@ -4822,10 +4938,11 @@ if selected_features and not filtered.empty:
         suffix = f" - {chart_name}" if chart_name else ""
         fig.update_layout(
             height=820 if chart_view_mode != "Mobile-friendly" else 640,
-            width=None if chart_view_mode == "Mobile-friendly" else 1700,
+            width=None,
             title=dict(text=chart_title_from_data(df, custom_chart_title) + suffix, font=dict(size=26, color=CHART_TEXT, family="Segoe UI Semibold, Arial, sans-serif")),
             xaxis_title=x_axis_title,
-            hovermode="x unified",
+            hovermode=hover_mode,
+            uirevision=plot_uirevision,
             margin=dict(l=85, r=95, t=185, b=80),
             plot_bgcolor=CHART_PLOT_BG,
             paper_bgcolor=CHART_PAPER_BG,
@@ -4834,7 +4951,7 @@ if selected_features and not filtered.empty:
             title_x=0.5,
             title_xanchor="center",
         )
-        fig.update_xaxes(showgrid=True, gridcolor=CHART_GRID, zeroline=False, tickfont=dict(size=13, color=CHART_TEXT), **axis_tick_settings)
+        fig.update_xaxes(**merged_xaxis_kwargs(showgrid=True, gridcolor=CHART_GRID, zeroline=False, tickfont=dict(size=13, color=CHART_TEXT)))
         fig.update_yaxes(
             title_text=" / ".join(column_label(f) for f in left_features[:3]),
             secondary_y=False,
