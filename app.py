@@ -6,6 +6,8 @@ import zipfile
 import traceback
 import gc
 import hashlib
+import html
+import math
 from pathlib import Path
 from datetime import date, datetime, time
 from typing import Optional
@@ -379,7 +381,7 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_UI_BUILD_ID = "v92-custom-intervals-drag-signal-order-20260628"
+APP_UI_BUILD_ID = "v94-note-clearance-smart-y-axis-20260702"
 print(f"Starting Production Test Dashboard: {APP_UI_BUILD_ID} | parser={PARSER_BUILD_ID}")
 
 UI_THEME_PRESETS = {
@@ -575,6 +577,110 @@ def numeric_feature_series(frame: pd.DataFrame, feature: str, *, reset_index: bo
 
     result = result.replace([np.inf, -np.inf], np.nan)
     return result.reset_index(drop=True) if reset_index else result
+
+
+
+def _nice_axis_ceiling(value: float) -> float:
+    """Round a positive number up to a readable engineering axis limit."""
+    try:
+        value = float(value)
+    except Exception:
+        return 1.0
+    if not np.isfinite(value) or value <= 0:
+        return 1.0
+    exponent = math.floor(math.log10(value))
+    base = 10.0 ** exponent
+    fraction = value / base
+    for step in (1.0, 1.2, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0):
+        if fraction <= step + 1e-12:
+            return float(step * base)
+    return float(10.0 * base)
+
+
+def _nice_axis_floor(value: float) -> float:
+    """Round a negative number down to a readable engineering axis limit."""
+    try:
+        value = float(value)
+    except Exception:
+        return -1.0
+    if not np.isfinite(value) or value >= 0:
+        return 0.0
+    return -_nice_axis_ceiling(abs(value))
+
+
+def _is_full_percent_axis(feature: str) -> bool:
+    label = column_label(feature).lower()
+    return (
+        feature in {"bsw_pct", "wlr_s_pct", "water_cut_pct", "wc_pct", "choke_pct"}
+        or "water cut" in label
+        or "bs&w" in label
+        or ("choke" in label and "%" in label)
+    )
+
+
+def _is_full_choke_size_axis(feature: str) -> bool:
+    label = column_label(feature).lower()
+    return (
+        feature == "choke_size_64"
+        or ("choke" in label and ("/64" in label or "128" in label))
+    )
+
+
+def default_y_axis_range(frame: pd.DataFrame, feature: str) -> list[float] | None:
+    """Return a clear default Y range for one engineering signal.
+
+    Non-negative measurements start at zero and end at a rounded value above
+    the detected maximum.  Signed measurements keep their negative portion so
+    physically meaningful values such as reverse reel speed are not hidden.
+    """
+    if frame is None or feature not in getattr(frame, "columns", []):
+        return None
+    if _is_full_percent_axis(feature):
+        return [0.0, 100.0]
+    if _is_full_choke_size_axis(feature):
+        return [0.0, 128.0]
+
+    vals = numeric_feature_series(frame, feature).dropna()
+    vals = vals[np.isfinite(vals)]
+    if vals.empty:
+        return None
+    ymin = float(vals.min())
+    ymax = float(vals.max())
+
+    if ymax <= 0:
+        return [_nice_axis_floor(ymin * 1.08), 0.0]
+    upper = _nice_axis_ceiling(ymax * 1.08)
+    if ymin < 0:
+        lower = _nice_axis_floor(ymin * 1.08)
+    else:
+        lower = 0.0
+    if upper <= lower:
+        upper = lower + max(abs(lower) * 0.1, 1.0)
+    return [float(lower), float(upper)]
+
+
+def combined_default_y_axis_range(frame: pd.DataFrame, features: list[str]) -> list[float] | None:
+    """Return one readable range for a combined axis containing several signals."""
+    features = [f for f in features if f in getattr(frame, "columns", [])]
+    if not features:
+        return None
+    if len(features) == 1:
+        return default_y_axis_range(frame, features[0])
+    pieces = [numeric_feature_series(frame, f).dropna() for f in features]
+    pieces = [s for s in pieces if not s.empty]
+    if not pieces:
+        return None
+    vals = pd.concat(pieces, ignore_index=True)
+    vals = vals[np.isfinite(vals)]
+    if vals.empty:
+        return None
+    ymin = float(vals.min())
+    ymax = float(vals.max())
+    lower = _nice_axis_floor(ymin * 1.08) if ymin < 0 else 0.0
+    upper = _nice_axis_ceiling(max(ymax, 0.0) * 1.08) if ymax > 0 else 0.0
+    if upper <= lower:
+        upper = lower + 1.0
+    return [float(lower), float(upper)]
 
 
 
@@ -1095,14 +1201,56 @@ st.markdown(
     [data-testid="stAppViewContainer"],
     [data-testid="stSidebarContent"],
     [data-testid="stSidebarUserContent"] {{ scrollbar-gutter: stable; }}
-    section[data-testid="stSidebar"] [data-testid="stSidebarContent"] {{ overflow-y: scroll !important; }}
-    *::-webkit-scrollbar {{ width: 13px; height: 13px; }}
+
+    /* Keep exactly one real scrolling surface in the sidebar.  Older builds
+       placed overflow rules on several nested elements, so the visible thumb
+       could move without the controls moving. */
+    section[data-testid="stSidebar"] {{
+        overflow: hidden !important;
+        overscroll-behavior: contain;
+    }}
+    section[data-testid="stSidebar"] > div:first-child {{
+        height: 100vh !important;
+        max-height: 100vh !important;
+        overflow: hidden !important;
+    }}
+    section[data-testid="stSidebar"] [data-testid="stSidebarContent"] {{
+        height: 100vh !important;
+        max-height: 100vh !important;
+        overflow-x: hidden !important;
+        overflow-y: auto !important;
+        overscroll-behavior-y: contain;
+        scroll-behavior: smooth;
+        touch-action: pan-y;
+        pointer-events: auto !important;
+        scrollbar-gutter: stable both-edges;
+        padding-bottom: 5rem !important;
+    }}
+    section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {{
+        overflow: visible !important;
+        min-height: max-content !important;
+        padding-bottom: 3rem !important;
+    }}
+    section[data-testid="stSidebar"] [data-testid="stSidebarContent"]:hover {{
+        scrollbar-color: var(--petro-scroll-thumb-hover) var(--petro-scroll-track);
+    }}
+    section[data-testid="stSidebar"] [data-testid="stSidebarContent"]::-webkit-scrollbar {{
+        width: 18px;
+    }}
+    section[data-testid="stSidebar"] [data-testid="stSidebarContent"]::-webkit-scrollbar-thumb {{
+        min-height: 96px;
+        cursor: grab;
+    }}
+    section[data-testid="stSidebar"] [data-testid="stSidebarContent"]::-webkit-scrollbar-thumb:active {{
+        cursor: grabbing;
+    }}
+    *::-webkit-scrollbar {{ width: 16px; height: 14px; }}
     *::-webkit-scrollbar-track {{
         background: var(--petro-scroll-track);
         border-radius: 999px;
     }}
     *::-webkit-scrollbar-thumb {{
-        min-height: 42px;
+        min-height: 72px;
         background: var(--petro-scroll-thumb);
         border: 3px solid var(--petro-scroll-track);
         border-radius: 999px;
@@ -1989,19 +2137,20 @@ with st.sidebar:
     )
 
 with st.sidebar.expander("1. Data Sources", expanded=True):
+    _uploader_generation_v93 = int(st.session_state.get("uploader_generation_v93", 0) or 0)
     uploaded_files = st.file_uploader(
         "Upload test files, reports, device exports, or chat export ZIPs",
         type=["xlsx", "xls", "csv", "txt", "docx", "pdf", "zip", "jpg", "jpeg", "png", "webp"],
         accept_multiple_files=True,
         help="Upload normal test files or a chat export ZIP. Directly uploaded images are OCR-processed automatically; the OCR switch controls images inside ZIP files.",
-        key="general_data_uploader_v70",
+        key=f"general_data_uploader_v93_{_uploader_generation_v93}",
     )
     uploaded_ocr_images = st.file_uploader(
         "Upload CTU/HMI photos",
         type=["jpg", "jpeg", "png", "webp"],
         accept_multiple_files=True,
         help="Use this dedicated uploader for field photos like the CTU ALL DATA screens. The display is rectified, OCR values are extracted, and every field remains editable in the OCR Review before plotting.",
-        key="direct_ctu_image_uploader_v70",
+        key=f"direct_ctu_image_uploader_v93_{_uploader_generation_v93}",
     )
     # Combine and deduplicate general files and dedicated OCR images.
     _combined_uploads = list(uploaded_files or []) + list(uploaded_ocr_images or [])
@@ -2043,6 +2192,27 @@ Pumping P= 849 Psi""",
     )
 
 with st.sidebar.expander("2. Processing", expanded=False):
+    continue_current_test = st.checkbox(
+        "Continue current test with new uploads",
+        value=True,
+        key="continue_current_test_v93",
+        help=(
+            "When a later file belongs to the same well/test, the app appends it to the current analysis, "
+            "removes overlapping duplicate timestamps, and keeps your selected signals and chart settings."
+        ),
+    )
+    if st.button("Start a new analysis", key="start_new_analysis_v93", use_container_width=True):
+        for _key in (
+            "continued_test_data_v93", "continued_upload_signatures_v93", "continued_batch_v93",
+            "upload_parse_key_v83", "upload_parse_bundle_v83", "combined_data_key_v83", "combined_data_bundle_v83",
+            "manual_events_table", "operation_intervals_table",
+        ):
+            st.session_state.pop(_key, None)
+        st.session_state["uploader_generation_v93"] = _uploader_generation_v93 + 1
+        _clear_heavy_session_state_v83(include_uploads=True)
+        gc.collect()
+        st.rerun()
+
     test_gap_hours = st.number_input(
         "New test after inactive gap (hours)",
         min_value=1.0,
@@ -2164,6 +2334,7 @@ def _uploaded_file_identity_v58(uploaded_file):
 upload_key = None
 if uploaded_files:
     upload_key = (
+        APP_UI_BUILD_ID,
         PARSER_BUILD_ID,
         bool(enable_ctu_ocr),
         int(max_ocr_images),
@@ -2292,34 +2463,134 @@ for _zip_status in zip_media_summaries:
 if errors:
     st.warning("Some files/messages were skipped or could not be parsed:\n\n" + "\n".join(f"- {e}" for e in errors))
 
+def _continuation_compatible_v93(previous: pd.DataFrame, incoming: pd.DataFrame) -> bool:
+    """Return True when a new upload can safely extend the current analysis."""
+    if previous is None or incoming is None or previous.empty or incoming.empty:
+        return False
+
+    def _known_wells(frame):
+        if "well" not in frame.columns:
+            return set()
+        values = frame["well"].dropna().astype(str).str.strip()
+        return {
+            value.casefold() for value in values
+            if value and value.casefold() not in {"unknown", "nan", "none", "unlinked"}
+        }
+
+    previous_wells = _known_wells(previous)
+    incoming_wells = _known_wells(incoming)
+    if previous_wells & incoming_wells:
+        return True
+
+    # A direct/ZIP OCR continuation can initially have an Unknown well.  Keep it
+    # with the current data only when its timestamp is close enough to be linked
+    # to the existing test context.
+    incoming_is_ocr = False
+    if "source_type" in incoming.columns:
+        incoming_is_ocr = incoming["source_type"].astype(str).str.contains("ocr", case=False, na=False).any()
+    if incoming_is_ocr and "datetime" in previous.columns and "datetime" in incoming.columns:
+        prev_dt = pd.to_datetime(previous["datetime"], errors="coerce").dropna()
+        inc_dt = pd.to_datetime(incoming["datetime"], errors="coerce").dropna()
+        if not prev_dt.empty and not inc_dt.empty:
+            nearest_gap = min(abs(inc_dt.min() - prev_dt.max()), abs(inc_dt.max() - prev_dt.min()))
+            if nearest_gap <= pd.Timedelta(hours=36):
+                return True
+    return False
+
+
+_saved_continuation_v93 = st.session_state.get("continued_test_data_v93")
+_using_saved_continuation_v93 = False
+
 if not frames:
-    st.info("Start by uploading field files or pasting one or more field-test messages in Data Sources.")
-    st.stop()
+    if (
+        continue_current_test
+        and isinstance(_saved_continuation_v93, pd.DataFrame)
+        and not _saved_continuation_v93.empty
+    ):
+        # Removing/replacing the uploader must not erase a test that the user is
+        # continuing in the same browser session.  The saved table is already
+        # parsed, so chart-option changes remain fast and require no re-reading.
+        data = _saved_continuation_v93.copy(deep=False)
+        rows_merged = 0
+        _using_saved_continuation_v93 = True
+        st.info("Current test retained. Upload the next file to continue the same analysis, or choose Start a new analysis.")
+    else:
+        st.info("Start by uploading field files or pasting one or more field-test messages in Data Sources.")
+        st.stop()
 
-# Keep one merged result for fast control changes. The session state stores the
-# same DataFrame object instead of a deep duplicate, reducing peak memory.
-_whatsapp_key = hashlib.sha1(whatsapp_text.encode("utf-8", errors="ignore")).hexdigest() if whatsapp_text.strip() else ""
-_combined_key = (PARSER_BUILD_ID, upload_key, _whatsapp_key)
-_combined_cached = st.session_state.get("combined_data_bundle_v83")
-_combined_cached_key = st.session_state.get("combined_data_key_v83")
+if not _using_saved_continuation_v93:
+    # Keep one merged result for fast control changes. The session state stores
+    # the same DataFrame object instead of a deep duplicate, reducing peak memory.
+    _whatsapp_key = hashlib.sha1(whatsapp_text.encode("utf-8", errors="ignore")).hexdigest() if whatsapp_text.strip() else ""
+    _combined_key = (APP_UI_BUILD_ID, PARSER_BUILD_ID, upload_key, _whatsapp_key)
+    _combined_cached = st.session_state.get("combined_data_bundle_v83")
+    _combined_cached_key = st.session_state.get("combined_data_key_v83")
 
-if _combined_cached is not None and _combined_cached_key == _combined_key:
-    data = _combined_cached["data"].copy(deep=False)
-    rows_merged = int(_combined_cached.get("rows_merged", 0))
-else:
-    data = pd.concat(frames, ignore_index=True, sort=False, copy=False)
-    rows_before_dedup = len(data)
-    try:
-        if hasattr(_tmu_parser, "merge_duplicate_test_rows_v53"):
-            data = _tmu_parser.merge_duplicate_test_rows_v53(data)
-    except Exception as dedup_error:
-        errors.append(f"Duplicate-row merge was skipped: {dedup_error}")
-    rows_merged = max(0, rows_before_dedup - len(data))
-    st.session_state["combined_data_key_v83"] = _combined_key
-    st.session_state["combined_data_bundle_v83"] = {
-        "data": data.copy(deep=False),
-        "rows_merged": int(rows_merged),
-    }
+    if _combined_cached is not None and _combined_cached_key == _combined_key:
+        current_upload_data_v93 = _combined_cached["data"].copy(deep=False)
+        rows_merged = int(_combined_cached.get("rows_merged", 0))
+    else:
+        current_upload_data_v93 = pd.concat(frames, ignore_index=True, sort=False, copy=False)
+        rows_before_dedup = len(current_upload_data_v93)
+        try:
+            if hasattr(_tmu_parser, "merge_duplicate_test_rows_v53"):
+                current_upload_data_v93 = _tmu_parser.merge_duplicate_test_rows_v53(current_upload_data_v93)
+        except Exception as dedup_error:
+            errors.append(f"Duplicate-row merge was skipped: {dedup_error}")
+        rows_merged = max(0, rows_before_dedup - len(current_upload_data_v93))
+        st.session_state["combined_data_key_v83"] = _combined_key
+        st.session_state["combined_data_bundle_v83"] = {
+            "data": current_upload_data_v93.copy(deep=False),
+            "rows_merged": int(rows_merged),
+        }
+
+    if continue_current_test:
+        signature_text = repr((APP_UI_BUILD_ID, PARSER_BUILD_ID, upload_key, _whatsapp_key))
+        continuation_signature = hashlib.sha1(signature_text.encode("utf-8", errors="ignore")).hexdigest()
+        seen_signatures = set(st.session_state.get("continued_upload_signatures_v93", []))
+        previous = st.session_state.get("continued_test_data_v93")
+
+        if continuation_signature not in seen_signatures:
+            batch_no = int(st.session_state.get("continued_batch_v93", 0) or 0) + 1
+            incoming = current_upload_data_v93.copy()
+            incoming["_continuation_batch"] = batch_no
+            if isinstance(previous, pd.DataFrame) and not previous.empty and _continuation_compatible_v93(previous, incoming):
+                previous = previous.copy()
+                if "_continuation_batch" not in previous.columns:
+                    previous["_continuation_batch"] = max(0, batch_no - 1)
+                data = pd.concat([previous, incoming], ignore_index=True, sort=False, copy=False)
+                previous_rows = len(previous)
+            else:
+                data = incoming
+                previous_rows = 0
+                if isinstance(previous, pd.DataFrame) and not previous.empty:
+                    # Different well/context uploaded after replacing the prior
+                    # file: start fresh automatically while keeping UI choices.
+                    seen_signatures.clear()
+                    batch_no = 1
+                    data["_continuation_batch"] = batch_no
+                    st.info("A different well/test context was detected, so the data view started a new analysis automatically.")
+
+            seen_signatures.add(continuation_signature)
+            st.session_state["continued_upload_signatures_v93"] = list(seen_signatures)[-100:]
+            st.session_state["continued_batch_v93"] = batch_no
+            st.session_state["continued_test_data_v93"] = data.copy(deep=False)
+            if previous_rows:
+                st.success(
+                    f"Continued the current analysis: loaded the new file(s) while retaining {previous_rows:,} earlier row(s). "
+                    "Overlapping timestamps will be merged automatically."
+                )
+        else:
+            if isinstance(previous, pd.DataFrame) and not previous.empty:
+                data = previous.copy(deep=False)
+            else:
+                data = current_upload_data_v93.copy(deep=False)
+    else:
+        # Turning continuation off returns to the normal uploader-only behavior.
+        data = current_upload_data_v93.copy(deep=False)
+        st.session_state.pop("continued_test_data_v93", None)
+        st.session_state.pop("continued_upload_signatures_v93", None)
+        st.session_state.pop("continued_batch_v93", None)
 
 
 if rows_merged:
@@ -2459,6 +2730,41 @@ if _quality_mask.any():
 # created later, after the safe parsing/mapping steps, so changing the display
 # unit never changes the original uploaded values.
 
+def _merge_continuation_duplicate_rows_v93(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Merge overlapping continuation files after test IDs are rebuilt.
+
+    A later export often repeats the final rows of the earlier export.  Newer
+    upload batches take priority, while missing cells are filled from the older
+    copy and notes/audit text are preserved.  The operation runs only when the
+    continuation feature is active, so normal uploads keep the existing fast
+    path.
+    """
+    if df is None or df.empty or "_continuation_batch" not in df.columns or "datetime" not in df.columns:
+        return df, 0
+    out = df.copy()
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+    keys = [c for c in ("well", "datetime", "test_id") if c in out.columns]
+    if len(keys) < 2:
+        return out, 0
+    out["_continuation_batch"] = pd.to_numeric(out["_continuation_batch"], errors="coerce").fillna(0)
+    out = out.sort_values(["_continuation_batch"], ascending=False, kind="stable")
+    text_merge_cols = {"note", "data_quality_note", "rejected_values", "suggested_link_reason"}
+    rows = []
+    for _, group in out.groupby(keys, dropna=False, sort=False):
+        row = group.iloc[0].copy()
+        for col in out.columns:
+            values = group[col].dropna()
+            if col in text_merge_cols:
+                clean = [str(v).strip() for v in values if str(v).strip() and str(v).strip().casefold() != "nan"]
+                row[col] = "; ".join(dict.fromkeys(clean))
+            elif len(values):
+                # Group is newest-first, therefore the first real value wins.
+                row[col] = values.iloc[0]
+        rows.append(row)
+    merged = pd.DataFrame(rows).reset_index(drop=True)
+    return merged, max(0, len(out) - len(merged))
+
+
 # One clear rule only: a new test starts after the user-selected inactive gap.
 # Existing parser IDs are rebuilt so spreadsheet, message and OCR readings use
 # the same rule and nearby image readings remain connected.
@@ -2471,6 +2777,14 @@ try:
     )
 except TypeError:
     data = assign_test_ids(data, gap_hours=float(test_gap_hours))
+
+_continuation_rows_merged_v93 = 0
+if continue_current_test and "_continuation_batch" in data.columns:
+    data, _continuation_rows_merged_v93 = _merge_continuation_duplicate_rows_v93(data)
+    if _continuation_rows_merged_v93:
+        st.caption(
+            f"Merged {_continuation_rows_merged_v93:,} overlapping row(s) from the continued test, keeping the newest values."
+        )
 
 if "datetime" in data.columns:
     data["datetime"] = pd.to_datetime(data["datetime"], errors="coerce")
@@ -2491,6 +2805,15 @@ try:
     data = normalize_ctu_ocr_signals(data)
 except Exception:
     pass
+
+# Save the merged/re-segmented table for the next continuation upload.  This is
+# one shallow session copy, not a second parser cache, so chart interactions stay
+# responsive and the selected signals/options remain untouched.
+if continue_current_test:
+    data.drop(columns=["_continuation_batch"], inplace=True, errors="ignore")
+    st.session_state["continued_test_data_v93"] = data.copy(deep=False)
+else:
+    data.drop(columns=["_continuation_batch"], inplace=True, errors="ignore")
 
 ocr_mask = data.get("source_type", pd.Series([], dtype=str)).astype(str).str.contains("ocr", case=False, na=False) if "source_type" in data.columns else pd.Series([False] * len(data), index=data.index)
 if ocr_mask.any():
@@ -2626,6 +2949,11 @@ if ocr_mask.any():
                 f"{int(unapproved.sum())} OCR row(s) still require review. They remain visible for editing "
                 "but are excluded from charts until approved."
             )
+
+        # Preserve manual OCR corrections/approvals when the next continuation
+        # file is added in the same session.
+        if continue_current_test:
+            st.session_state["continued_test_data_v93"] = data.copy(deep=False)
 
 
 
@@ -3755,10 +4083,8 @@ with st.sidebar.expander("6. Chart Options", expanded=False):
                         if feature in history_scale_preview.columns
                         else pd.Series(dtype="float64")
                     )
-                    default_min = float(vals.min()) if not vals.empty else 0.0
-                    default_max = float(vals.max()) if not vals.empty else 1.0
-                    if default_min == default_max:
-                        default_max = default_min + 1.0
+                    auto_range = default_y_axis_range(history_scale_preview, feature) or [0.0, 1.0]
+                    default_min, default_max = float(auto_range[0]), float(auto_range[1])
                     st.markdown(f"**{column_label(feature)}**")
                     cy1, cy2 = st.columns(2)
                     with cy1:
@@ -3819,10 +4145,8 @@ with st.sidebar.expander("6. Chart Options", expanded=False):
             if use_custom_y_scale and selected_features:
                 for feature in selected_features:
                     vals = numeric_feature_series(data, feature).dropna() if feature in data.columns else pd.Series(dtype="float64")
-                    default_min = float(vals.min()) if not vals.empty else 0.0
-                    default_max = float(vals.max()) if not vals.empty else 1.0
-                    if default_min == default_max:
-                        default_max = default_min + 1.0
+                    auto_range = default_y_axis_range(data, feature) or [0.0, 1.0]
+                    default_min, default_max = float(auto_range[0]), float(auto_range[1])
 
                     st.markdown(f"**{column_label(feature)}**")
                     cy1, cy2 = st.columns(2)
@@ -4008,11 +4332,14 @@ with st.sidebar.expander("7. Events & Notes", expanded=False):
         help="Used only when auto-hide is enabled.",
     )
 
+    if st.session_state.get("event_label_layout") == "Vertical labels":
+        st.session_state["event_label_layout"] = "Auto staggered"
     event_label_style = st.selectbox(
         "Event label layout",
-        ["Auto staggered", "Vertical labels", "Compact top labels"],
+        ["Auto staggered", "Compact top labels"],
         index=0,
-        help="Use Vertical labels or Compact top labels when many notes are close together.",
+        help="Comments stay in a dedicated band above the chart so they cannot cover data values.",
+        key="event_label_layout",
     )
     enable_drag_annotations = st.checkbox(
         "Allow dragging event labels on the interactive chart",
@@ -4426,43 +4753,91 @@ if selected_features and not filtered.empty:
     def total_note_count():
         return len(plot_intervals or []) + len(plot_events or [])
 
-    def note_event_levels(events, x_values=None, max_levels=8):
-        """Assign staggered rows for point-event labels so close labels do not overlap.
+    def _note_x_number(value):
+        """Convert numeric/datetime plot positions to one collision-layout scale."""
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return np.nan
+        try:
+            ts = pd.Timestamp(value)
+            if not pd.isna(ts) and not isinstance(value, (int, float, np.integer, np.floating)):
+                return float(ts.value) / 1_000_000_000.0
+        except Exception:
+            pass
+        try:
+            return float(value)
+        except Exception:
+            return np.nan
 
-        Users can override the automatic row using the point-note table Y level.
+    def compact_note_label(label, *, max_chars=72, line_chars=26):
+        """Return a safe, short multi-line label for charts.
+
+        Full text remains in the sidebar table.  Chart labels are wrapped and,
+        only when exceptionally long, shortened so they cannot cover a large
+        part of the plot.
+        """
+        text = re.sub(r"\s+", " ", str(label or "")).strip()
+        if len(text) > max_chars:
+            text = text[: max(1, max_chars - 1)].rstrip() + "…"
+        words = text.split()
+        lines, current = [], ""
+        for word in words:
+            candidate = word if not current else f"{current} {word}"
+            if len(candidate) <= line_chars or not current:
+                current = candidate
+            else:
+                lines.append(current)
+                current = word
+        if current:
+            lines.append(current)
+        return "<br>".join(html.escape(line) for line in lines[:3])
+
+    def note_event_levels(events, x_values=None, max_levels=10):
+        """Place note labels in non-overlapping rows using estimated text width.
+
+        The earlier implementation used only the distance between event times.
+        Long comments could therefore overlap even when their timestamps were
+        sufficiently separated.  This version reserves an x-interval based on
+        each label's length and chooses the first free row.
         """
         if not events:
             return []
-        try:
-            xs = []
-            for e in events:
-                try:
-                    xs.append(float(e.get("plot_x", 0)))
-                except Exception:
-                    pass
-            if x_values is not None:
-                try:
-                    xs += [float(v) for v in x_values if pd.notna(v)]
-                except Exception:
-                    pass
-            span = (max(xs) - min(xs)) if len(xs) >= 2 else 1.0
-            min_gap = max(span * 0.070, 0.8)
-        except Exception:
-            min_gap = 1.0
 
-        placed_until = [-1e18] * max_levels
-        decorated = []
+        domain = []
+        for event in events:
+            n = _note_x_number(event.get("plot_x"))
+            if pd.notna(n):
+                domain.append(float(n))
+        if x_values is not None:
+            try:
+                for value in x_values:
+                    n = _note_x_number(value)
+                    if pd.notna(n):
+                        domain.append(float(n))
+            except Exception:
+                pass
+        span = max(domain) - min(domain) if len(domain) >= 2 else 1.0
+        if not np.isfinite(span) or span <= 0:
+            span = 1.0
+
+        occupied = [[] for _ in range(max_levels)]
         sortable = []
         for i, event in enumerate(events):
-            x = event.get("plot_x", 0)
-            try:
-                sx = float(x)
-            except Exception:
+            sx = _note_x_number(event.get("plot_x"))
+            if pd.isna(sx):
                 sx = float(i)
-            sortable.append((sx, i, dict(event)))
-        sortable.sort(key=lambda t: t[0])
+            item = dict(event)
+            label_len = max(6, min(72, len(re.sub(r"\s+", " ", str(item.get("label", ""))).strip())))
+            # Approximate the horizontal chart space occupied by the text box.
+            half_width = span * min(0.18, max(0.025, 0.012 + label_len * 0.0019))
+            item["_left"] = float(sx) - half_width
+            item["_right"] = float(sx) + half_width
+            item["label_html"] = compact_note_label(item.get("label", ""))
+            sortable.append((float(sx), i, item))
+        sortable.sort(key=lambda entry: entry[0])
 
-        for sx, _, event in sortable:
+        decorated = []
+        pad = span * 0.008
+        for _, _, event in sortable:
             manual_level = str(event.get("y_level", "Auto") or "Auto")
             if manual_level != "Auto":
                 try:
@@ -4471,12 +4846,22 @@ if selected_features and not filtered.empty:
                     level = 0
             else:
                 level = 0
-                while level < max_levels and sx - placed_until[level] < min_gap:
+                while level < max_levels:
+                    overlaps = any(
+                        not (event["_right"] + pad < left or event["_left"] - pad > right)
+                        for left, right in occupied[level]
+                    )
+                    if not overlaps:
+                        break
                     level += 1
                 if level >= max_levels:
-                    level = max_levels - 1
-            placed_until[level] = sx
+                    # Use the least crowded row rather than stacking everything
+                    # on the final row.
+                    level = min(range(max_levels), key=lambda idx: len(occupied[idx]))
+            occupied[level].append((event["_left"], event["_right"]))
             event["level"] = level
+            event.pop("_left", None)
+            event.pop("_right", None)
             decorated.append(event)
         return decorated
 
@@ -4493,10 +4878,37 @@ if selected_features and not filtered.empty:
 
     def visible_intervals_for_notes():
         intervals = interval_levels(plot_intervals)
-        if not auto_hide_crowded_notes:
-            return intervals
-        # Long parent intervals are already first from interval_levels(), so this keeps main events first.
-        return intervals[: int(max_visible_notes_per_chart)]
+        if auto_hide_crowded_notes:
+            # Long parent intervals are already first from interval_levels(), so this keeps main events first.
+            intervals = intervals[: int(max_visible_notes_per_chart)]
+        if not intervals:
+            return []
+
+        # Reuse the text-width collision engine on interval midpoints.  Preserve
+        # nesting levels, but move adjacent long labels to another row when the
+        # text boxes would collide.
+        pseudo_events = []
+        for idx, interval in enumerate(intervals):
+            x0, x1 = interval.get("x0"), interval.get("x1")
+            try:
+                x_mid = x0 + (x1 - x0) / 2
+            except Exception:
+                x_mid = x0
+            pseudo_events.append({
+                "plot_x": x_mid,
+                "label": interval.get("label", ""),
+                "_interval_index": idx,
+            })
+        laid_out = note_event_levels(
+            pseudo_events,
+            x_values=(filtered["plot_x"] if "plot_x" in filtered.columns else None),
+            max_levels=8,
+        )
+        auto_levels = {int(item.get("_interval_index", 0)): int(item.get("level", 0)) for item in laid_out}
+        for idx, interval in enumerate(intervals):
+            interval["level"] = max(int(interval.get("level", 0) or 0), auto_levels.get(idx, 0))
+            interval["label_html"] = compact_note_label(interval.get("label", ""))
+        return intervals
 
     def visible_events_for_notes(x_values=None):
         events = note_event_levels(plot_events, x_values=x_values, max_levels=10)
@@ -4521,23 +4933,41 @@ if selected_features and not filtered.empty:
                     pass
         return fig
 
+    def _reserve_plotly_note_band(fig, interval_rows=0, event_rows=0):
+        """Reserve a dedicated band above the plot for comments.
+
+        Keeping note text outside the data area prevents comments from covering
+        value labels, peaks, or lines.  The band grows only when needed.
+        """
+        rows = max(0, int(interval_rows)) + max(0, int(event_rows))
+        if rows <= 0:
+            return fig
+        try:
+            current_top = int(fig.layout.margin.t or 120)
+        except Exception:
+            current_top = 120
+        required_top = min(520, max(current_top, 175 + rows * 38))
+        fig.update_layout(margin=dict(t=required_top))
+        return fig
+
     def add_operation_intervals_to_plotly(fig, features):
         fig = add_compressed_test_separators_to_plotly(fig, features)
 
-        if not plot_intervals:
+        intervals = visible_intervals_for_notes()
+        if not intervals:
             return fig
 
         interval_font_size, _ = adaptive_note_font_sizes(total_note_count(), mobile=(chart_view_mode == "Mobile-friendly"))
-        for idx, interval in enumerate(visible_intervals_for_notes()):
+        interval_rows = 1 + max(int(item.get("level", 0) or 0) for item in intervals)
+        _reserve_plotly_note_band(fig, interval_rows=interval_rows)
+
+        for idx, interval in enumerate(intervals):
             x0 = interval["x0"]
             x1 = interval["x1"]
-            label = interval["label"]
+            label_html = interval.get("label_html") or compact_note_label(interval.get("label", ""))
             level = int(interval.get("level", 0) or 0)
             note_col = note_color(idx)
 
-            # v51: use whole-figure shapes instead of repeated labels in each subplot.
-            # One draggable event/interval line spans all charts, so moving it in the
-            # interactive Plotly view affects the whole multi-chart figure visually.
             for x_val in [x0, x1]:
                 try:
                     fig.add_shape(
@@ -4548,8 +4978,9 @@ if selected_features and not filtered.empty:
                         y1=1,
                         xref="x",
                         yref="paper",
-                        line=dict(color=note_col, width=2.2, dash="dash"),
-                        opacity=0.90,
+                        line=dict(color=note_col, width=2.0, dash="dash"),
+                        opacity=0.82,
+                        layer="below",
                     )
                 except Exception:
                     pass
@@ -4560,20 +4991,24 @@ if selected_features and not filtered.empty:
                 x_mid = x0
 
             try:
-                y_row = max(1.035, 1.155 - 0.055 * min(level, 4))
+                # Bottom-up note band: level 0 is closest to the plot; higher
+                # levels move upward, never down into data labels.
+                y_row = 1.035 + 0.065 * level
                 fig.add_annotation(
                     x=x_mid,
                     y=y_row,
                     xref="x",
                     yref="paper",
-                    text=f"<b>{label}</b>",
+                    text=f"<b>{label_html}</b>",
                     showarrow=False,
                     xanchor="center",
                     yanchor="bottom",
                     bgcolor=CHART_LEGEND_BG,
                     bordercolor=note_col,
-                    borderwidth=1.4,
+                    borderwidth=1.3,
+                    borderpad=3,
                     font=dict(size=interval_font_size, color=note_col),
+                    align="center",
                 )
             except Exception:
                 pass
@@ -4582,15 +5017,23 @@ if selected_features and not filtered.empty:
     def add_manual_events_to_plotly(fig, features):
         fig = add_operation_intervals_to_plotly(fig, features)
 
-        if not plot_events:
+        decorated_events = visible_events_for_notes(
+            x_values=(filtered["plot_x"] if "plot_x" in filtered.columns else None)
+        )
+        if not decorated_events:
             return fig
+
+        intervals = visible_intervals_for_notes()
+        interval_rows = 1 + max([int(item.get("level", 0) or 0) for item in intervals], default=-1)
+        event_rows = 1 + max(int(item.get("level", 0) or 0) for item in decorated_events)
+        _reserve_plotly_note_band(fig, interval_rows=interval_rows, event_rows=event_rows)
+
         _, event_font_size = adaptive_note_font_sizes(total_note_count(), mobile=(chart_view_mode == "Mobile-friendly"))
-        decorated_events = visible_events_for_notes(x_values=(filtered["plot_x"] if "plot_x" in filtered.columns else None))
         for idx, event in enumerate(decorated_events):
             x = event["plot_x"]
-            label = event["label"]
+            label_html = event.get("label_html") or compact_note_label(event.get("label", ""))
             level = int(event.get("level", 0) or 0)
-            note_col = note_color(idx + len(plot_intervals or []))
+            note_col = note_color(idx + len(intervals))
             try:
                 fig.add_shape(
                     type="line",
@@ -4600,36 +5043,33 @@ if selected_features and not filtered.empty:
                     y1=1,
                     xref="x",
                     yref="paper",
-                    line=dict(color=note_col, width=2, dash="dash"),
-                    opacity=0.75,
+                    line=dict(color=note_col, width=1.8, dash="dash"),
+                    opacity=0.68,
+                    layer="below",
                 )
             except Exception:
                 pass
             try:
-                y_note = max(1.015, 1.115 - 0.050 * min(level, 8))
+                y_note = 1.035 + 0.065 * (interval_rows + level)
                 text_angle = 0
                 x_anchor = "center"
-                if event_label_style == "Vertical labels" or (event_label_style == "Auto staggered" and total_note_count() >= 3):
-                    text_angle = -90
-                    y_note = max(1.005, 1.105 - 0.045 * min(level, 8))
-                    x_anchor = "right"
-                elif event_label_style == "Compact top labels":
-                    y_note = max(1.015, 1.115 - 0.045 * min(level, 8))
-                    x_anchor = "center"
+                compact_font = max(8, event_font_size - 1) if event_label_style == "Compact top labels" else event_font_size
                 fig.add_annotation(
                     x=x,
                     y=y_note,
                     xref="x",
                     yref="paper",
-                    text=f"<b>{label}</b>",
+                    text=f"<b>{label_html}</b>",
                     showarrow=False,
                     xanchor=x_anchor,
                     yanchor="bottom",
                     textangle=text_angle,
-                    font=dict(size=event_font_size, color=note_col),
+                    font=dict(size=compact_font, color=note_col),
                     bgcolor=CHART_LEGEND_BG,
                     bordercolor=note_col,
-                    borderwidth=1.4,
+                    borderwidth=1.3,
+                    borderpad=3,
+                    align="center",
                 )
             except Exception:
                 pass
@@ -4806,6 +5246,45 @@ if selected_features and not filtered.empty:
 
         return {i for i in idxs if 0 <= i < n}
 
+    def _note_guard_positions():
+        """Numeric X positions where event/interval guide lines cross the data area."""
+        positions = []
+        for event in plot_events or []:
+            n = _note_x_number(event.get("plot_x"))
+            if pd.notna(n):
+                positions.append(float(n))
+        for interval in plot_intervals or []:
+            for key in ("x0", "x1"):
+                n = _note_x_number(interval.get(key))
+                if pd.notna(n):
+                    positions.append(float(n))
+        return positions
+
+    def _remove_value_labels_near_notes(g, idxs):
+        """Hide value labels close to note guide lines to prevent visual collisions."""
+        idxs = set(idxs or set())
+        guards = _note_guard_positions()
+        if not idxs or not guards or g is None or g.empty:
+            return idxs
+        try:
+            gx = x_values(g.reset_index(drop=True))
+            nums = pd.Series([_note_x_number(v) for v in gx], dtype="float64")
+            valid = nums.dropna()
+            if valid.empty:
+                return idxs
+            span = float(valid.max() - valid.min())
+            if not np.isfinite(span) or span <= 0:
+                span = max(abs(float(valid.iloc[0])), 1.0)
+            clearance = max(span * 0.018, 1e-9)
+            return {
+                i for i in idxs
+                if 0 <= i < len(nums)
+                and pd.notna(nums.iloc[i])
+                and all(abs(float(nums.iloc[i]) - guard) > clearance for guard in guards)
+            }
+        except Exception:
+            return idxs
+
     def build_text_and_positions(g, feature):
         if analysis_view == "Production history":
             if value_label_mode == "Clean readable - recommended":
@@ -4817,6 +5296,7 @@ if selected_features and not filtered.empty:
         else:
             idxs = label_indices(len(g), value_label_mode)
 
+        idxs = _remove_value_labels_near_notes(g, idxs)
         values = numeric_feature_series(g, feature, reset_index=True)
         text = []
         pos = []
@@ -4829,20 +5309,8 @@ if selected_features and not filtered.empty:
     def padded_range(df, feature):
         if feature in custom_y_ranges:
             return custom_y_ranges[feature]
+        return default_y_axis_range(df, feature)
 
-        vals = numeric_feature_series(df, feature).dropna()
-        if vals.empty:
-            return None
-
-        ymin = float(vals.min())
-        ymax = float(vals.max())
-
-        if ymin == ymax:
-            pad = max(abs(ymin) * 0.08, 1.0)
-        else:
-            pad = (ymax - ymin) * 0.22
-
-        return [ymin - pad, ymax + pad]
 
     def build_figure(df, features, mode):
         series_values = sorted(df["series_label"].dropna().astype(str).unique()) if "series_label" in df.columns else (
@@ -4922,14 +5390,14 @@ if selected_features and not filtered.empty:
                 showgrid=True,
                 gridcolor=CHART_GRID_SOFT,
                 zeroline=False,
-                range=custom_y_ranges.get(left_feature),
+                range=custom_y_ranges.get(left_feature) or default_y_axis_range(df, left_feature),
             )
             fig.update_yaxes(
                 title_text=column_label(right_feature),
                 secondary_y=True,
                 showgrid=False,
                 zeroline=False,
-                range=custom_y_ranges.get(right_feature),
+                range=custom_y_ranges.get(right_feature) or default_y_axis_range(df, right_feature),
             )
             fig = add_manual_events_to_plotly(fig, [left_feature])
             return fig
@@ -5128,25 +5596,9 @@ if selected_features and not filtered.empty:
             zeroline=False,
             title_font=dict(size=20, color=CHART_TEXT),
             tickfont=dict(size=15, color=CHART_TEXT),
+            range=combined_default_y_axis_range(df, list(features)),
         )
-        if manual_events:
-            for event in manual_events:
-                fig.add_vline(x=event["datetime"], line_dash="dash", line_color=CHART_TEXT, line_width=2, opacity=0.75)
-                fig.add_annotation(
-                    x=event["datetime"],
-                    y=1,
-                    xref="x",
-                    yref="paper",
-                    text=event["label"],
-                    showarrow=False,
-                    xanchor="left",
-                    yanchor="top",
-                    font=dict(size=13, color=CHART_TEXT),
-                    bgcolor=CHART_LEGEND_BG,
-                    bordercolor=CHART_TEXT,
-                    borderwidth=1.4,
-                )
-        return fig
+        return add_manual_events_to_plotly(fig, features)
 
     def build_dual_axis_multi_figure(df, left_features, right_features, chart_name=""):
         """Build one combined chart with multiple left/right Y-axis features."""
@@ -5226,12 +5678,14 @@ if selected_features and not filtered.empty:
             showgrid=True,
             gridcolor=CHART_GRID_SOFT,
             zeroline=False,
+            range=combined_default_y_axis_range(df, left_features),
         )
         fig.update_yaxes(
             title_text=" / ".join(column_label(f) for f in right_features[:3]),
             secondary_y=True,
             showgrid=False,
             zeroline=False,
+            range=combined_default_y_axis_range(df, right_features),
         )
         return add_manual_events_to_plotly(fig, [left_features[0]])
 
@@ -5341,6 +5795,7 @@ if selected_features and not filtered.empty:
             idxs = set(chosen)
             if n:
                 idxs.update({0, n - 1})
+        idxs = _remove_value_labels_near_notes(g2, idxs)
         return {i for i in idxs if 0 <= i < n}
 
     def apply_matplotlib_petro_style(fig_obj, ax_obj=None):
@@ -5440,15 +5895,9 @@ if selected_features and not filtered.empty:
                             )
                         first_segment = False
 
-                if feature in custom_y_ranges:
-                    ax.set_ylim(custom_y_ranges[feature][0], custom_y_ranges[feature][1])
-                else:
-                    vals = numeric_feature_series(df, feature).dropna()
-                    if not vals.empty:
-                        ymin = float(vals.min())
-                        ymax = float(vals.max())
-                        pad = max((ymax - ymin) * 0.18, max(abs(ymax), 1) * 0.03, 0.5)
-                        ax.set_ylim(ymin - pad, ymax + pad)
+                y_limits = custom_y_ranges.get(feature) or default_y_axis_range(df, feature)
+                if y_limits:
+                    ax.set_ylim(y_limits[0], y_limits[1])
 
                 ax.set_ylabel(column_label(feature), fontsize=15, fontweight="bold")
                 ax.set_xlabel(x_axis_title, fontsize=15, fontweight="bold")
@@ -5485,7 +5934,7 @@ if selected_features and not filtered.empty:
                     ax.legend(fontsize=12, loc="best")
 
                 apply_matplotlib_petro_style(fig_m, ax)
-                fig_m.tight_layout(rect=[0.02, 0.02, 0.98, 0.94])
+                fig_m.tight_layout(rect=[0.02, 0.02, 0.98, _matplotlib_note_top_limit()])
                 pdf.savefig(fig_m, facecolor=CHART_PAPER_BG, edgecolor=CHART_PAPER_BG)
                 plt.close(fig_m)
 
@@ -5541,68 +5990,18 @@ if selected_features and not filtered.empty:
                             bbox=dict(boxstyle="round,pad=0.12", fc=EXPORT_LABEL_BG, ec=EXPORT_LABEL_EDGE, alpha=0.7),
                         )
 
-                if feature in custom_y_ranges:
-                    ax.set_ylim(custom_y_ranges[feature][0], custom_y_ranges[feature][1])
-                else:
-                    vals = numeric_feature_series(df, feature).dropna()
-                    if not vals.empty:
-                        ymin = float(vals.min())
-                        ymax = float(vals.max())
-                        pad = max((ymax - ymin) * 0.18, max(abs(ymax), 1) * 0.03, 0.5)
-                        ax.set_ylim(ymin - pad, ymax + pad)
+                y_limits = custom_y_ranges.get(feature) or default_y_axis_range(df, feature)
+                if y_limits:
+                    ax.set_ylim(y_limits[0], y_limits[1])
 
                 ax.set_ylabel(column_label(feature), fontsize=16, fontweight="bold")
                 ax.set_xlabel(x_axis_title, fontsize=16, fontweight="bold")
 
-                if plot_intervals:
-                    ymin_i, ymax_i = ax.get_ylim()
-                    y_span = ymax_i - ymin_i if ymax_i != ymin_i else 1.0
-                    y_note = ymax_i - 0.04 * y_span
-                    for interval in visible_intervals_for_notes():
-                        x0 = interval["x0"]
-                        x1 = interval["x1"]
-                        ax.axvline(x0, color="#92400e", linestyle="--", linewidth=1.8, alpha=0.90)
-                        ax.axvline(x1, color="#92400e", linestyle="--", linewidth=1.8, alpha=0.90)
-                        try:
-                            x_mid = x0 + (x1 - x0) / 2
-                        except Exception:
-                            x_mid = x0
-                        try:
-                            ax.annotate(
-                                "",
-                                xy=(x1, y_note),
-                                xytext=(x0, y_note),
-                                arrowprops=dict(arrowstyle="<->", color="#92400e", lw=1.8),
-                            )
-                        except Exception:
-                            pass
-                        ax.text(
-                            x_mid,
-                            y_note,
-                            interval["label"],
-                            fontsize=12,
-                            fontweight="bold",
-                            ha="center",
-                            va="center",
-                            color=CHART_TEXT,
-                            bbox=dict(boxstyle="round,pad=0.22", fc=EXPORT_LABEL_BG, ec="#C98B3C", alpha=0.95),
-                        )
-
-                if plot_events:
-                    for event in plot_events:
-                        ax.axvline(event["plot_x"], color=CHART_TEXT, linestyle="--", linewidth=1.8, alpha=0.75)
-                        ax.text(
-                            event["plot_x"],
-                            0.98,
-                            event["label"],
-                            transform=ax.get_xaxis_transform(),
-                            rotation=90,
-                            va="top",
-                            ha="right",
-                            fontsize=11,
-                            color=CHART_TEXT,
-                            bbox=dict(boxstyle="round,pad=0.15", fc=EXPORT_LABEL_BG, ec=CHART_GRID, alpha=0.75),
-                        )
+                try:
+                    x_for_notes = ax.lines[0].get_xdata() if ax.lines else None
+                except Exception:
+                    x_for_notes = None
+                _apply_matplotlib_notes(ax, x_values=x_for_notes)
                 ax.grid(True, which="major", alpha=0.28)
                 ax.tick_params(axis="both", labelsize=13)
 
@@ -5630,7 +6029,7 @@ if selected_features and not filtered.empty:
                     ax.legend(fontsize=12, loc="best")
 
                 apply_matplotlib_petro_style(fig_m, ax)
-                fig_m.tight_layout(rect=[0.02, 0.02, 0.98, 0.94])
+                fig_m.tight_layout(rect=[0.02, 0.02, 0.98, _matplotlib_note_top_limit()])
 
                 png_buffer = io.BytesIO()
                 fig_m.savefig(png_buffer, format="png", dpi=190, facecolor=CHART_PAPER_BG, edgecolor=CHART_PAPER_BG)
@@ -5704,79 +6103,93 @@ if selected_features and not filtered.empty:
     def _matplotlib_event_levels(events, x_values=None, max_levels=4):
         return note_event_levels(events, x_values=x_values, max_levels=max_levels)
 
-    def _apply_matplotlib_notes(ax, x_values=None):
-        """Apply interval and point notes with staggered rows to avoid overlap in exports."""
-        _draw_all_test_separators_matplotlib(ax, filtered)
-        # Interval notes: parent/long intervals on top row, child intervals below.
-        note_count = total_note_count()
-        interval_font_size, event_font_size = adaptive_note_font_sizes(note_count, mobile=(chart_view_mode == "Mobile-friendly"))
-        if plot_intervals:
-            for idx, interval in enumerate(visible_intervals_for_notes()):
-                x0 = interval["x0"]
-                x1 = interval["x1"]
-                level = int(interval.get("level", 0))
-                note_col = note_color(idx)
-                ax.axvline(x0, color=note_col, linestyle="--", linewidth=1.8, alpha=0.90)
-                ax.axvline(x1, color=note_col, linestyle="--", linewidth=1.8, alpha=0.90)
-                try:
-                    x_mid = x0 + (x1 - x0) / 2
-                except Exception:
-                    x_mid = x0
-                y_frac = max(0.68, 0.96 - 0.10 * min(level, 3))
-                try:
-                    ax.annotate(
-                        "",
-                        xy=(x1, y_frac),
-                        xytext=(x0, y_frac),
-                        xycoords=("data", "axes fraction"),
-                        textcoords=("data", "axes fraction"),
-                        arrowprops=dict(arrowstyle="<->", color=note_col, lw=1.7),
-                    )
-                except Exception:
-                    pass
-                ax.text(
-                    x_mid,
-                    min(0.985, y_frac + 0.016),
-                    interval["label"],
-                    transform=ax.get_xaxis_transform(),
-                    fontsize=interval_font_size,
-                    fontweight="bold",
-                    ha="center",
-                    va="bottom",
-                    color=note_col,
-                    bbox=dict(boxstyle="round,pad=0.22", fc=EXPORT_LABEL_BG, ec=note_col, alpha=0.96),
-                    clip_on=False,
-                )
+    def _matplotlib_note_top_limit():
+        intervals = visible_intervals_for_notes()
+        events = visible_events_for_notes(
+            x_values=(filtered["plot_x"] if "plot_x" in filtered.columns else None)
+        )
+        interval_rows = 1 + max([int(item.get("level", 0) or 0) for item in intervals], default=-1)
+        event_rows = 1 + max([int(item.get("level", 0) or 0) for item in events], default=-1)
+        rows = interval_rows + event_rows
+        return max(0.62, 0.93 - 0.045 * rows)
 
-        # Point notes: stagger close labels on multiple rows.
-        if plot_events:
-            event_rows = visible_events_for_notes(x_values=x_values)
-            base_frac = 0.80 if plot_intervals else 0.98
-            for idx, event in enumerate(event_rows):
-                level = int(event.get("level", 0))
-                note_col = note_color(idx + len(plot_intervals or []))
-                y_frac = max(0.12, base_frac - 0.060 * min(level, 12))
-                ax.axvline(event["plot_x"], color=note_col, linestyle="--", linewidth=1.5, alpha=0.78)
-                rotation = 90 if (event_label_style == "Vertical labels" or (event_label_style == "Auto staggered" and total_note_count() >= 3)) else 0
-                ha = "right" if rotation else "center"
-                try:
-                    x_shift_points = float(event.get("x_shift_px", 0) or 0) * 0.5
-                except Exception:
-                    x_shift_points = 0
+    def _apply_matplotlib_notes(ax, x_values=None):
+        """Draw notes in a dedicated band above the axes for clean exports."""
+        _draw_all_test_separators_matplotlib(ax, filtered)
+        note_count = total_note_count()
+        interval_font_size, event_font_size = adaptive_note_font_sizes(
+            note_count, mobile=(chart_view_mode == "Mobile-friendly")
+        )
+        intervals = visible_intervals_for_notes()
+        events = visible_events_for_notes(x_values=x_values)
+        interval_rows = 1 + max([int(item.get("level", 0) or 0) for item in intervals], default=-1)
+
+        for idx, interval in enumerate(intervals):
+            x0 = interval["x0"]
+            x1 = interval["x1"]
+            level = int(interval.get("level", 0) or 0)
+            note_col = note_color(idx)
+            ax.axvline(x0, color=note_col, linestyle="--", linewidth=1.6, alpha=0.72)
+            ax.axvline(x1, color=note_col, linestyle="--", linewidth=1.6, alpha=0.72)
+            try:
+                x_mid = x0 + (x1 - x0) / 2
+            except Exception:
+                x_mid = x0
+            y_frac = 1.035 + 0.085 * level
+            try:
                 ax.annotate(
-                    event["label"],
-                    xy=(event["plot_x"], y_frac),
+                    "",
+                    xy=(x1, y_frac),
+                    xytext=(x0, y_frac),
                     xycoords=("data", "axes fraction"),
-                    xytext=(x_shift_points, 0),
-                    textcoords="offset points",
-                    rotation=rotation,
-                    va="top",
-                    ha=ha,
-                    fontsize=event_font_size,
-                    color=note_col,
-                    bbox=dict(boxstyle="round,pad=0.15", fc=EXPORT_LABEL_BG, ec=note_col, alpha=0.82),
-                    clip_on=False,
+                    textcoords=("data", "axes fraction"),
+                    arrowprops=dict(arrowstyle="<->", color=note_col, lw=1.5),
+                    annotation_clip=False,
                 )
+            except Exception:
+                pass
+            clean_label = html.unescape(re.sub(r"<br>", "\n", interval.get("label_html") or compact_note_label(interval.get("label", ""))))
+            ax.text(
+                x_mid,
+                y_frac + 0.012,
+                clean_label,
+                transform=ax.get_xaxis_transform(),
+                fontsize=interval_font_size,
+                fontweight="bold",
+                ha="center",
+                va="bottom",
+                color=note_col,
+                bbox=dict(boxstyle="round,pad=0.20", fc=EXPORT_LABEL_BG, ec=note_col, alpha=0.96),
+                clip_on=False,
+            )
+
+        for idx, event in enumerate(events):
+            level = int(event.get("level", 0) or 0)
+            note_col = note_color(idx + len(intervals))
+            y_frac = 1.035 + 0.085 * (interval_rows + level)
+            ax.axvline(event["plot_x"], color=note_col, linestyle="--", linewidth=1.4, alpha=0.64)
+            rotation = 0
+            ha = "center"
+            try:
+                x_shift_points = float(event.get("x_shift_px", 0) or 0) * 0.5
+            except Exception:
+                x_shift_points = 0
+            clean_label = html.unescape(re.sub(r"<br>", "\n", event.get("label_html") or compact_note_label(event.get("label", ""))))
+            ax.annotate(
+                clean_label,
+                xy=(event["plot_x"], y_frac),
+                xycoords=("data", "axes fraction"),
+                xytext=(x_shift_points, 0),
+                textcoords="offset points",
+                rotation=rotation,
+                va="bottom",
+                ha=ha,
+                fontsize=event_font_size,
+                color=note_col,
+                bbox=dict(boxstyle="round,pad=0.15", fc=EXPORT_LABEL_BG, ec=note_col, alpha=0.90),
+                clip_on=False,
+                annotation_clip=False,
+            )
 
     def matplotlib_overview_export_bytes(df, features, fmt="png"):
         """High-resolution single report chart export with labels and notes."""
@@ -5856,15 +6269,9 @@ if selected_features and not filtered.empty:
                         )
                     first_segment = False
 
-            if feature in custom_y_ranges:
-                ax.set_ylim(custom_y_ranges[feature][0], custom_y_ranges[feature][1])
-            else:
-                vals = numeric_feature_series(df, feature).dropna()
-                if not vals.empty:
-                    ymin = float(vals.min())
-                    ymax = float(vals.max())
-                    pad = max((ymax - ymin) * 0.22, max(abs(ymax), 1) * 0.03, 0.5)
-                    ax.set_ylim(ymin - pad, ymax + pad)
+            y_limits = custom_y_ranges.get(feature) or default_y_axis_range(df, feature)
+            if y_limits:
+                ax.set_ylim(y_limits[0], y_limits[1])
 
             try:
                 x_for_notes = ax.lines[0].get_xdata() if ax.lines else None
@@ -5880,7 +6287,7 @@ if selected_features and not filtered.empty:
 
         axes[-1].set_xlabel(x_axis_title_from_mode(x_axis_mode), fontsize=14, fontweight="bold")
         apply_matplotlib_petro_style(fig_m, axes)
-        fig_m.tight_layout(rect=[0.02, 0.02, 0.98, 0.975])
+        fig_m.tight_layout(rect=[0.02, 0.02, 0.98, max(_matplotlib_note_top_limit(), 0.90)])
 
         output = io.BytesIO()
         if fmt == "pdf":
@@ -5954,12 +6361,9 @@ if selected_features and not filtered.empty:
                         )
                     first_segment = False
 
-            vals = numeric_feature_series(df, feature).dropna()
-            if not vals.empty:
-                ymin = float(vals.min())
-                ymax = float(vals.max())
-                pad = max((ymax - ymin) * 0.22, max(abs(ymax), 1) * 0.03, 0.5)
-                ax.set_ylim(ymin - pad, ymax + pad)
+            y_limits = custom_y_ranges.get(feature) or default_y_axis_range(df, feature)
+            if y_limits:
+                ax.set_ylim(y_limits[0], y_limits[1])
 
             ax.set_ylabel(column_label(feature), fontsize=15, fontweight="bold")
             ax.set_xlabel(x_axis_title_from_mode(x_axis_mode), fontsize=14, fontweight="bold")
@@ -5975,7 +6379,7 @@ if selected_features and not filtered.empty:
                 ax.legend(fontsize=11, loc="best")
 
             apply_matplotlib_petro_style(fig_m, ax)
-            fig_m.tight_layout(rect=[0.02, 0.02, 0.98, 0.94])
+            fig_m.tight_layout(rect=[0.02, 0.02, 0.98, _matplotlib_note_top_limit()])
             output = io.BytesIO()
             fig_m.savefig(output, format="png", dpi=260, bbox_inches="tight", facecolor=CHART_PAPER_BG, edgecolor=CHART_PAPER_BG)
             plt.close(fig_m)

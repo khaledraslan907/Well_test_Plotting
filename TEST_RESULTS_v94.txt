@@ -1,0 +1,58 @@
+Production Test Dashboard v94 validation
+=========================================
+
+Build ID
+--------
+v94-note-clearance-smart-y-axis-20260702
+
+Compilation
+-----------
+PASS: app.py
+PASS: tmu_parser.py
+PASS: tmu_parser_compat.py
+PASS: tmu_parser_legacy.py
+PASS: smart_tabular_v75.py
+PASS: history_analysis.py
+
+Smart Y-axis tests
+------------------
+PASS: Gross Rate maximum 177 -> 0 to 200 BBL/D
+PASS: Total Gas maximum 3.91 -> 0 to 5 MMSCF/D
+PASS: BS&W -> fixed 0 to 100%
+PASS: Choke Opening -> fixed 0 to 100%
+PASS: Choke Size (/64 in) -> fixed 0 to 128
+PASS: Negative reel-speed data remains visible (-50 to 0 ft/min in test case)
+PASS: Custom user ranges retain priority
+
+Comment-layout tests
+--------------------
+PASS: Vertical-comment layout removed from selectable options
+PASS: Close comments assigned to separate staggered rows
+PASS: Dedicated note band reserves additional top margin
+PASS: Value labels near event/interval guide lines are suppressed
+PASS: Interactive and export paths use the same note-clearance policy
+
+Parser regression
+-----------------
+PASS: SPR(2).xlsx -> 12 rows in 0.073 s
+PASS: 6-B15-42 (Dasco 27) (9-6-2026)(4).xlsx -> 10 rows in 1.357 s
+PASS: WhatsApp Chat - Sitra8-58 clean & test(3).zip -> 74 rows in 1.243 s
+PASS: ESP.xlsx -> 3,672 raw rows -> 54 production-history points
+
+Continuation regression
+-----------------------
+PASS: overlapping continuation timestamps merged
+PASS: newest uploaded values retained
+PASS: existing continuation behavior preserved
+
+Visual reference review
+-----------------------
+The supplied BED-3-C18-7 report was reviewed. Its event labels and value labels
+showed crowding near the shut-in interval. v94 moves the note text above the
+plot and removes nearby numeric labels while preserving hover values.
+
+Environment limitation
+----------------------
+A full live Streamlit browser session was not available in the artifact runtime
+because Streamlit is not installed there. Python compilation, helper tests,
+parser regression tests, and a rendered note/Y-axis validation preview passed.

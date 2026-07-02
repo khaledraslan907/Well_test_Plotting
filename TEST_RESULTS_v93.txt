@@ -1,0 +1,59 @@
+Production Test Dashboard v93 validation
+========================================
+
+Build
+-----
+UI build: v93-smart-notes-continuation-sidebar-scroll-20260629
+
+Compilation
+-----------
+PASS - app.py
+PASS - tmu_parser.py
+PASS - tmu_parser_compat.py
+PASS - tmu_parser_legacy.py
+PASS - smart_tabular_v75.py
+PASS - history_analysis.py
+
+Continuation logic
+------------------
+PASS - same-well continuation recognized
+PASS - unrelated replacement well not treated as continuation
+PASS - nearby Unknown-well OCR image accepted for timestamp linking
+PASS - repeated overlap timestamp merged
+PASS - newest upload value retained at overlap
+PASS - 4 input rows reduced to 3 unique continuation rows
+PASS - selected chart controls are not cleared by continuation-cache invalidation
+
+Comment collision layout
+------------------------
+PASS - close long comments assigned to multiple visual rows
+PASS - long comments wrapped into compact chart labels
+PASS - point and interval comments use a dedicated band above the plotting area
+PASS - automatic mode no longer forces vertical labels
+PASS - PNG/PDF note renderer uses the same staggered layout policy
+
+Sidebar scrolling
+-----------------
+PASS - single sidebar scroll surface defined
+PASS - overflow-y set to auto on stSidebarContent
+PASS - overscroll containment enabled
+PASS - sidebar scrollbar width increased to 18 px
+PASS - sidebar thumb minimum height increased to 96 px
+
+Parser regression
+-----------------
+PASS - SPR(2).xlsx: 12 rows, approximately 0.14 s
+PASS - 6-B15-42 (Dasco 27) (9-6-2026)(4).xlsx: 10 rows, approximately 2.74 s
+PASS - WhatsApp Chat - Sitra8-58 clean & test(3).zip: 74 rows, approximately 2.57 s
+
+Production history regression
+-----------------------------
+PASS - ESP.xlsx: 3,672 raw readings
+PASS - 54 averaged production-history test points
+PASS - continuous per-well production-history test ID retained
+
+Limitations of this environment
+-------------------------------
+The Streamlit browser runtime is not installed in the artifact environment, so a live
+browser interaction test was not run here. Python compilation, parser regression,
+continuation helper execution and note-layout helper execution all passed.
