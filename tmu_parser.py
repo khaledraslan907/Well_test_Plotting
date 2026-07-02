@@ -23,9 +23,8 @@ import pandas as pd
 
 import tmu_parser_compat as compat
 import smart_tabular_v75 as smart
-from project_resume import extract_project_from_pdf
 
-PARSER_BUILD_ID = "v96-resumable-pdf-project-20260702"
+PARSER_BUILD_ID = "v91-ocr-continuity-canonical-pressure-20260628"
 
 COLUMN_LABELS: Dict[str, str] = dict(getattr(compat, "COLUMN_LABELS", {}))
 COLUMN_LABELS.update({
@@ -677,19 +676,6 @@ def _zip_member_is_chat_text(member_name: str, payload: bytes) -> bool:
 def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: int = 1000) -> List[pd.DataFrame]:
     data, name = _bytes_and_name(uploaded_file)
     suffix = Path(name).suffix.lower()
-
-    # Dashboard PDFs exported by this application can be reopened as projects.
-    # New PDFs contain an exact embedded data/settings bundle. Older dashboard
-    # PDFs are recovered from their visible vector values and event markers.
-    if suffix == ".pdf":
-        project = extract_project_from_pdf(data, source_name=name)
-        if project is not None and isinstance(project.get("data"), pd.DataFrame) and not project["data"].empty:
-            frame = _safe_postprocess(project["data"].copy())
-            frame = assign_test_ids(frame)
-            frame.attrs["dashboard_project_state"] = project.get("state", {})
-            frame.attrs["dashboard_project_source_kind"] = project.get("source_kind", "dashboard_pdf")
-            frame.attrs["dashboard_project_exact"] = bool(project.get("exact", False))
-            return [frame]
 
     # Handle WhatsApp ZIP exports explicitly.  A valid export may contain only
     # ``_chat.txt`` and an unsupported audio file, so the chat must be parsed

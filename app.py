@@ -338,15 +338,15 @@ WELL_COLORS = [
 ]
 
 LIGHT_FEATURE_COLOR_OVERRIDES = {
-    "gross_rate_bpd": "#496B7A",
-    "qgross_s_bpd": "#496B7A",
-    "gas_rate_mmscfd": "#0097A7",
-    "qgas_s_mmscfd": "#0097A7",
-    "qgas_a_mmcfd": "#00A6B8",
-    "water_rate_bpd": "#0B67C2",
-    "qwat_s_bpd": "#0B67C2",
-    "oil_rate_stbd": "#237A31",
-    "qoil_s_stbd": "#237A31",
+    "gross_rate_bpd": "#365D70",
+    "qgross_s_bpd": "#365D70",
+    "gas_rate_mmscfd": "#007F91",
+    "qgas_s_mmscfd": "#007F91",
+    "qgas_a_mmcfd": "#008FA3",
+    "water_rate_bpd": "#075DAE",
+    "qwat_s_bpd": "#075DAE",
+    "oil_rate_stbd": "#176B29",
+    "qoil_s_stbd": "#176B29",
 }
 
 def feature_color(feature_name: str, fallback_index: int = 0) -> str:
@@ -396,47 +396,326 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_UI_BUILD_ID = "v96-inline-events-clear-labels-enhanced-light-20260702"
+APP_UI_BUILD_ID = "v97-portable-pdf-v92-events-20260702"
 print(f"Starting Production Test Dashboard: {APP_UI_BUILD_ID} | parser={PARSER_BUILD_ID}")
+
+PORTABLE_STATE_MAGIC = "CORELYTIX_PRODUCTION_TEST_ANALYSIS"
+PORTABLE_STATE_SCHEMA = 1
+PORTABLE_STATE_ATTACHMENT = "corelytix_production_test_state_v1.zip"
+
+# These controls are safe to restore before their widgets are created. Dynamic
+# data-dependent selections are reconciled against the newly restored dataframe
+# before Streamlit renders the corresponding widget.
+PORTABLE_SESSION_KEYS = [
+    "ui_theme", "continue_current_test_v93", "test_gap_hours_v97",
+    "pressure_display_unit_v58", "temperature_display_unit_v58",
+    "analysis_view_v97", "time_filter_mode_v97",
+    "time_aggregation_interval_preset", "time_aggregation_interval_custom_value",
+    "x_axis_tick_interval_preset", "x_axis_tick_interval_custom_value",
+    "x_axis_mode_v97", "continuous_gap_hours_v97", "compressed_gap_hours_v97",
+    "selected_wells_v97", "selected_features_v58", "plot_signal_order_v92_state",
+    "history_use_custom_y_scale", "detail_use_custom_y_scale_v97",
+    "fill_method_v97", "hide_zero_flow_rows_v97", "plot_mode_v97",
+    "show_points_v97", "value_label_mode_v97", "detail_value_label_step",
+    "history_value_label_mode", "history_value_label_step",
+    "label_decimals_default_v97", "event_label_layout",
+    "auto_hide_crowded_notes_v97", "max_visible_notes_per_chart_v97",
+    "enable_drag_annotations_v97",
+    "choke_plot_mode_v97", "choke_full_open_64_v97",
+    "ambiguous_choke_unit_v97", "treat_zero_choke_as_missing_v97",
+    "display_label_overrides", "choke_unified_label",
+]
+PORTABLE_DYNAMIC_PREFIXES = ("ymin_", "ymax_", "label_decimals_", "display_label_", "dual_")
+
+
+def _portable_json_value(value):
+    """Convert Streamlit/pandas values into safe JSON-compatible objects."""
+    if value is None:
+        return None
+    if isinstance(value, (pd.Timestamp, datetime, date, time)):
+        return value.isoformat()
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        number = float(value)
+        return number if np.isfinite(number) else None
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, dict):
+        return {str(k): _portable_json_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_portable_json_value(v) for v in value]
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _portable_event_records(records, datetime_fields):
+    cleaned = []
+    for record in records or []:
+        if not isinstance(record, dict):
+            continue
+        item = {str(k): _portable_json_value(v) for k, v in record.items()}
+        for field in datetime_fields:
+            if field in item and item[field]:
+                try:
+                    item[field] = pd.Timestamp(item[field]).isoformat()
+                except Exception:
+                    pass
+        cleaned.append(item)
+    return cleaned
+
+
+def build_portable_state_zip(dataframe: pd.DataFrame, *, ui_state: dict, chart_title: str,
+                             manual_events: list, operation_intervals: list,
+                             custom_y_ranges: Optional[dict] = None) -> bytes:
+    """Create a safe ZIP payload embedded in exported PDFs.
+
+    CSV is intentionally used instead of pickle so an uploaded PDF never causes
+    executable Python objects to be deserialized. The manifest records dtypes and
+    datetime columns for a faithful dataframe reconstruction.
+    """
+    frame = dataframe.copy() if dataframe is not None else pd.DataFrame()
+    datetime_columns = []
+    dtype_map = {}
+    export_frame = frame.copy()
+    for col in export_frame.columns:
+        series = export_frame[col]
+        dtype_map[str(col)] = str(series.dtype)
+        if pd.api.types.is_datetime64_any_dtype(series.dtype):
+            datetime_columns.append(str(col))
+            export_frame[col] = pd.to_datetime(series, errors="coerce").dt.strftime("%Y-%m-%dT%H:%M:%S.%f")
+        elif pd.api.types.is_timedelta64_dtype(series.dtype):
+            export_frame[col] = series.astype(str)
+        elif pd.api.types.is_object_dtype(series.dtype):
+            # Preserve date/time objects and mixed report metadata predictably.
+            export_frame[col] = series.map(_portable_json_value)
+
+    manifest = {
+        "magic": PORTABLE_STATE_MAGIC,
+        "schema": PORTABLE_STATE_SCHEMA,
+        "app_build": APP_UI_BUILD_ID,
+        "parser_build": PARSER_BUILD_ID,
+        "created_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+        "chart_title": str(chart_title or ""),
+        "ui_state": _portable_json_value(ui_state or {}),
+        "manual_events": _portable_event_records(manual_events, ["datetime"]),
+        "operation_intervals": _portable_event_records(operation_intervals, ["start", "end"]),
+        "custom_y_ranges": _portable_json_value(custom_y_ranges or {}),
+        "data": {
+            "rows": int(len(export_frame)),
+            "columns": [str(c) for c in export_frame.columns],
+            "dtypes": dtype_map,
+            "datetime_columns": datetime_columns,
+            "file": "analysis_data.csv",
+        },
+    }
+
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+        zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, separators=(",", ":")))
+        zf.writestr("analysis_data.csv", export_frame.to_csv(index=False, lineterminator="\n"))
+    return output.getvalue()
+
+
+def attach_portable_state_to_pdf(pdf_bytes: bytes, state_zip_bytes: bytes) -> bytes:
+    """Embed the complete recoverable analysis state without changing PDF pages."""
+    if not pdf_bytes or not state_zip_bytes:
+        return pdf_bytes
+    try:
+        from pypdf import PdfReader, PdfWriter
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        writer = PdfWriter()
+        writer.clone_document_from_reader(reader)
+        writer.add_attachment(PORTABLE_STATE_ATTACHMENT, state_zip_bytes)
+        metadata = {
+            "/CorelytixPortableState": "1",
+            "/CorelytixStateSchema": str(PORTABLE_STATE_SCHEMA),
+            "/CorelytixAppBuild": APP_UI_BUILD_ID,
+        }
+        try:
+            existing = dict(reader.metadata or {})
+            existing.update(metadata)
+            writer.add_metadata({str(k): str(v) for k, v in existing.items() if v is not None})
+        except Exception:
+            writer.add_metadata(metadata)
+        output = io.BytesIO()
+        writer.write(output)
+        return output.getvalue()
+    except Exception:
+        # Never block a normal PDF download because an attachment library is
+        # unavailable; the PDF remains readable, only reopening state is absent.
+        return pdf_bytes
+
+
+def read_portable_state_from_pdf(file_name: str, pdf_bytes: bytes) -> Optional[dict]:
+    """Read and validate an embedded portable analysis package from a PDF."""
+    if Path(str(file_name)).suffix.lower() != ".pdf" or not pdf_bytes:
+        return None
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        attachment_values = reader.attachments.get(PORTABLE_STATE_ATTACHMENT, [])
+        if isinstance(attachment_values, (bytes, bytearray)):
+            attachment_values = [bytes(attachment_values)]
+        for payload_bytes in attachment_values or []:
+            with zipfile.ZipFile(io.BytesIO(payload_bytes)) as zf:
+                manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+                if manifest.get("magic") != PORTABLE_STATE_MAGIC:
+                    continue
+                if int(manifest.get("schema", 0) or 0) != PORTABLE_STATE_SCHEMA:
+                    continue
+                data_info = manifest.get("data", {}) or {}
+                csv_name = str(data_info.get("file") or "analysis_data.csv")
+                frame = pd.read_csv(io.BytesIO(zf.read(csv_name)), low_memory=False)
+                expected_columns = [str(c) for c in data_info.get("columns", [])]
+                if expected_columns and len(expected_columns) == len(frame.columns):
+                    frame.columns = expected_columns
+                for col in data_info.get("datetime_columns", []) or []:
+                    if col in frame.columns:
+                        frame[col] = pd.to_datetime(frame[col], errors="coerce")
+                dtype_map = data_info.get("dtypes", {}) or {}
+                for col, dtype_name in dtype_map.items():
+                    if col not in frame.columns or col in set(data_info.get("datetime_columns", []) or []):
+                        continue
+                    dtype_text = str(dtype_name).lower()
+                    try:
+                        if any(token in dtype_text for token in ["int", "float", "double", "decimal"]):
+                            frame[col] = pd.to_numeric(frame[col], errors="coerce")
+                        elif "bool" in dtype_text:
+                            frame[col] = frame[col].astype(str).str.lower().map({"true": True, "false": False})
+                    except Exception:
+                        pass
+                return {"manifest": manifest, "data": frame}
+    except Exception:
+        return None
+    return None
+
+
+def infer_legacy_pdf_theme(pdf_bytes: bytes) -> Optional[str]:
+    """Best-effort Light/Dark detection for older PDFs without embedded state."""
+    try:
+        import pypdfium2 as pdfium
+        from PIL import ImageStat
+        doc = pdfium.PdfDocument(pdf_bytes)
+        if len(doc) == 0:
+            return None
+        bitmap = doc[0].render(scale=0.35)
+        image = bitmap.to_pil().convert("L")
+        width, height = image.size
+        crop = image.crop((int(width * 0.08), int(height * 0.08), int(width * 0.92), int(height * 0.88)))
+        luminance = float(ImageStat.Stat(crop).mean[0])
+        return "Dark" if luminance < 118 else "Light"
+    except Exception:
+        return None
+
+
+def apply_portable_state_to_session(portable: dict, signature: str) -> bool:
+    """Restore PDF state once and request one clean rerun before widgets render."""
+    if not portable or st.session_state.get("_portable_state_applied_v97") == signature:
+        return False
+    manifest = portable.get("manifest", {}) or {}
+    ui_state = manifest.get("ui_state", {}) or {}
+    for key, value in ui_state.items():
+        if key in PORTABLE_SESSION_KEYS or str(key).startswith(PORTABLE_DYNAMIC_PREFIXES):
+            st.session_state[str(key)] = value
+
+    theme = str(ui_state.get("ui_theme") or manifest.get("theme") or "")
+    if theme in {"Light", "Dark"}:
+        st.session_state["ui_theme"] = theme
+
+    events = []
+    for item in manifest.get("manual_events", []) or []:
+        if not isinstance(item, dict):
+            continue
+        restored = dict(item)
+        if restored.get("datetime"):
+            restored["datetime"] = pd.Timestamp(restored["datetime"])
+        events.append(restored)
+    intervals = []
+    for item in manifest.get("operation_intervals", []) or []:
+        if not isinstance(item, dict):
+            continue
+        restored = dict(item)
+        if restored.get("start"):
+            restored["start"] = pd.Timestamp(restored["start"])
+        if restored.get("end"):
+            restored["end"] = pd.Timestamp(restored["end"])
+        intervals.append(restored)
+    st.session_state["manual_events_table"] = events
+    st.session_state["operation_intervals_table"] = intervals
+    st.session_state["portable_chart_title_v97"] = str(manifest.get("chart_title") or "")
+
+    custom_ranges = manifest.get("custom_y_ranges", {}) or {}
+    if custom_ranges:
+        st.session_state["detail_use_custom_y_scale_v97"] = True
+        st.session_state["history_use_custom_y_scale"] = True
+        for feature, limits in custom_ranges.items():
+            if isinstance(limits, (list, tuple)) and len(limits) == 2:
+                try:
+                    st.session_state[f"ymin_{feature_key_text(feature)}"] = float(limits[0])
+                    st.session_state[f"ymax_{feature_key_text(feature)}"] = float(limits[1])
+                except Exception:
+                    pass
+
+    frame = portable.get("data")
+    if isinstance(frame, pd.DataFrame) and not frame.empty:
+        st.session_state["continued_test_data_v93"] = frame.copy(deep=False)
+        st.session_state["portable_pdf_data_v97"] = frame.copy(deep=False)
+        st.session_state["portable_pdf_signature_v97"] = signature
+
+    st.session_state["_portable_state_applied_v97"] = signature
+    st.session_state["_portable_state_notice_v97"] = (
+        f"Restored {len(frame):,} readings, {len(events)} point event(s), "
+        f"{len(intervals)} interval event(s), and the saved {st.session_state.get('ui_theme', 'Light')} theme."
+        if isinstance(frame, pd.DataFrame) else
+        f"Restored {len(events)} point event(s), {len(intervals)} interval event(s), and the saved theme."
+    )
+    return True
 
 UI_THEME_PRESETS = {
     "Light": {
         "color_scheme": "light",
-        "app_bg": "#EEF3F7",
-        "app_bg_2": "#E4ECF2",
-        "sidebar_bg": "#F8FAFC",
+        "app_bg": "#E7EEF3",
+        "app_bg_2": "#DCE7EE",
+        "sidebar_bg": "#F5F8FA",
         "panel_bg": "#FFFFFF",
-        "panel_bg_2": "#F2F6F9",
+        "panel_bg_2": "#EAF1F5",
         "input_bg": "#FFFFFF",
-        "border": "#BFCEDA",
-        "border_strong": "#91A9B8",
-        "accent": "#0F627B",
-        "accent_hover": "#147D9A",
+        "border": "#A9BFCC",
+        "border_strong": "#7898A9",
+        "accent": "#075F7A",
+        "accent_hover": "#087C9E",
         "accent_soft": "#DCEEF3",
         "gold": "#A97B32",
         "gold_soft": "#C69A52",
-        "text": "#0B1F2A",
+        "text": "#061B26",
         "text_strong": "#03141D",
-        "text_muted": "#4E6573",
+        "text_muted": "#3D5967",
         "success": "#287A57",
         "warning": "#A86100",
         "danger": "#B73E38",
         "grid": "rgba(15, 98, 123, 0.035)",
         "glow": "rgba(47, 141, 168, 0.14)",
         "shadow": "rgba(22, 46, 60, 0.10)",
-        "control_bg": "#E8F0F4",
-        "control_hover": "#D6E6ED",
+        "control_bg": "#DCE8EE",
+        "control_hover": "#C9DDE7",
         "control_icon": "#214454",
         "disabled_bg": "#E8EEF2",
         "disabled_text": "#6A7E89",
         "scroll_track": "#E7EEF2",
         "scroll_thumb": "#6D8D9C",
         "scroll_thumb_hover": "#0F627B",
-        "chart_paper": "#F7F9FC",
+        "chart_paper": "#EEF3F7",
         "chart_plot": "#FFFFFF",
-        "chart_text": "#0A1E29",
-        "chart_grid": "#C8D5DF",
-        "chart_grid_soft": "#DEE7ED",
+        "chart_text": "#041923",
+        "chart_grid": "#AFC1CD",
+        "chart_grid_soft": "#D2DEE6",
         "chart_legend": "rgba(255,255,255,0.96)",
     },
     "Dark": {
@@ -2158,6 +2437,9 @@ with st.sidebar.expander("1. Data Sources", expanded=True):
                 pass
 
     st.caption("The interface uses generic examples before upload. Names from your own uploaded data are shown normally after parsing.")
+    _restore_notice_v97 = st.session_state.pop("_portable_state_notice_v97", None)
+    if _restore_notice_v97:
+        st.success(str(_restore_notice_v97))
 
     whatsapp_text = st.text_area(
         "Paste field-test messages",
@@ -2193,6 +2475,9 @@ with st.sidebar.expander("2. Processing", expanded=False):
             "continued_test_data_v93", "continued_upload_signatures_v93", "continued_batch_v93",
             "upload_parse_key_v83", "upload_parse_bundle_v83", "combined_data_key_v83", "combined_data_bundle_v83",
             "manual_events_table", "operation_intervals_table",
+            "portable_pdf_data_v97", "portable_pdf_signature_v97",
+            "portable_chart_title_v97", "_portable_state_applied_v97",
+            "_portable_title_applied_token_v97", "_legacy_pdf_theme_applied_v97",
         ):
             st.session_state.pop(_key, None)
         st.session_state["uploader_generation_v93"] = _uploader_generation_v93 + 1
@@ -2206,6 +2491,7 @@ with st.sidebar.expander("2. Processing", expanded=False):
         max_value=8760.0,
         value=12.0,
         step=1.0,
+        key="test_gap_hours_v97",
         help="Readings stay connected until the time gap is larger than this value.",
     )
     enable_ctu_ocr = st.checkbox(
@@ -2354,9 +2640,43 @@ if uploaded_files:
                 _zip_media_summary = inspect_chat_zip_media(f.name, file_bytes) if _suffix == ".zip" else None
                 _is_direct_image = _suffix in {".jpg", ".jpeg", ".png", ".webp"}
                 _parse_images_for_file = bool(enable_ctu_ocr) or _is_direct_image
-                parsed_tables = load_uploaded_file_once(
-                    f.name, file_bytes, _parse_images_for_file, int(max_ocr_images), PARSER_BUILD_ID
-                )
+
+                # PDFs exported by v97+ carry a safe embedded ZIP with the full
+                # dataframe and chart state. Restore it before ordinary PDF table
+                # parsing so reopening is exact instead of OCR/visual guesswork.
+                _portable_pdf = read_portable_state_from_pdf(f.name, file_bytes) if _suffix == ".pdf" else None
+                if _portable_pdf is not None:
+                    _portable_signature = hashlib.sha1(file_bytes).hexdigest()
+                    if apply_portable_state_to_session(_portable_pdf, _portable_signature):
+                        st.rerun()
+                    _portable_frame = _portable_pdf.get("data")
+                    parsed_tables = [_portable_frame.copy(deep=False)] if isinstance(_portable_frame, pd.DataFrame) and not _portable_frame.empty else []
+                else:
+                    # Older dashboard PDFs did not contain recoverable events/data.
+                    # Their visible background can still restore Light/Dark without
+                    # affecting ordinary vendor reports unless the dashboard title
+                    # is present in the PDF text.
+                    if _suffix == ".pdf":
+                        try:
+                            from pypdf import PdfReader
+                            _legacy_reader = PdfReader(io.BytesIO(file_bytes))
+                            _legacy_text = "\n".join((page.extract_text() or "") for page in _legacy_reader.pages[:2])
+                            _legacy_signature = hashlib.sha1(file_bytes).hexdigest()
+                            if ("Production Test" in _legacy_text or "Well Production Test" in _legacy_text) and st.session_state.get("_legacy_pdf_theme_applied_v97") != _legacy_signature:
+                                _legacy_theme = infer_legacy_pdf_theme(file_bytes)
+                                if _legacy_theme in UI_THEME_PRESETS:
+                                    st.session_state["ui_theme"] = _legacy_theme
+                                    st.session_state["_legacy_pdf_theme_applied_v97"] = _legacy_signature
+                                    st.session_state["_portable_state_notice_v97"] = (
+                                        f"Detected the {_legacy_theme} theme from an older dashboard PDF. "
+                                        "Exact event recovery requires a PDF exported by v97 or later."
+                                    )
+                                    st.rerun()
+                        except Exception:
+                            pass
+                    parsed_tables = load_uploaded_file_once(
+                        f.name, file_bytes, _parse_images_for_file, int(max_ocr_images), PARSER_BUILD_ID
+                    )
                 if _zip_media_summary is not None:
                     _zip_media_summary["ocr_rows"] = int(sum(
                         table.get("source_type", pd.Series(dtype=str)).astype(str).str.contains("ocr", case=False, na=False).sum()
@@ -3633,6 +3953,10 @@ if _prev_temp_unit != temperature_display_unit and _prev_temp_unit in {"°C", "�
                     pass
 st.session_state["_prev_temperature_display_unit_v58"] = temperature_display_unit
 
+# Keep one canonical pre-display-unit view for portable PDF reopening. Exported
+# PDF state must not store bar/°F display values under psi/°C canonical column
+# names, otherwise a later import would convert the same values twice.
+canonical_data_for_portable_v97 = data.copy(deep=False)
 data = apply_display_unit_conversions(data, pressure_display_unit, temperature_display_unit)
 
 # ---------------------------------------------------------------------------
@@ -3665,6 +3989,7 @@ if _has_choke_pct or _has_choke_size or _has_choke_ambiguous:
                 "Creates one choke curve. Percentage rows and /64-inch rows are converted "
                 "to the selected unit. Original uploaded columns remain unchanged."
             ),
+            key="choke_plot_mode_v97",
         )
         choke_full_open_64 = st.number_input(
             "Full-open choke size (/64 in)",
@@ -3673,6 +3998,7 @@ if _has_choke_pct or _has_choke_size or _has_choke_ambiguous:
             value=128.0,
             step=1.0,
             help="Calibration used for conversion. Default: 100% = 128/64 in; therefore 50% = 64/64 in.",
+            key="choke_full_open_64_v97",
         )
         if _has_choke_ambiguous:
             ambiguous_choke_unit = st.selectbox(
@@ -3687,10 +4013,12 @@ if _has_choke_pct or _has_choke_size or _has_choke_ambiguous:
                     "A plain entry such as 'Choke = 64' is impossible to identify from the number alone. "
                     "Choose its meaning here, or let Auto use explicit values in the same source file."
                 ),
+                key="ambiguous_choke_unit_v97",
             )
         treat_zero_choke_as_missing = st.checkbox(
             "Treat zero choke as blank/template value",
             value=True,
+            key="treat_zero_choke_as_missing_v97",
             help=(
                 "Recommended for TMU reports where unused choke cells are stored as 0. "
                 "Turn this off only when 0 truly means the choke was fully closed."
@@ -3861,6 +4189,7 @@ with st.sidebar.expander("4. Analysis View", expanded=True):
         "Choose analysis view",
         ["Test detail", "Production history"],
         horizontal=True,
+        key="analysis_view_v97",
         help=(
             "Test detail shows every reading inside a short test. Production history shows one stabilized "
             "value per test across months or years."
@@ -3885,6 +4214,7 @@ with st.sidebar.expander("4. Analysis View", expanded=True):
             "Time range control",
             ["Slider", "Manual calendar/time"],
             index=0,
+            key="time_filter_mode_v97",
             help="Use Manual calendar/time for long tests where a slider is difficult.",
         )
         time_aggregation = interval_select_with_custom(
@@ -3907,6 +4237,7 @@ with st.sidebar.expander("4. Analysis View", expanded=True):
             "X-axis display mode",
             ["Real calendar time", "Compressed real dates - remove empty gaps"],
             index=0,
+            key="x_axis_mode_v97",
         )
         if is_compressed_real_date_mode(x_axis_mode):
             continuous_gap_hours = st.number_input(
@@ -3915,6 +4246,7 @@ with st.sidebar.expander("4. Analysis View", expanded=True):
                 max_value=24.0,
                 value=2.0,
                 step=0.5,
+                key="continuous_gap_hours_v97",
             )
             compressed_gap_hours = st.number_input(
                 "Visual gap shown after long gaps (hours)",
@@ -3922,6 +4254,7 @@ with st.sidebar.expander("4. Analysis View", expanded=True):
                 max_value=12.0,
                 value=0.75,
                 step=0.25,
+                key="compressed_gap_hours_v97",
             )
         else:
             continuous_gap_hours = 2.0
@@ -3957,7 +4290,14 @@ with st.sidebar.expander("5. Wells & Signals", expanded=True):
             all_wells = sorted(well_df["well"].dropna().astype(str).unique())
     else:
         all_wells = []
-    selected_wells = st.multiselect("Choose wells", all_wells, default=all_wells[:1] if all_wells else [])
+    _saved_wells_v97 = st.session_state.get("selected_wells_v97", [])
+    if isinstance(_saved_wells_v97, (list, tuple)):
+        st.session_state["selected_wells_v97"] = [w for w in _saved_wells_v97 if w in all_wells]
+    if not st.session_state.get("selected_wells_v97") and all_wells:
+        st.session_state["selected_wells_v97"] = all_wells[:1]
+    selected_wells = st.multiselect(
+        "Choose wells", all_wells, default=all_wells[:1] if all_wells else [], key="selected_wells_v97"
+    )
 
     # Test/period filtering removed from the sidebar.
     # Tests are still detected internally and shown in the data preview/export,
@@ -3968,6 +4308,7 @@ with st.sidebar.expander("5. Wells & Signals", expanded=True):
     select_all_features = st.checkbox(
         "Select all signals",
         value=False,
+        key="select_all_features_v97",
         help="Shows every detected numeric column in the plot list, including raw fallback columns from unseen templates.",
     )
 
@@ -4025,7 +4366,13 @@ with st.sidebar.expander("5. Wells & Signals", expanded=True):
         sort_keys=True,
         ensure_ascii=False,
     )
-    if st.session_state.get(chart_header_selection_key) != selection_signature:
+    _portable_chart_title_v97 = str(st.session_state.get("portable_chart_title_v97", "") or "").strip()
+    _portable_title_token_v97 = f"{chart_header_key}|{st.session_state.get('portable_pdf_signature_v97', '')}"
+    if _portable_chart_title_v97 and st.session_state.get("_portable_title_applied_token_v97") != _portable_title_token_v97:
+        st.session_state[chart_header_key] = _portable_chart_title_v97
+        st.session_state[chart_header_selection_key] = selection_signature
+        st.session_state["_portable_title_applied_token_v97"] = _portable_title_token_v97
+    elif st.session_state.get(chart_header_selection_key) != selection_signature:
         st.session_state[chart_header_key] = auto_chart_header
         st.session_state[chart_header_selection_key] = selection_signature
     elif chart_header_key in st.session_state:
@@ -4127,6 +4474,7 @@ with st.sidebar.expander("6. Chart Options", expanded=False):
                 "Use custom Y-axis ranges",
                 value=False,
                 help="Set min/max for each selected graph, e.g. Gross Rate from 0 to 1000.",
+                key="detail_use_custom_y_scale_v97",
             )
 
             if use_custom_y_scale and selected_features:
@@ -4159,12 +4507,14 @@ with st.sidebar.expander("6. Chart Options", expanded=False):
             "Handle missing values",
             ["No fill", "Linear interpolation by row"],
             index=0,
+            key="fill_method_v97",
             help="This only affects the plotted/filtered copy, not the originally detected data.",
         )
 
         hide_zero_flow_rows = st.checkbox(
             "Hide zero-flow/bypassed rows",
             value=False,
+            key="hide_zero_flow_rows_v97",
             help="Useful for multiphase-meter reports during bypass periods where oil, water, gas, and gross are all zero.",
         )
 
@@ -4172,6 +4522,7 @@ with st.sidebar.expander("6. Chart Options", expanded=False):
             "Plot style",
             ["Separate panels like report", "Overlay actual values"],
             index=0,
+            key="plot_mode_v97",
             help="Use separate panels for normal reports. Use overlay to compare actual values on one axis.",
         )
 
@@ -4223,7 +4574,7 @@ with st.sidebar.expander("6. Chart Options", expanded=False):
         # Keep markers off automatically on large datasets for speed/readability, but allow the user to turn them on.
         estimated_points_for_speed = int(len(data)) if "data" in globals() else 0
         default_markers = estimated_points_for_speed <= 350
-        show_points = st.checkbox("Show markers", value=default_markers)
+        show_points = st.checkbox("Show markers", value=default_markers, key="show_points_v97")
 
         _vl1, _vl2 = st.columns([1.45, 0.85], gap="small")
         with _vl1:
@@ -4242,6 +4593,7 @@ with st.sidebar.expander("6. Chart Options", expanded=False):
                     "Clean readable keeps labels to important/non-crowded points. "
                     "Choose Every N readings and type the required spacing beside it."
                 ),
+                key="value_label_mode_v97",
             )
         with _vl2:
             custom_value_label_step = int(st.number_input(
@@ -4258,6 +4610,7 @@ with st.sidebar.expander("6. Chart Options", expanded=False):
             "Default number format on labels",
             ["Auto", "0 decimals", "1 decimal", "2 decimals"],
             index=0,
+            key="label_decimals_default_v97",
         )
         label_decimals_by_feature = {}
         if selected_features:
@@ -4303,6 +4656,7 @@ with st.sidebar.expander("7. Events & Notes", expanded=False):
     auto_hide_crowded_notes = st.checkbox(
         "Auto hide some notes when too crowded",
         value=False,
+        key="auto_hide_crowded_notes_v97",
         help=(
             "When enabled, the app keeps the most important/representative notes visible and hides extra notes "
             "only on the chart/export. The full note list remains saved in the sidebar."
@@ -4315,6 +4669,7 @@ with st.sidebar.expander("7. Events & Notes", expanded=False):
         max_value=20,
         value=8,
         step=1,
+        key="max_visible_notes_per_chart_v97",
         disabled=not auto_hide_crowded_notes,
         help="Used only when auto-hide is enabled.",
     )
@@ -4325,13 +4680,14 @@ with st.sidebar.expander("7. Events & Notes", expanded=False):
         index=0,
         help=(
             "Notes stay inside the plot and remain tied to their exact times. "
-            "Auto staggered uses compact labels for a few notes and vertical labels when the chart is crowded."
+            "Auto staggered keeps compact horizontal labels near the top, like version 92, and moves nearby labels to separate rows."
         ),
         key="event_label_layout",
     )
     enable_drag_annotations = st.checkbox(
         "Allow dragging event labels on the interactive chart",
         value=False,
+        key="enable_drag_annotations_v97",
         help="Mouse drag is for on-screen adjustment only. Downloaded PNG/PDF charts use the clean automatic note layout and do not save dragged positions.",
     )
 
@@ -4953,7 +5309,7 @@ if selected_features and not filtered.empty:
             level = int(interval.get("level", 0) or 0)
             note_col = note_color(idx)
             y_row = _inline_interval_y(level)
-            label = str(interval.get("label", "") or "").strip()
+            label = str(interval.get("label_html") or compact_note_label(interval.get("label", "")))
 
             for x_val in (x0, x1):
                 try:
@@ -5009,14 +5365,13 @@ if selected_features and not filtered.empty:
             total_note_count(), mobile=(chart_view_mode == "Mobile-friendly")
         )
         has_intervals = bool(visible_intervals_for_notes())
-        auto_vertical = event_label_style == "Auto staggered" and total_note_count() >= 3
-        vertical = event_label_style == "Vertical labels" or auto_vertical
+        vertical = event_label_style == "Vertical labels"
 
         for idx, event in enumerate(events):
             x = event["plot_x"]
             level = int(event.get("level", 0) or 0)
             note_col = note_color(idx + len(plot_intervals or []))
-            label = str(event.get("label", "") or "").strip()
+            label = str(event.get("label_html") or compact_note_label(event.get("label", "")))
             try:
                 fig.add_shape(
                     type="line", x0=x, x1=x, y0=0, y1=1,
@@ -5838,6 +6193,44 @@ if selected_features and not filtered.empty:
         idxs = _remove_value_labels_near_notes(g2, idxs)
         return {i for i in idxs if 0 <= i < n}
 
+    def matplotlib_value_label_placement(g, feature, index):
+        """Return an export label offset that respects inline event geometry."""
+        default = (0, 11 if int(index) % 2 == 0 else -16, "center")
+        try:
+            g2 = g.reset_index(drop=True)
+            xnums, yvals, span_x, span_y = _value_label_context(g2, feature)
+            if index < 0 or index >= len(xnums) or pd.isna(xnums.iloc[index]):
+                return default
+            xv = float(xnums.iloc[index])
+            guards = _note_guard_positions()
+            nearest = min((abs(xv - guard) for guard in guards), default=float("inf"))
+            clearance = max(span_x * 0.030, 1e-9)
+            valid_y = yvals.dropna()
+            ymin = float(valid_y.min()) if not valid_y.empty else 0.0
+            y_norm = 0.5
+            if index < len(yvals) and pd.notna(yvals.iloc[index]):
+                y_norm = (float(yvals.iloc[index]) - ymin) / span_y
+
+            interval_bounds = []
+            for interval in plot_intervals or []:
+                x0 = _note_x_number(interval.get("x0"))
+                x1 = _note_x_number(interval.get("x1"))
+                if pd.notna(x0) and pd.notna(x1):
+                    interval_bounds.append((min(float(x0), float(x1)), max(float(x0), float(x1))))
+            inside_interval = any(lo - clearance <= xv <= hi + clearance for lo, hi in interval_bounds)
+
+            if nearest <= clearance:
+                return (14, -16 if y_norm >= 0.82 else 12, "left")
+            if inside_interval and y_norm >= 0.76:
+                return (0, -17, "center")
+            if y_norm >= 0.92:
+                return (0, -17, "center")
+            if y_norm <= 0.08:
+                return (0, 12, "center")
+            return default
+        except Exception:
+            return default
+
     def apply_matplotlib_petro_style(fig_obj, ax_obj=None):
         """Apply the active engineering theme to PNG/PDF exports."""
         fig_obj.patch.set_facecolor(CHART_PAPER_BG)
@@ -5870,6 +6263,41 @@ if selected_features and not filtered.empty:
                 figure_text.set_color(CHART_TEXT)
             except Exception:
                 pass
+
+    def portable_ui_state_snapshot(features):
+        """Capture only chart-related controls needed to reopen the same analysis."""
+        snapshot = {}
+        for key in PORTABLE_SESSION_KEYS:
+            if key in st.session_state:
+                snapshot[key] = _portable_json_value(st.session_state.get(key))
+        for key in list(st.session_state.keys()):
+            if str(key).startswith(PORTABLE_DYNAMIC_PREFIXES):
+                snapshot[str(key)] = _portable_json_value(st.session_state.get(key))
+        snapshot.update({
+            "ui_theme": ACTIVE_THEME_NAME,
+            "selected_features_v58": list(features or []),
+            "plot_signal_order_v92_state": list(features or []),
+            "selected_wells_v97": list(selected_wells or []),
+            "analysis_view_v97": analysis_view,
+            "event_label_layout": event_label_style,
+            "pressure_display_unit_v58": pressure_display_unit,
+            "temperature_display_unit_v58": temperature_display_unit,
+        })
+        return snapshot
+
+    def make_portable_pdf(pdf_bytes, df, features):
+        portable_frame = canonical_data_for_portable_v97.copy(deep=False)
+        if selected_wells and "well" in portable_frame.columns:
+            portable_frame = portable_frame[portable_frame["well"].astype(str).isin(selected_wells)].copy(deep=False)
+        state_zip = build_portable_state_zip(
+            portable_frame,
+            ui_state=portable_ui_state_snapshot(features),
+            chart_title=chart_title_from_data(df, custom_chart_title),
+            manual_events=list(st.session_state.get("manual_events_table", []) or []),
+            operation_intervals=list(st.session_state.get("operation_intervals_table", []) or []),
+            custom_y_ranges=custom_y_ranges,
+        )
+        return attach_portable_state_to_pdf(pdf_bytes, state_zip)
 
     def human_readable_pdf_bytes(df, features):
         """Create a multi-page PDF: one large chart per feature, suitable for human reading/printing."""
@@ -5922,12 +6350,13 @@ if selected_features and not filtered.empty:
                         for i in sorted(idxs):
                             if i >= len(g) or pd.isna(y.iloc[i]):
                                 continue
+                            _label_dx, _label_dy, _label_ha = matplotlib_value_label_placement(g, feature, i)
                             ax.annotate(
                                 format_plot_value(feature, y.iloc[i]),
                                 (x.iloc[i], y.iloc[i]),
                                 textcoords="offset points",
-                                xytext=(0, 10 if i % 2 == 0 else -15),
-                                ha="center",
+                                xytext=(_label_dx, _label_dy),
+                                ha=_label_ha,
                                 fontsize=9.5,
                                 color=color,
                                 fontweight="bold",
@@ -5979,7 +6408,7 @@ if selected_features and not filtered.empty:
                 plt.close(fig_m)
 
         output.seek(0)
-        return output.getvalue()
+        return make_portable_pdf(output.getvalue(), df, features)
 
     def human_readable_png_zip_bytes(df, features):
         """Create a ZIP containing one large PNG per selected feature."""
@@ -6018,12 +6447,13 @@ if selected_features and not filtered.empty:
                     for i in sorted(idxs):
                         if i >= len(g) or pd.isna(y.iloc[i]):
                             continue
+                        _label_dx, _label_dy, _label_ha = matplotlib_value_label_placement(g, feature, i)
                         ax.annotate(
                             format_plot_value(feature, y.iloc[i]),
                             (x.iloc[i], y.iloc[i]),
                             textcoords="offset points",
-                            xytext=(0, 11 if i % 2 == 0 else -16),
-                            ha="center",
+                            xytext=(_label_dx, _label_dy),
+                            ha=_label_ha,
                             fontsize=11,
                             color=color,
                             fontweight="bold",
@@ -6178,15 +6608,15 @@ if selected_features and not filtered.empty:
             except Exception:
                 pass
             ax.text(
-                x_mid, min(0.992, y_frac + 0.018), str(interval.get("label", "")),
+                x_mid, min(0.992, y_frac + 0.018),
+                str(interval.get("label_html") or compact_note_label(interval.get("label", ""))).replace("<br>", "\n"),
                 transform=ax.get_xaxis_transform(), fontsize=interval_font_size,
                 fontweight="bold", ha="center", va="bottom", color=note_col,
                 bbox=dict(boxstyle="round,pad=0.22", fc=EXPORT_LABEL_BG, ec=note_col, alpha=0.98),
                 clip_on=False, zorder=14,
             )
 
-        auto_vertical = event_label_style == "Auto staggered" and total_note_count() >= 3
-        vertical = event_label_style == "Vertical labels" or auto_vertical
+        vertical = event_label_style == "Vertical labels"
         base_frac = 0.84 if intervals else 0.92
         for idx, event in enumerate(events):
             level = int(event.get("level", 0) or 0)
@@ -6201,7 +6631,7 @@ if selected_features and not filtered.empty:
             except Exception:
                 x_shift_points = 0
             ax.annotate(
-                str(event.get("label", "")),
+                str(event.get("label_html") or compact_note_label(event.get("label", ""))).replace("<br>", "\n"),
                 xy=(event["plot_x"], y_frac), xycoords=("data", "axes fraction"),
                 xytext=(x_shift_points, 0), textcoords="offset points",
                 rotation=rotation, va=va, ha=ha, fontsize=event_font_size,
@@ -6275,12 +6705,13 @@ if selected_features and not filtered.empty:
                     for i in sorted(idxs):
                         if i >= len(g) or pd.isna(y.iloc[i]):
                             continue
+                        _label_dx, _label_dy, _label_ha = matplotlib_value_label_placement(g, feature, i)
                         ax.annotate(
                             format_plot_value(feature, y.iloc[i]),
                             (x.iloc[i], y.iloc[i]),
                             textcoords="offset points",
-                            xytext=(0, 11 if i % 2 == 0 else -16),
-                            ha="center",
+                            xytext=(_label_dx, _label_dy),
+                            ha=_label_ha,
                             fontsize=10.5,
                             color=color,
                             fontweight="bold",
@@ -6315,7 +6746,8 @@ if selected_features and not filtered.empty:
             fig_m.savefig(output, format="png", dpi=320, bbox_inches="tight", facecolor=CHART_PAPER_BG, edgecolor=CHART_PAPER_BG)
         plt.close(fig_m)
         output.seek(0)
-        return output.getvalue()
+        payload = output.getvalue()
+        return make_portable_pdf(payload, df, features) if fmt == "pdf" else payload
 
     def human_readable_multi_png_bytes(df, features):
         """Create one PNG byte stream per selected feature for phone-friendly separate downloads."""
@@ -6367,12 +6799,13 @@ if selected_features and not filtered.empty:
                     for i in sorted(idxs):
                         if i >= len(g) or pd.isna(y.iloc[i]):
                             continue
+                        _label_dx, _label_dy, _label_ha = matplotlib_value_label_placement(g, feature, i)
                         ax.annotate(
                             format_plot_value(feature, y.iloc[i]),
                             (x.iloc[i], y.iloc[i]),
                             textcoords="offset points",
-                            xytext=(0, 10 if i % 2 == 0 else -14),
-                            ha="center",
+                            xytext=(_label_dx, _label_dy),
+                            ha=_label_ha,
                             fontsize=9.5,
                             color=color,
                             fontweight="bold",

@@ -1,0 +1,61 @@
+Production Test Dashboard v97 validation
+=========================================
+
+Build
+-----
+v97-portable-pdf-v92-events-20260702
+
+Compilation
+-----------
+PASS - app.py
+PASS - tmu_parser.py
+PASS - tmu_parser_compat.py
+PASS - tmu_parser_legacy.py
+PASS - smart_tabular_v75.py
+PASS - history_analysis.py
+
+Portable PDF reopening
+----------------------
+PASS - safe ZIP state attachment embedded in PDF
+PASS - PDF pages unchanged after attachment (0.0% rendered pixel difference)
+PASS - canonical dataframe round-trip
+PASS - numeric values restored correctly
+PASS - datetime dtype and timestamp values restored correctly
+PASS - Light/Dark theme stored and restored
+PASS - point events stored and restored
+PASS - operation intervals stored and restored
+PASS - chart title stored and restored
+PASS - selected signals and signal order stored and restored
+PASS - custom Y-axis ranges stored and restored
+PASS - pre-display canonical values used to prevent double pressure/temperature conversion
+
+Version-92 events
+-----------------
+PASS - inline event guide lines retained
+PASS - Auto staggered uses horizontal compact labels
+PASS - vertical labels occur only when explicitly selected
+PASS - nearby labels use text-width-aware stagger rows
+PASS - operation interval boundaries and bidirectional arrow retained
+PASS - Plotly numeric labels move/hide only when required near events
+PASS - Matplotlib PNG/PDF numeric labels use the same event-aware displacement policy
+
+Theme
+-----
+PASS - enhanced Light chart text and grid contrast
+PASS - stronger Light panel/control borders
+PASS - more saturated Light production-curve colors
+PASS - Dark theme values unchanged
+
+Regression
+----------
+PASS - smart gross-rate range: maximum 177 -> 0 to 200
+PASS - smart gas-rate range: maximum 3.91 -> 0 to 5
+PASS - percentage range: 0 to 100
+PASS - choke-size range: 0 to 128
+PASS - negative reel-speed values remain visible
+PASS - continuation merge retains newest value at an overlapping timestamp
+PASS - explicit Streamlit widget keys are unique in static validation
+
+Environment limitation
+----------------------
+The execution environment did not contain the Streamlit package/CLI, so a live browser session was unavailable. Python compilation, AST regression checks, portable-PDF round-trip, pypdf attachment inspection, and rendered PDF comparison passed.

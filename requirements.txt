@@ -16,5 +16,5 @@ Pillow>=10.0
 pytesseract>=0.3.10
 opencv-python-headless>=4.10
 streamlit-sortables==0.3.1
-pypdf>=5.0
-PyMuPDF>=1.24
+pypdf>=5.9,<7
+pypdfium2>=4.30
