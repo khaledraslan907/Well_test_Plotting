@@ -1,0 +1,16 @@
+Production Test Dashboard v95 validation
+========================================
+
+PASS - app.py Python compilation
+PASS - parser modules Python compilation
+PASS - v95 build identifier present
+PASS - v92 sidebar scroll rule restored: overflow-y: scroll
+PASS - fixed 100vh sidebar wrappers removed
+PASS - nested sidebar overflow:hidden rule removed
+PASS - scrollbar width restored to 13 px
+PASS - scrollbar thumb minimum height restored to 42 px
+PASS - v94 smart Y-axis and note-clearance code retained
+
+Browser note
+------------
+A live Streamlit browser was not installed in this execution environment. Static DOM/CSS checks and Python compilation passed. The sidebar CSS now matches the proven v92 scrolling structure requested by the user.
