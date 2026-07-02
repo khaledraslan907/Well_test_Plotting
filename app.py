@@ -381,7 +381,7 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_UI_BUILD_ID = "v94-note-clearance-smart-y-axis-20260702"
+APP_UI_BUILD_ID = "v95-v92-sidebar-scroll-20260702"
 print(f"Starting Production Test Dashboard: {APP_UI_BUILD_ID} | parser={PARSER_BUILD_ID}")
 
 UI_THEME_PRESETS = {
@@ -1202,55 +1202,27 @@ st.markdown(
     [data-testid="stSidebarContent"],
     [data-testid="stSidebarUserContent"] {{ scrollbar-gutter: stable; }}
 
-    /* Keep exactly one real scrolling surface in the sidebar.  Older builds
-       placed overflow rules on several nested elements, so the visible thumb
-       could move without the controls moving. */
-    section[data-testid="stSidebar"] {{
-        overflow: hidden !important;
-        overscroll-behavior: contain;
-    }}
-    section[data-testid="stSidebar"] > div:first-child {{
-        height: 100vh !important;
-        max-height: 100vh !important;
-        overflow: hidden !important;
-    }}
+    /* Sidebar scrolling restored to the proven v92 behavior.
+       Let Streamlit keep its native sidebar height and make its own content
+       container the scrolling surface.  Avoid fixed 100vh/nested overflow
+       rules because they can create a visible thumb that does not move the
+       controls in some browsers. */
     section[data-testid="stSidebar"] [data-testid="stSidebarContent"] {{
-        height: 100vh !important;
-        max-height: 100vh !important;
         overflow-x: hidden !important;
-        overflow-y: auto !important;
-        overscroll-behavior-y: contain;
-        scroll-behavior: smooth;
-        touch-action: pan-y;
-        pointer-events: auto !important;
-        scrollbar-gutter: stable both-edges;
-        padding-bottom: 5rem !important;
+        overflow-y: scroll !important;
+        scrollbar-gutter: stable !important;
+        overscroll-behavior-y: auto;
     }}
     section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {{
-        overflow: visible !important;
-        min-height: max-content !important;
         padding-bottom: 3rem !important;
     }}
-    section[data-testid="stSidebar"] [data-testid="stSidebarContent"]:hover {{
-        scrollbar-color: var(--petro-scroll-thumb-hover) var(--petro-scroll-track);
-    }}
-    section[data-testid="stSidebar"] [data-testid="stSidebarContent"]::-webkit-scrollbar {{
-        width: 18px;
-    }}
-    section[data-testid="stSidebar"] [data-testid="stSidebarContent"]::-webkit-scrollbar-thumb {{
-        min-height: 96px;
-        cursor: grab;
-    }}
-    section[data-testid="stSidebar"] [data-testid="stSidebarContent"]::-webkit-scrollbar-thumb:active {{
-        cursor: grabbing;
-    }}
-    *::-webkit-scrollbar {{ width: 16px; height: 14px; }}
+    *::-webkit-scrollbar {{ width: 13px; height: 13px; }}
     *::-webkit-scrollbar-track {{
         background: var(--petro-scroll-track);
         border-radius: 999px;
     }}
     *::-webkit-scrollbar-thumb {{
-        min-height: 72px;
+        min-height: 42px;
         background: var(--petro-scroll-thumb);
         border: 3px solid var(--petro-scroll-track);
         border-radius: 999px;
