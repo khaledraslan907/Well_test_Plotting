@@ -1,0 +1,52 @@
+Production Test Dashboard v99 validation
+========================================
+
+Build
+-----
+UI build: v99-safe-session-restore-20260702
+Parser build: v98-legacy-vector-pdf-recovery-20260702 (unchanged)
+
+Compilation
+-----------
+PASS - app.py
+PASS - tmu_parser.py
+PASS - tmu_parser_compat.py
+PASS - tmu_parser_legacy.py
+PASS - smart_tabular_v75.py
+PASS - history_analysis.py
+PASS - legacy_dashboard_pdf.py
+
+Streamlit session-state restoration
+-----------------------------------
+PASS - legacy PDF restoration does not write ui_theme after its widget is instantiated
+PASS - portable PDF restoration does not write any saved widget-backed control in the active run
+PASS - recovered controls are staged in a private pending-state container
+PASS - staged controls are applied at the beginning of the next rerun before widgets exist
+PASS - Light/Dark theme, events, intervals, wells, selected signals and curve order restore safely
+PASS - continuation mode, test-gap setting and custom Y-axis settings use the same safe path
+PASS - legacy theme-only detection uses the same safe path
+PASS - Start a new analysis clears pending restored state
+
+Supplied BED-3-C18-7 PDF
+------------------------
+PASS - PDF parsed without the previous session-state exception
+PASS - 42 timestamped rows recovered
+PASS - 9 engineering signals recovered
+PASS - Dark theme recovered
+PASS - 2 point events recovered
+PASS - 1 operation interval recovered
+PASS - Well B3C18-7 retained
+
+Preserved regressions
+---------------------
+PASS - v98 legacy vector-PDF recovery
+PASS - v97 portable PDF embedded-state round trip
+PASS - version-92 inline horizontal auto-stagger event behavior
+PASS - smart Y-axis rules
+PASS - continuation overlap keeps newest uploaded values
+
+Scope
+-----
+Only the recovered-session-state timing was changed. Parser interpretation,
+chart rendering, event presentation, theme design, continuation logic, exports,
+units and engineering calculations remain unchanged.

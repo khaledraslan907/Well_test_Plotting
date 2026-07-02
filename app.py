@@ -396,12 +396,37 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_UI_BUILD_ID = "v98-legacy-vector-pdf-recovery-20260702"
+APP_UI_BUILD_ID = "v99-safe-session-restore-20260702"
 print(f"Starting Production Test Dashboard: {APP_UI_BUILD_ID} | parser={PARSER_BUILD_ID}")
 
 PORTABLE_STATE_MAGIC = "CORELYTIX_PRODUCTION_TEST_ANALYSIS"
 PORTABLE_STATE_SCHEMA = 1
 PORTABLE_STATE_ATTACHMENT = "corelytix_production_test_state_v1.zip"
+
+# Streamlit does not allow a widget-backed session key to be changed after that
+# widget has been instantiated in the current run. PDF state is discovered only
+# after the upload widget has rendered, so recovered controls are staged here and
+# applied at the very start of the next rerun, before any widget is created.
+PENDING_SESSION_RESTORE_KEY_V99 = "_pending_session_restore_v99"
+
+
+def queue_session_state_restore_v99(values: dict) -> None:
+    """Stage recovered control state without touching live widget keys."""
+    if not isinstance(values, dict) or not values:
+        return
+    current = st.session_state.get(PENDING_SESSION_RESTORE_KEY_V99)
+    merged = dict(current) if isinstance(current, dict) else {}
+    merged.update({str(key): value for key, value in values.items()})
+    st.session_state[PENDING_SESSION_RESTORE_KEY_V99] = merged
+
+
+def apply_pending_session_state_restore_v99() -> None:
+    """Apply staged state before any Streamlit widget is instantiated."""
+    pending = st.session_state.pop(PENDING_SESSION_RESTORE_KEY_V99, None)
+    if not isinstance(pending, dict):
+        return
+    for key, value in pending.items():
+        st.session_state[str(key)] = value
 
 # These controls are safe to restore before their widgets are created. Dynamic
 # data-dependent selections are reconciled against the newly restored dataframe
@@ -616,18 +641,19 @@ def infer_legacy_pdf_theme(pdf_bytes: bytes) -> Optional[str]:
 
 
 def apply_portable_state_to_session(portable: dict, signature: str) -> bool:
-    """Restore PDF state once and request one clean rerun before widgets render."""
+    """Stage recovered PDF controls and request one clean pre-widget rerun."""
     if not portable or st.session_state.get("_portable_state_applied_v97") == signature:
         return False
     manifest = portable.get("manifest", {}) or {}
     ui_state = manifest.get("ui_state", {}) or {}
+    pending_state = {}
     for key, value in ui_state.items():
         if key in PORTABLE_SESSION_KEYS or str(key).startswith(PORTABLE_DYNAMIC_PREFIXES):
-            st.session_state[str(key)] = value
+            pending_state[str(key)] = value
 
     theme = str(ui_state.get("ui_theme") or manifest.get("theme") or "")
     if theme in {"Light", "Dark"}:
-        st.session_state["ui_theme"] = theme
+        pending_state["ui_theme"] = theme
 
     events = []
     for item in manifest.get("manual_events", []) or []:
@@ -647,21 +673,23 @@ def apply_portable_state_to_session(portable: dict, signature: str) -> bool:
         if restored.get("end"):
             restored["end"] = pd.Timestamp(restored["end"])
         intervals.append(restored)
-    st.session_state["manual_events_table"] = events
-    st.session_state["operation_intervals_table"] = intervals
-    st.session_state["portable_chart_title_v97"] = str(manifest.get("chart_title") or "")
+    pending_state["manual_events_table"] = events
+    pending_state["operation_intervals_table"] = intervals
+    pending_state["portable_chart_title_v97"] = str(manifest.get("chart_title") or "")
 
     custom_ranges = manifest.get("custom_y_ranges", {}) or {}
     if custom_ranges:
-        st.session_state["detail_use_custom_y_scale_v97"] = True
-        st.session_state["history_use_custom_y_scale"] = True
+        pending_state["detail_use_custom_y_scale_v97"] = True
+        pending_state["history_use_custom_y_scale"] = True
         for feature, limits in custom_ranges.items():
             if isinstance(limits, (list, tuple)) and len(limits) == 2:
                 try:
-                    st.session_state[f"ymin_{feature_key_text(feature)}"] = float(limits[0])
-                    st.session_state[f"ymax_{feature_key_text(feature)}"] = float(limits[1])
+                    pending_state[f"ymin_{feature_key_text(feature)}"] = float(limits[0])
+                    pending_state[f"ymax_{feature_key_text(feature)}"] = float(limits[1])
                 except Exception:
                     pass
+
+    queue_session_state_restore_v99(pending_state)
 
     frame = portable.get("data")
     if isinstance(frame, pd.DataFrame) and not frame.empty:
@@ -670,9 +698,10 @@ def apply_portable_state_to_session(portable: dict, signature: str) -> bool:
         st.session_state["portable_pdf_signature_v97"] = signature
 
     st.session_state["_portable_state_applied_v97"] = signature
+    restored_theme = pending_state.get("ui_theme", st.session_state.get("ui_theme", "Light"))
     st.session_state["_portable_state_notice_v97"] = (
         f"Restored {len(frame):,} readings, {len(events)} point event(s), "
-        f"{len(intervals)} interval event(s), and the saved {st.session_state.get('ui_theme', 'Light')} theme."
+        f"{len(intervals)} interval event(s), and the saved {restored_theme} theme."
         if isinstance(frame, pd.DataFrame) else
         f"Restored {len(events)} point event(s), {len(intervals)} interval event(s), and the saved theme."
     )
@@ -680,28 +709,29 @@ def apply_portable_state_to_session(portable: dict, signature: str) -> bool:
 
 
 def apply_legacy_dashboard_state_to_session(state: dict, signature: str) -> bool:
-    """Restore theme, events, title and curve order recovered from a pre-v97 PDF."""
+    """Stage recovered pre-v97 controls and request one clean pre-widget rerun."""
     if not state or st.session_state.get("_legacy_dashboard_state_applied_v98") == signature:
         return False
 
+    pending_state = {}
     theme = str(state.get("theme") or "")
     if theme in {"Light", "Dark"}:
-        st.session_state["ui_theme"] = theme
+        pending_state["ui_theme"] = theme
 
     features = [str(x) for x in (state.get("selected_features") or []) if str(x)]
     if features:
-        st.session_state["selected_features_v58"] = features
-        st.session_state["plot_signal_order_v92_state"] = features
+        pending_state["selected_features_v58"] = features
+        pending_state["plot_signal_order_v92_state"] = features
 
     well = str(state.get("well") or "").strip()
     if well:
-        st.session_state["selected_wells_v97"] = [well]
+        pending_state["selected_wells_v97"] = [well]
 
-    st.session_state["analysis_view_v97"] = "Test detail"
+    pending_state["analysis_view_v97"] = "Test detail"
     x_mode = str(state.get("x_axis_mode") or "")
     if x_mode in {"Real calendar time", "Compressed real dates - remove empty gaps"}:
-        st.session_state["x_axis_mode_v97"] = x_mode
-    st.session_state["event_label_layout"] = "Auto staggered"
+        pending_state["x_axis_mode_v97"] = x_mode
+    pending_state["event_label_layout"] = "Auto staggered"
 
     events = []
     for item in state.get("manual_events", []) or []:
@@ -721,20 +751,26 @@ def apply_legacy_dashboard_state_to_session(state: dict, signature: str) -> bool
         if restored.get("end"):
             restored["end"] = pd.Timestamp(restored["end"])
         intervals.append(restored)
-    st.session_state["manual_events_table"] = events
-    st.session_state["operation_intervals_table"] = intervals
+    pending_state["manual_events_table"] = events
+    pending_state["operation_intervals_table"] = intervals
 
     title = str(state.get("chart_title") or "").strip()
     if title:
-        st.session_state["portable_chart_title_v97"] = title
+        pending_state["portable_chart_title_v97"] = title
         st.session_state["portable_pdf_signature_v97"] = signature
 
+    queue_session_state_restore_v99(pending_state)
     st.session_state["_legacy_dashboard_state_applied_v98"] = signature
     st.session_state["_portable_state_notice_v97"] = (
         f"Recovered the older dashboard PDF from vector chart data: {len(features)} signal(s), "
         f"{len(events)} point event(s), {len(intervals)} interval event(s), and the {theme or 'saved'} theme."
     )
     return True
+
+
+# Consume recovered widget values before theme calculation and before any widget
+# is instantiated. This is the only safe point to update widget-backed keys.
+apply_pending_session_state_restore_v99()
 
 
 UI_THEME_PRESETS = {
@@ -2537,7 +2573,7 @@ with st.sidebar.expander("2. Processing", expanded=False):
             "portable_pdf_data_v97", "portable_pdf_signature_v97",
             "portable_chart_title_v97", "_portable_state_applied_v97",
             "_portable_title_applied_token_v97", "_legacy_pdf_theme_applied_v97",
-            "_legacy_dashboard_state_applied_v98",
+            "_legacy_dashboard_state_applied_v98", PENDING_SESSION_RESTORE_KEY_V99,
         ):
             st.session_state.pop(_key, None)
         st.session_state["uploader_generation_v93"] = _uploader_generation_v93 + 1
@@ -2725,7 +2761,7 @@ if uploaded_files:
                             if ("Production Test" in _legacy_text or "Well Production Test" in _legacy_text) and st.session_state.get("_legacy_pdf_theme_applied_v97") != _legacy_signature:
                                 _legacy_theme = infer_legacy_pdf_theme(file_bytes)
                                 if _legacy_theme in UI_THEME_PRESETS:
-                                    st.session_state["ui_theme"] = _legacy_theme
+                                    queue_session_state_restore_v99({"ui_theme": _legacy_theme})
                                     st.session_state["_legacy_pdf_theme_applied_v97"] = _legacy_signature
                                     st.session_state["_portable_state_notice_v97"] = (
                                         f"Detected the {_legacy_theme} theme from an older dashboard PDF. "
