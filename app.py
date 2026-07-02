@@ -72,7 +72,6 @@ assign_test_ids = getattr(_tmu_parser, "assign_test_ids", lambda df, gap_hours=1
 normalize_ctu_ocr_signals = getattr(_tmu_parser, "normalize_ctu_ocr_signals", lambda df: df)
 
 from history_analysis import build_production_history
-from project_resume import build_project_bundle, embed_project_bundle
 
 DISPLAY_LABEL_FILE = Path(__file__).with_name("user_display_labels.json")
 
@@ -338,7 +337,22 @@ WELL_COLORS = [
     "#C49A44", "#00897B",
 ]
 
+LIGHT_FEATURE_COLOR_OVERRIDES = {
+    "gross_rate_bpd": "#496B7A",
+    "qgross_s_bpd": "#496B7A",
+    "gas_rate_mmscfd": "#0097A7",
+    "qgas_s_mmscfd": "#0097A7",
+    "qgas_a_mmcfd": "#00A6B8",
+    "water_rate_bpd": "#0B67C2",
+    "qwat_s_bpd": "#0B67C2",
+    "oil_rate_stbd": "#237A31",
+    "qoil_s_stbd": "#237A31",
+}
+
 def feature_color(feature_name: str, fallback_index: int = 0) -> str:
+    if globals().get("ACTIVE_THEME_NAME") == "Light":
+        if feature_name in LIGHT_FEATURE_COLOR_OVERRIDES:
+            return LIGHT_FEATURE_COLOR_OVERRIDES[feature_name]
     return FEATURE_COLORS.get(feature_name, WELL_COLORS[fallback_index % len(WELL_COLORS)])
 
 def well_color(index: int) -> str:
@@ -382,134 +396,28 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_UI_BUILD_ID = "v96-resumable-pdf-project-20260702"
+APP_UI_BUILD_ID = "v96-inline-events-clear-labels-enhanced-light-20260702"
 print(f"Starting Production Test Dashboard: {APP_UI_BUILD_ID} | parser={PARSER_BUILD_ID}")
-
-
-def _merge_unique_project_records_v96(existing, incoming, fields):
-    merged = []
-    seen = set()
-    for record in list(existing or []) + list(incoming or []):
-        if not isinstance(record, dict):
-            continue
-        normalized = dict(record)
-        for field in ("datetime", "start", "end"):
-            if field in normalized and normalized[field] not in (None, ""):
-                try:
-                    normalized[field] = pd.Timestamp(normalized[field])
-                except Exception:
-                    pass
-        key = tuple(str(normalized.get(field, "")) for field in fields)
-        if key in seen:
-            continue
-        seen.add(key)
-        merged.append(normalized)
-    return merged
-
-
-def _apply_pending_project_restore_v96():
-    """Apply a saved PDF project before any Streamlit widgets are created."""
-    pending = st.session_state.pop("pending_project_restore_v96", None)
-    if not isinstance(pending, dict):
-        return
-    signature = str(pending.get("signature", ""))
-    state = pending.get("state", {})
-    if not isinstance(state, dict):
-        return
-    chart = state.get("chart", {}) if isinstance(state.get("chart"), dict) else {}
-
-    allowed = {
-        "ui_theme": chart.get("theme"),
-        "analysis_view_v96": chart.get("analysis_view"),
-        "selected_wells_v96": chart.get("selected_wells"),
-        "selected_features_v58": chart.get("selected_features"),
-        "plot_signal_order_v92_state": chart.get("signal_order") or chart.get("selected_features"),
-        "pressure_display_unit_v58": chart.get("pressure_display_unit"),
-        "temperature_display_unit_v58": chart.get("temperature_display_unit"),
-        "x_axis_mode_v96": chart.get("x_axis_mode"),
-        "continuous_gap_hours_v96": chart.get("continuous_gap_hours"),
-        "compressed_gap_hours_v96": chart.get("compressed_gap_hours"),
-        "plot_mode_v96": chart.get("plot_mode"),
-        "show_points_v96": chart.get("show_points"),
-        "event_label_layout": chart.get("event_label_layout"),
-        "choke_plot_mode_v96": chart.get("choke_plot_mode"),
-        "choke_full_open_64_v96": chart.get("choke_full_open_64"),
-        "continue_current_test_v93": True,
-    }
-    if str(chart.get("analysis_view", "")) == "Production history":
-        allowed["history_value_label_mode"] = chart.get("value_label_mode")
-        allowed["history_value_label_step"] = chart.get("value_label_step")
-    else:
-        allowed["detail_value_label_mode_v96"] = chart.get("value_label_mode")
-        allowed["detail_value_label_step"] = chart.get("value_label_step")
-    for key, value in allowed.items():
-        if value is not None:
-            st.session_state[key] = value
-
-    if chart.get("chart_title") not in (None, ""):
-        st.session_state["_restored_chart_title_pending_v96"] = str(chart.get("chart_title"))
-    restored_y_ranges = chart.get("custom_y_ranges")
-    if isinstance(restored_y_ranges, dict) and restored_y_ranges:
-        st.session_state["_restored_custom_y_ranges_pending_v96"] = restored_y_ranges
-
-    aggregation = str(chart.get("time_aggregation", "") or "")
-    if aggregation:
-        known = {"Raw data", "5 minutes", "15 minutes", "30 minutes", "1 hour", "6 hours", "1 day", "1 month", "1 year"}
-        if aggregation in known:
-            st.session_state["time_aggregation_interval_preset"] = aggregation
-        elif aggregation.startswith("Custom:"):
-            st.session_state["time_aggregation_interval_preset"] = "Custom"
-            st.session_state["time_aggregation_interval_custom_value"] = aggregation.split(":", 1)[1].strip()
-
-    tick_scale = str(chart.get("x_axis_scale", "") or "")
-    if tick_scale:
-        known = {"Auto readable", "30 minutes", "1 hour", "3 hours", "6 hours", "12 hours", "1 day", "1 month", "1 year"}
-        if tick_scale in known:
-            st.session_state["x_axis_tick_interval_preset"] = tick_scale
-        elif tick_scale.startswith("Custom:"):
-            st.session_state["x_axis_tick_interval_preset"] = "Custom"
-            st.session_state["x_axis_tick_interval_custom_value"] = tick_scale.split(":", 1)[1].strip()
-
-    st.session_state["manual_events_table"] = _merge_unique_project_records_v96(
-        st.session_state.get("manual_events_table", []),
-        state.get("events", []),
-        ("datetime", "label", "target"),
-    )
-    st.session_state["operation_intervals_table"] = _merge_unique_project_records_v96(
-        st.session_state.get("operation_intervals_table", []),
-        state.get("intervals", []),
-        ("start", "end", "label", "target"),
-    )
-    st.session_state["_project_restore_applied_signature_v96"] = signature
-    exact = bool(state.get("exact_restore", state.get("source_kind") == "embedded_project"))
-    st.session_state["_project_restore_message_v96"] = (
-        "Saved PDF project restored exactly: data, selected signals, chart settings, and events are ready to continue."
-        if exact else
-        "Older dashboard PDF recovered from its visible chart values and event markers. Upload the later readings to extend it."
-    )
-
-
-_apply_pending_project_restore_v96()
 
 UI_THEME_PRESETS = {
     "Light": {
         "color_scheme": "light",
-        "app_bg": "#F4F7FA",
-        "app_bg_2": "#EAF0F5",
+        "app_bg": "#EEF3F7",
+        "app_bg_2": "#E4ECF2",
         "sidebar_bg": "#F8FAFC",
         "panel_bg": "#FFFFFF",
-        "panel_bg_2": "#F5F8FA",
+        "panel_bg_2": "#F2F6F9",
         "input_bg": "#FFFFFF",
-        "border": "#CDD9E2",
-        "border_strong": "#AFC1CE",
+        "border": "#BFCEDA",
+        "border_strong": "#91A9B8",
         "accent": "#0F627B",
         "accent_hover": "#147D9A",
         "accent_soft": "#DCEEF3",
         "gold": "#A97B32",
         "gold_soft": "#C69A52",
-        "text": "#10222E",
-        "text_strong": "#081923",
-        "text_muted": "#5C7180",
+        "text": "#0B1F2A",
+        "text_strong": "#03141D",
+        "text_muted": "#4E6573",
         "success": "#287A57",
         "warning": "#A86100",
         "danger": "#B73E38",
@@ -524,11 +432,11 @@ UI_THEME_PRESETS = {
         "scroll_track": "#E7EEF2",
         "scroll_thumb": "#6D8D9C",
         "scroll_thumb_hover": "#0F627B",
-        "chart_paper": "#FFFFFF",
-        "chart_plot": "#F8FAFC",
-        "chart_text": "#152631",
-        "chart_grid": "#D9E3EA",
-        "chart_grid_soft": "#ECF1F4",
+        "chart_paper": "#F7F9FC",
+        "chart_plot": "#FFFFFF",
+        "chart_text": "#0A1E29",
+        "chart_grid": "#C8D5DF",
+        "chart_grid_soft": "#DEE7ED",
         "chart_legend": "rgba(255,255,255,0.96)",
     },
     "Dark": {
@@ -2272,24 +2180,19 @@ Pumping P= 849 Psi""",
 
 with st.sidebar.expander("2. Processing", expanded=False):
     continue_current_test = st.checkbox(
-        "Continue current test or resume saved PDF",
+        "Continue current test with new uploads",
         value=True,
         key="continue_current_test_v93",
         help=(
-            "During the current session, later files are appended automatically. After closing the app, upload a PDF "
-            "previously exported by this dashboard to restore its data, selected signals, chart settings, and events, "
-            "then upload the later readings."
+            "When a later file belongs to the same well/test, the app appends it to the current analysis, "
+            "removes overlapping duplicate timestamps, and keeps your selected signals and chart settings."
         ),
     )
-    st.caption("To continue after closing the app, upload the saved dashboard PDF together with, or before, the new readings.")
     if st.button("Start a new analysis", key="start_new_analysis_v93", use_container_width=True):
         for _key in (
             "continued_test_data_v93", "continued_upload_signatures_v93", "continued_batch_v93",
             "upload_parse_key_v83", "upload_parse_bundle_v83", "combined_data_key_v83", "combined_data_bundle_v83",
             "manual_events_table", "operation_intervals_table",
-            "pending_project_restore_v96", "_project_restore_applied_signature_v96",
-            "_project_restore_message_v96", "_restored_chart_title_pending_v96",
-            "_restored_custom_y_ranges_pending_v96",
         ):
             st.session_state.pop(_key, None)
         st.session_state["uploader_generation_v93"] = _uploader_generation_v93 + 1
@@ -2395,7 +2298,6 @@ def load_uploaded_file_once(file_name: str, file_bytes: bytes, parse_images: boo
 frames = []
 errors = []
 zip_media_summaries = []
-project_restore_states = []
 
 
 def _uploaded_file_identity_v58(uploaded_file):
@@ -2432,7 +2334,6 @@ if uploaded_files:
         frames.extend(cached_bundle.get("frames", []))
         errors.extend(list(cached_bundle.get("errors", [])))
         zip_media_summaries.extend(list(cached_bundle.get("zip_media_summaries", [])))
-        project_restore_states.extend(list(cached_bundle.get("project_restore_states", [])))
     else:
         # A new upload invalidates merged data and prepared reports immediately.
         # This prevents stale large objects from accumulating across file changes.
@@ -2440,7 +2341,6 @@ if uploaded_files:
         parsed_frames = []
         parsed_errors = []
         parsed_zip_media_summaries = []
-        parsed_project_restore_states = []
         upload_progress = st.progress(0.0, text="Reading uploaded files...") if len(uploaded_files) > 1 else None
         for upload_order, f in enumerate(uploaded_files):
             try:
@@ -2467,16 +2367,6 @@ if uploaded_files:
                     for table_order, table in enumerate(parsed_tables):
                         if table is None or table.empty:
                             continue
-                        project_state = dict(getattr(table, "attrs", {}).get("dashboard_project_state", {}) or {})
-                        if project_state:
-                            project_state["_uploaded_file_name"] = str(f.name)
-                            project_state["_project_source_kind"] = str(
-                                getattr(table, "attrs", {}).get("dashboard_project_source_kind", project_state.get("source_kind", "dashboard_pdf"))
-                            )
-                            project_state["exact_restore"] = bool(
-                                getattr(table, "attrs", {}).get("dashboard_project_exact", project_state.get("exact_restore", False))
-                            )
-                            parsed_project_restore_states.append(project_state)
                         table = table.copy(deep=False)
                         table["_upload_order"] = int(upload_order)
                         table["_table_order"] = int(table_order)
@@ -2509,12 +2399,10 @@ if uploaded_files:
             "frames": parsed_frames,
             "errors": list(parsed_errors),
             "zip_media_summaries": list(parsed_zip_media_summaries),
-            "project_restore_states": list(parsed_project_restore_states),
         }
         frames.extend(parsed_frames)
         errors.extend(parsed_errors)
         zip_media_summaries.extend(parsed_zip_media_summaries)
-        project_restore_states.extend(parsed_project_restore_states)
         gc.collect()
 else:
     # Removing all uploads should also release the previous workbook data and
@@ -2561,29 +2449,6 @@ for _zip_status in zip_media_summaries:
 
 if errors:
     st.warning("Some files/messages were skipped or could not be parsed:\n\n" + "\n".join(f"- {e}" for e in errors))
-
-# A dashboard PDF can restore a closed browser/session. Apply the state on the
-# next rerun so theme and all other widget defaults are set before widgets are
-# instantiated. The parsed PDF data remains cached and is reused immediately.
-if continue_current_test and project_restore_states:
-    selected_project_state = sorted(
-        project_restore_states,
-        key=lambda item: (bool(item.get("exact_restore", False)), len(item.get("chart", {}).get("selected_features", []))),
-        reverse=True,
-    )[0]
-    restore_signature = hashlib.sha1(
-        json.dumps(selected_project_state, sort_keys=True, default=str, ensure_ascii=False).encode("utf-8")
-    ).hexdigest()
-    if st.session_state.get("_project_restore_applied_signature_v96") != restore_signature:
-        st.session_state["pending_project_restore_v96"] = {
-            "signature": restore_signature,
-            "state": selected_project_state,
-        }
-        st.rerun()
-
-_project_restore_message = st.session_state.pop("_project_restore_message_v96", "")
-if _project_restore_message:
-    st.success(_project_restore_message)
 
 def _continuation_compatible_v93(previous: pd.DataFrame, incoming: pd.DataFrame) -> bool:
     """Return True when a new upload can safely extend the current analysis."""
@@ -3727,11 +3592,6 @@ def convert_intervals_for_plot(operation_intervals, df, x_axis_mode):
     return converted
 
 
-# Keep the canonical, unconverted engineering data for resumable PDF exports.
-# This snapshot is attached only when the user prepares a PDF, so normal chart
-# interaction remains lightweight.
-project_source_data_v96 = data.copy(deep=False)
-
 # ---------------------------------------------------------------------------
 # Display-unit conversion (v58)
 # ---------------------------------------------------------------------------
@@ -3805,7 +3665,6 @@ if _has_choke_pct or _has_choke_size or _has_choke_ambiguous:
                 "Creates one choke curve. Percentage rows and /64-inch rows are converted "
                 "to the selected unit. Original uploaded columns remain unchanged."
             ),
-            key="choke_plot_mode_v96",
         )
         choke_full_open_64 = st.number_input(
             "Full-open choke size (/64 in)",
@@ -3814,7 +3673,6 @@ if _has_choke_pct or _has_choke_size or _has_choke_ambiguous:
             value=128.0,
             step=1.0,
             help="Calibration used for conversion. Default: 100% = 128/64 in; therefore 50% = 64/64 in.",
-            key="choke_full_open_64_v96",
         )
         if _has_choke_ambiguous:
             ambiguous_choke_unit = st.selectbox(
@@ -4007,7 +3865,6 @@ with st.sidebar.expander("4. Analysis View", expanded=True):
             "Test detail shows every reading inside a short test. Production history shows one stabilized "
             "value per test across months or years."
         ),
-        key="analysis_view_v96",
     )
 
     if analysis_view == "Production history":
@@ -4050,7 +3907,6 @@ with st.sidebar.expander("4. Analysis View", expanded=True):
             "X-axis display mode",
             ["Real calendar time", "Compressed real dates - remove empty gaps"],
             index=0,
-            key="x_axis_mode_v96",
         )
         if is_compressed_real_date_mode(x_axis_mode):
             continuous_gap_hours = st.number_input(
@@ -4059,7 +3915,6 @@ with st.sidebar.expander("4. Analysis View", expanded=True):
                 max_value=24.0,
                 value=2.0,
                 step=0.5,
-                key="continuous_gap_hours_v96",
             )
             compressed_gap_hours = st.number_input(
                 "Visual gap shown after long gaps (hours)",
@@ -4067,7 +3922,6 @@ with st.sidebar.expander("4. Analysis View", expanded=True):
                 max_value=12.0,
                 value=0.75,
                 step=0.25,
-                key="compressed_gap_hours_v96",
             )
         else:
             continuous_gap_hours = 2.0
@@ -4103,12 +3957,7 @@ with st.sidebar.expander("5. Wells & Signals", expanded=True):
             all_wells = sorted(well_df["well"].dropna().astype(str).unique())
     else:
         all_wells = []
-    _restored_wells_v96 = [w for w in st.session_state.get("selected_wells_v96", []) if w in all_wells]
-    if not _restored_wells_v96 and all_wells:
-        _restored_wells_v96 = all_wells[:1]
-    if st.session_state.get("selected_wells_v96") != _restored_wells_v96:
-        st.session_state["selected_wells_v96"] = _restored_wells_v96
-    selected_wells = st.multiselect("Choose wells", all_wells, key="selected_wells_v96")
+    selected_wells = st.multiselect("Choose wells", all_wells, default=all_wells[:1] if all_wells else [])
 
     # Test/period filtering removed from the sidebar.
     # Tests are still detected internally and shown in the data preview/export,
@@ -4176,12 +4025,9 @@ with st.sidebar.expander("5. Wells & Signals", expanded=True):
         sort_keys=True,
         ensure_ascii=False,
     )
-    _restored_title_v96 = st.session_state.pop("_restored_chart_title_pending_v96", None)
     if st.session_state.get(chart_header_selection_key) != selection_signature:
-        st.session_state[chart_header_key] = str(_restored_title_v96 or auto_chart_header)
+        st.session_state[chart_header_key] = auto_chart_header
         st.session_state[chart_header_selection_key] = selection_signature
-    elif _restored_title_v96:
-        st.session_state[chart_header_key] = str(_restored_title_v96)
     elif chart_header_key in st.session_state:
         old_header = str(st.session_state.get(chart_header_key, ""))
         st.session_state[chart_header_key] = re.sub(r"(?i)^well\s+well\s+", "Well ", old_header).strip()
@@ -4193,22 +4039,6 @@ with st.sidebar.expander("5. Wells & Signals", expanded=True):
     )
 
 with st.sidebar.expander("6. Chart Options", expanded=False):
-    _restored_y_ranges_v96 = st.session_state.pop("_restored_custom_y_ranges_pending_v96", None)
-    if isinstance(_restored_y_ranges_v96, dict) and _restored_y_ranges_v96:
-        if analysis_view == "Production history":
-            st.session_state["history_use_custom_y_scale"] = True
-            _y_prefix_min, _y_prefix_max = "history_ymin_", "history_ymax_"
-        else:
-            st.session_state["detail_use_custom_y_scale_v96"] = True
-            _y_prefix_min, _y_prefix_max = "ymin_", "ymax_"
-        for _feature, _limits in _restored_y_ranges_v96.items():
-            try:
-                if isinstance(_limits, (list, tuple)) and len(_limits) >= 2:
-                    st.session_state[_y_prefix_min + feature_key_text(_feature)] = float(_limits[0])
-                    st.session_state[_y_prefix_max + feature_key_text(_feature)] = float(_limits[1])
-            except Exception:
-                pass
-
     if analysis_view == "Production history":
         # Keep only the two controls that materially improve a long-term history:
         # optional Y-axis limits and sparse value labels.
@@ -4297,7 +4127,6 @@ with st.sidebar.expander("6. Chart Options", expanded=False):
                 "Use custom Y-axis ranges",
                 value=False,
                 help="Set min/max for each selected graph, e.g. Gross Rate from 0 to 1000.",
-                key="detail_use_custom_y_scale_v96",
             )
 
             if use_custom_y_scale and selected_features:
@@ -4344,7 +4173,6 @@ with st.sidebar.expander("6. Chart Options", expanded=False):
             ["Separate panels like report", "Overlay actual values"],
             index=0,
             help="Use separate panels for normal reports. Use overlay to compare actual values on one axis.",
-            key="plot_mode_v96",
         )
 
         # Optional combined dual-axis charts.  These do not replace the normal
@@ -4395,7 +4223,7 @@ with st.sidebar.expander("6. Chart Options", expanded=False):
         # Keep markers off automatically on large datasets for speed/readability, but allow the user to turn them on.
         estimated_points_for_speed = int(len(data)) if "data" in globals() else 0
         default_markers = estimated_points_for_speed <= 350
-        show_points = st.checkbox("Show markers", value=default_markers, key="show_points_v96")
+        show_points = st.checkbox("Show markers", value=default_markers)
 
         _vl1, _vl2 = st.columns([1.45, 0.85], gap="small")
         with _vl1:
@@ -4414,7 +4242,6 @@ with st.sidebar.expander("6. Chart Options", expanded=False):
                     "Clean readable keeps labels to important/non-crowded points. "
                     "Choose Every N readings and type the required spacing beside it."
                 ),
-                key="detail_value_label_mode_v96",
             )
         with _vl2:
             custom_value_label_step = int(st.number_input(
@@ -4492,13 +4319,14 @@ with st.sidebar.expander("7. Events & Notes", expanded=False):
         help="Used only when auto-hide is enabled.",
     )
 
-    if st.session_state.get("event_label_layout") == "Vertical labels":
-        st.session_state["event_label_layout"] = "Auto staggered"
     event_label_style = st.selectbox(
         "Event label layout",
-        ["Auto staggered", "Compact top labels"],
+        ["Auto staggered", "Vertical labels", "Compact top labels"],
         index=0,
-        help="Comments stay in a dedicated band above the chart so they cannot cover data values.",
+        help=(
+            "Notes stay inside the plot and remain tied to their exact times. "
+            "Auto staggered uses compact labels for a few notes and vertical labels when the chart is crowded."
+        ),
         key="event_label_layout",
     )
     enable_drag_annotations = st.checkbox(
@@ -4883,7 +4711,7 @@ if selected_features and not filtered.empty:
     x_axis_title = x_axis_title_from_mode(x_axis_mode)
 
     NOTE_COLOR_PALETTES = {
-        "Light": ["#111827", "#1F2937", "#243B53", "#374151"],
+        "Light": ["#A16207", "#007C91", "#C2410C", "#1D4ED8", "#15803D", "#7C3AED"],
         "Dark": ["#FFD166", "#66D9EF", "#FF8A72", "#8FE388", "#C9A7FF", "#F9A8D4"],
     }
 
@@ -5093,54 +4921,47 @@ if selected_features and not filtered.empty:
                     pass
         return fig
 
-    def _reserve_plotly_note_band(fig, interval_rows=0, event_rows=0):
-        """Reserve a dedicated band above the plot for comments.
+    def _inline_note_bg():
+        return "rgba(255,255,255,0.97)" if ACTIVE_THEME_NAME == "Light" else "rgba(8,20,29,0.94)"
 
-        Keeping note text outside the data area prevents comments from covering
-        value labels, peaks, or lines.  The band grows only when needed.
-        """
-        rows = max(0, int(interval_rows)) + max(0, int(event_rows))
-        if rows <= 0:
-            return fig
-        try:
-            current_top = int(fig.layout.margin.t or 120)
-        except Exception:
-            current_top = 120
-        required_top = min(520, max(current_top, 175 + rows * 38))
-        fig.update_layout(margin=dict(t=required_top))
-        return fig
+    def _inline_interval_y(level: int) -> float:
+        return max(0.70, 0.965 - 0.085 * min(int(level or 0), 3))
+
+    def _inline_event_y(level: int, vertical: bool, has_intervals: bool) -> float:
+        if vertical:
+            base = 0.84 if has_intervals else 0.92
+            return max(0.22, base - 0.095 * min(int(level or 0), 6))
+        base = 0.84 if has_intervals else 0.95
+        return max(0.30, base - 0.075 * min(int(level or 0), 7))
 
     def add_operation_intervals_to_plotly(fig, features):
-        fig = add_compressed_test_separators_to_plotly(fig, features)
+        """Draw interval boundaries and labels inside the plot, as in v92.
 
+        The interval label remains visually attached to its start/end times. Two
+        inward arrows form a clear <-> span while leaving the data region usable.
+        """
+        fig = add_compressed_test_separators_to_plotly(fig, features)
         intervals = visible_intervals_for_notes()
         if not intervals:
             return fig
 
-        interval_font_size, _ = adaptive_note_font_sizes(total_note_count(), mobile=(chart_view_mode == "Mobile-friendly"))
-        interval_rows = 1 + max(int(item.get("level", 0) or 0) for item in intervals)
-        _reserve_plotly_note_band(fig, interval_rows=interval_rows)
-
+        interval_font_size, _ = adaptive_note_font_sizes(
+            total_note_count(), mobile=(chart_view_mode == "Mobile-friendly")
+        )
         for idx, interval in enumerate(intervals):
-            x0 = interval["x0"]
-            x1 = interval["x1"]
-            label_html = interval.get("label_html") or compact_note_label(interval.get("label", ""))
+            x0, x1 = interval["x0"], interval["x1"]
             level = int(interval.get("level", 0) or 0)
             note_col = note_color(idx)
+            y_row = _inline_interval_y(level)
+            label = str(interval.get("label", "") or "").strip()
 
-            for x_val in [x0, x1]:
+            for x_val in (x0, x1):
                 try:
                     fig.add_shape(
-                        type="line",
-                        x0=x_val,
-                        x1=x_val,
-                        y0=0,
-                        y1=1,
-                        xref="x",
-                        yref="paper",
+                        type="line", x0=x_val, x1=x_val, y0=0, y1=1,
+                        xref="x", yref="paper",
                         line=dict(color=note_col, width=2.0, dash="dash"),
-                        opacity=0.82,
-                        layer="below",
+                        opacity=0.90, layer="above",
                     )
                 except Exception:
                     pass
@@ -5150,86 +4971,76 @@ if selected_features and not filtered.empty:
             except Exception:
                 x_mid = x0
 
+            # Two arrows, midpoint to each endpoint, create a true bidirectional span.
+            for x_tip in (x0, x1):
+                try:
+                    fig.add_annotation(
+                        x=x_tip, y=y_row, ax=x_mid, ay=y_row,
+                        xref="x", yref="paper", axref="x", ayref="paper",
+                        text="", showarrow=True, arrowhead=2, arrowsize=0.9,
+                        arrowwidth=1.8, arrowcolor=note_col, opacity=0.95,
+                    )
+                except Exception:
+                    pass
             try:
-                # Bottom-up note band: level 0 is closest to the plot; higher
-                # levels move upward, never down into data labels.
-                y_row = 1.035 + 0.065 * level
                 fig.add_annotation(
-                    x=x_mid,
-                    y=y_row,
-                    xref="x",
-                    yref="paper",
-                    text=f"<b>{label_html}</b>",
-                    showarrow=False,
-                    xanchor="center",
-                    yanchor="bottom",
-                    bgcolor=CHART_LEGEND_BG,
-                    bordercolor=note_col,
-                    borderwidth=1.3,
-                    borderpad=3,
+                    x=x_mid, y=min(0.995, y_row + 0.018),
+                    xref="x", yref="paper",
+                    text=f"<b>{label}</b>", showarrow=False,
+                    xanchor="center", yanchor="bottom",
+                    bgcolor=_inline_note_bg(), bordercolor=note_col,
+                    borderwidth=1.5, borderpad=3,
                     font=dict(size=interval_font_size, color=note_col),
-                    align="center",
                 )
             except Exception:
                 pass
         return fig
 
     def add_manual_events_to_plotly(fig, features):
+        """Draw point events inside the plot and stagger them away from data labels."""
         fig = add_operation_intervals_to_plotly(fig, features)
-
-        decorated_events = visible_events_for_notes(
+        events = visible_events_for_notes(
             x_values=(filtered["plot_x"] if "plot_x" in filtered.columns else None)
         )
-        if not decorated_events:
+        if not events:
             return fig
 
-        intervals = visible_intervals_for_notes()
-        interval_rows = 1 + max([int(item.get("level", 0) or 0) for item in intervals], default=-1)
-        event_rows = 1 + max(int(item.get("level", 0) or 0) for item in decorated_events)
-        _reserve_plotly_note_band(fig, interval_rows=interval_rows, event_rows=event_rows)
+        _, event_font_size = adaptive_note_font_sizes(
+            total_note_count(), mobile=(chart_view_mode == "Mobile-friendly")
+        )
+        has_intervals = bool(visible_intervals_for_notes())
+        auto_vertical = event_label_style == "Auto staggered" and total_note_count() >= 3
+        vertical = event_label_style == "Vertical labels" or auto_vertical
 
-        _, event_font_size = adaptive_note_font_sizes(total_note_count(), mobile=(chart_view_mode == "Mobile-friendly"))
-        for idx, event in enumerate(decorated_events):
+        for idx, event in enumerate(events):
             x = event["plot_x"]
-            label_html = event.get("label_html") or compact_note_label(event.get("label", ""))
             level = int(event.get("level", 0) or 0)
-            note_col = note_color(idx + len(intervals))
+            note_col = note_color(idx + len(plot_intervals or []))
+            label = str(event.get("label", "") or "").strip()
             try:
                 fig.add_shape(
-                    type="line",
-                    x0=x,
-                    x1=x,
-                    y0=0,
-                    y1=1,
-                    xref="x",
-                    yref="paper",
+                    type="line", x0=x, x1=x, y0=0, y1=1,
+                    xref="x", yref="paper",
                     line=dict(color=note_col, width=1.8, dash="dash"),
-                    opacity=0.68,
-                    layer="below",
+                    opacity=0.82, layer="above",
                 )
             except Exception:
                 pass
+
+            y_note = _inline_event_y(level, vertical=vertical, has_intervals=has_intervals)
+            text_angle = -90 if vertical else 0
+            x_anchor = "right" if vertical else "center"
+            y_anchor = "top" if vertical else "bottom"
+            if event_label_style == "Compact top labels" and not vertical:
+                y_note = max(0.35, y_note - 0.02)
             try:
-                y_note = 1.035 + 0.065 * (interval_rows + level)
-                text_angle = 0
-                x_anchor = "center"
-                compact_font = max(8, event_font_size - 1) if event_label_style == "Compact top labels" else event_font_size
                 fig.add_annotation(
-                    x=x,
-                    y=y_note,
-                    xref="x",
-                    yref="paper",
-                    text=f"<b>{label_html}</b>",
-                    showarrow=False,
-                    xanchor=x_anchor,
-                    yanchor="bottom",
-                    textangle=text_angle,
-                    font=dict(size=compact_font, color=note_col),
-                    bgcolor=CHART_LEGEND_BG,
-                    bordercolor=note_col,
-                    borderwidth=1.3,
-                    borderpad=3,
-                    align="center",
+                    x=x, y=y_note, xref="x", yref="paper",
+                    text=f"<b>{label}</b>", showarrow=False,
+                    xanchor=x_anchor, yanchor=y_anchor, textangle=text_angle,
+                    font=dict(size=event_font_size, color=note_col),
+                    bgcolor=_inline_note_bg(), bordercolor=note_col,
+                    borderwidth=1.4, borderpad=2, opacity=0.98,
                 )
             except Exception:
                 pass
@@ -5420,28 +5231,58 @@ if selected_features and not filtered.empty:
                     positions.append(float(n))
         return positions
 
+    def _value_label_context(g, feature):
+        gx = x_values(g.reset_index(drop=True))
+        xnums = pd.Series([_note_x_number(v) for v in gx], dtype="float64")
+        yvals = numeric_feature_series(g, feature, reset_index=True)
+        valid_x = xnums.dropna()
+        valid_y = yvals.dropna()
+        span_x = float(valid_x.max() - valid_x.min()) if not valid_x.empty else 1.0
+        if not np.isfinite(span_x) or span_x <= 0:
+            span_x = 1.0
+        span_y = float(valid_y.max() - valid_y.min()) if not valid_y.empty else 1.0
+        if not np.isfinite(span_y) or span_y <= 0:
+            span_y = max(abs(float(valid_y.iloc[0])) if not valid_y.empty else 1.0, 1.0)
+        return xnums, yvals, span_x, span_y
+
+    def _important_value_label_indices(g, feature):
+        n = len(g)
+        if n <= 0:
+            return set()
+        y = numeric_feature_series(g, feature, reset_index=True)
+        valid = y.dropna()
+        important = {0, n - 1}
+        if not valid.empty:
+            important.update({int(valid.idxmin()), int(valid.idxmax())})
+        return {i for i in important if 0 <= i < n}
+
     def _remove_value_labels_near_notes(g, idxs):
-        """Hide value labels close to note guide lines to prevent visual collisions."""
+        """Suppress only non-essential labels that sit directly on note guide lines.
+
+        First/last/min/max values remain available and are repositioned by the
+        interactive text-position logic. This keeps exports readable without
+        losing the most important engineering values.
+        """
         idxs = set(idxs or set())
         guards = _note_guard_positions()
         if not idxs or not guards or g is None or g.empty:
             return idxs
         try:
-            gx = x_values(g.reset_index(drop=True))
-            nums = pd.Series([_note_x_number(v) for v in gx], dtype="float64")
-            valid = nums.dropna()
-            if valid.empty:
-                return idxs
-            span = float(valid.max() - valid.min())
-            if not np.isfinite(span) or span <= 0:
-                span = max(abs(float(valid.iloc[0])), 1.0)
-            clearance = max(span * 0.018, 1e-9)
-            return {
-                i for i in idxs
-                if 0 <= i < len(nums)
-                and pd.notna(nums.iloc[i])
-                and all(abs(float(nums.iloc[i]) - guard) > clearance for guard in guards)
-            }
+            xnums, _, span_x, _ = _value_label_context(g, g.columns[-1] if len(g.columns) else "")
+            important = set()
+            # Preserve first/last by default; caller-specific extrema are normally
+            # already included and are retained unless the chart is extremely dense.
+            if len(g):
+                important.update({0, len(g) - 1})
+            exact_clearance = max(span_x * 0.006, 1e-9)
+            cleaned = set()
+            for i in idxs:
+                if i < 0 or i >= len(xnums) or pd.isna(xnums.iloc[i]):
+                    continue
+                nearest = min(abs(float(xnums.iloc[i]) - guard) for guard in guards)
+                if i in important or nearest > exact_clearance or len(idxs) <= 8:
+                    cleaned.add(i)
+            return cleaned
         except Exception:
             return idxs
 
@@ -5456,14 +5297,53 @@ if selected_features and not filtered.empty:
         else:
             idxs = label_indices(len(g), value_label_mode)
 
-        idxs = _remove_value_labels_near_notes(g, idxs)
         values = numeric_feature_series(g, feature, reset_index=True)
-        text = []
-        pos = []
+        xnums, yvals, span_x, span_y = _value_label_context(g, feature)
+        guards = _note_guard_positions()
+        important = _important_value_label_indices(g, feature)
+        clearance = max(span_x * 0.030, 1e-9)
+
+        interval_bounds = []
+        for interval in plot_intervals or []:
+            x0 = _note_x_number(interval.get("x0"))
+            x1 = _note_x_number(interval.get("x1"))
+            if pd.notna(x0) and pd.notna(x1):
+                interval_bounds.append((min(float(x0), float(x1)), max(float(x0), float(x1))))
+
+        text, pos = [], []
         position_cycle = ["top center", "bottom center", "middle right", "middle left"]
+        valid_y = yvals.dropna()
+        ymin = float(valid_y.min()) if not valid_y.empty else 0.0
+
         for i, v in enumerate(values):
-            text.append(format_plot_value(feature, v) if i in idxs else "")
-            pos.append(position_cycle[i % len(position_cycle)])
+            show = i in idxs
+            default_pos = position_cycle[i % len(position_cycle)]
+            chosen_pos = default_pos
+            if show and i < len(xnums) and pd.notna(xnums.iloc[i]):
+                xv = float(xnums.iloc[i])
+                nearest = min((abs(xv - guard) for guard in guards), default=float("inf"))
+                near_guide = nearest <= clearance
+                y_norm = 0.5
+                if i < len(yvals) and pd.notna(yvals.iloc[i]):
+                    y_norm = (float(yvals.iloc[i]) - ymin) / span_y
+                inside_interval = any(lo - clearance <= xv <= hi + clearance for lo, hi in interval_bounds)
+
+                # Keep first/last/min/max labels, but move them away from note boxes.
+                if near_guide:
+                    chosen_pos = "top right" if y_norm < 0.82 else "bottom right"
+                    # In very dense cases, suppress non-essential labels exactly on a guide line.
+                    if i not in important and nearest <= clearance * 0.22 and len(idxs) > 8:
+                        show = False
+                elif inside_interval and y_norm >= 0.78:
+                    # The interval arrow sits near the top of the plot. Put high values below their marker.
+                    chosen_pos = "bottom center"
+                elif y_norm >= 0.92:
+                    chosen_pos = "bottom center"
+                elif y_norm <= 0.08:
+                    chosen_pos = "top center"
+
+            text.append(format_plot_value(feature, v) if show else "")
+            pos.append(chosen_pos)
         return text, pos
 
     def padded_range(df, feature):
@@ -5716,8 +5596,8 @@ if selected_features and not filtered.empty:
                             name=plot_name,
                             legendgroup=plot_name,
                             showlegend=first_segment,
-                            line=dict(color=color, width=2.5, shape=("hv" if feature in {"choke_unified", "choke_pct", "choke_size_64", "choke_ambiguous"} else "linear")),
-                            marker=dict(color=color, size=7),
+                            line=dict(color=color, width=3.0, shape=("hv" if feature in {"choke_unified", "choke_pct", "choke_size_64", "choke_ambiguous"} else "linear")),
+                            marker=dict(color=color, size=8),
                         )
                     )
                     first_segment = False
@@ -5935,57 +5815,6 @@ if selected_features and not filtered.empty:
 
     render_section_title("Engineering Report Exports")
     st.caption(f"Downloads use the active {ACTIVE_THEME_NAME} theme.")
-    embed_resume_snapshot_v96 = st.checkbox(
-        "Make PDF resumable - embed data, chart settings, and events",
-        value=True,
-        key="embed_resume_snapshot_v96",
-        help=(
-            "A resumable PDF can be uploaded after closing the app to restore and extend the test. "
-            "Because it contains the underlying project data as an embedded attachment, treat it as confidential. "
-            "Turn this off for a presentation-only PDF."
-        ),
-    )
-
-    def current_project_state_v96():
-        return {
-            "schema_version": 1,
-            "source_kind": "embedded_project",
-            "exact_restore": True,
-            "app_build_id": APP_UI_BUILD_ID,
-            "parser_build_id": PARSER_BUILD_ID,
-            "exported_at": pd.Timestamp.utcnow().isoformat(),
-            "chart": {
-                "theme": ACTIVE_THEME_NAME,
-                "analysis_view": analysis_view,
-                "selected_wells": list(selected_wells),
-                "selected_features": list(selected_features),
-                "signal_order": list(selected_features),
-                "pressure_display_unit": pressure_display_unit,
-                "temperature_display_unit": temperature_display_unit,
-                "time_aggregation": time_aggregation,
-                "x_axis_scale": x_axis_scale,
-                "x_axis_mode": x_axis_mode,
-                "continuous_gap_hours": float(continuous_gap_hours),
-                "compressed_gap_hours": float(compressed_gap_hours),
-                "plot_mode": plot_mode,
-                "show_points": bool(show_points),
-                "value_label_mode": value_label_mode,
-                "value_label_step": int(custom_value_label_step),
-                "event_label_layout": event_label_style,
-                "chart_title": custom_chart_title,
-                "choke_plot_mode": choke_plot_mode,
-                "choke_full_open_64": float(choke_full_open_64),
-                "custom_y_ranges": custom_y_ranges,
-            },
-            "events": list(st.session_state.get("manual_events_table", [])),
-            "intervals": list(st.session_state.get("operation_intervals_table", [])),
-        }
-
-    def make_resumable_pdf_v96(raw_pdf_bytes):
-        if not embed_resume_snapshot_v96:
-            return raw_pdf_bytes
-        bundle = build_project_bundle(project_source_data_v96, current_project_state_v96())
-        return embed_project_bundle(raw_pdf_bytes, bundle)
 
     def chart_label_indices_for_export(g, feature):
         """Use the same readable label logic for exports as the interactive chart."""
@@ -6150,7 +5979,7 @@ if selected_features and not filtered.empty:
                 plt.close(fig_m)
 
         output.seek(0)
-        return make_resumable_pdf_v96(output.getvalue())
+        return output.getvalue()
 
     def human_readable_png_zip_bytes(df, features):
         """Create a ZIP containing one large PNG per selected feature."""
@@ -6315,17 +6144,11 @@ if selected_features and not filtered.empty:
         return note_event_levels(events, x_values=x_values, max_levels=max_levels)
 
     def _matplotlib_note_top_limit():
-        intervals = visible_intervals_for_notes()
-        events = visible_events_for_notes(
-            x_values=(filtered["plot_x"] if "plot_x" in filtered.columns else None)
-        )
-        interval_rows = 1 + max([int(item.get("level", 0) or 0) for item in intervals], default=-1)
-        event_rows = 1 + max([int(item.get("level", 0) or 0) for item in events], default=-1)
-        rows = interval_rows + event_rows
-        return max(0.62, 0.93 - 0.045 * rows)
+        # Notes are drawn inside the axes, so no large external note band is needed.
+        return 0.94
 
     def _apply_matplotlib_notes(ax, x_values=None):
-        """Draw notes in a dedicated band above the axes for clean exports."""
+        """Draw v92-style inline notes with stronger contrast and staggered placement."""
         _draw_all_test_separators_matplotlib(ax, filtered)
         note_count = total_note_count()
         interval_font_size, event_font_size = adaptive_note_font_sizes(
@@ -6333,73 +6156,58 @@ if selected_features and not filtered.empty:
         )
         intervals = visible_intervals_for_notes()
         events = visible_events_for_notes(x_values=x_values)
-        interval_rows = 1 + max([int(item.get("level", 0) or 0) for item in intervals], default=-1)
 
         for idx, interval in enumerate(intervals):
-            x0 = interval["x0"]
-            x1 = interval["x1"]
+            x0, x1 = interval["x0"], interval["x1"]
             level = int(interval.get("level", 0) or 0)
             note_col = note_color(idx)
-            ax.axvline(x0, color=note_col, linestyle="--", linewidth=1.6, alpha=0.72)
-            ax.axvline(x1, color=note_col, linestyle="--", linewidth=1.6, alpha=0.72)
+            ax.axvline(x0, color=note_col, linestyle="--", linewidth=1.8, alpha=0.92, zorder=10)
+            ax.axvline(x1, color=note_col, linestyle="--", linewidth=1.8, alpha=0.92, zorder=10)
             try:
                 x_mid = x0 + (x1 - x0) / 2
             except Exception:
                 x_mid = x0
-            y_frac = 1.035 + 0.085 * level
+            y_frac = max(0.70, 0.965 - 0.085 * min(level, 3))
             try:
                 ax.annotate(
-                    "",
-                    xy=(x1, y_frac),
-                    xytext=(x0, y_frac),
-                    xycoords=("data", "axes fraction"),
-                    textcoords=("data", "axes fraction"),
-                    arrowprops=dict(arrowstyle="<->", color=note_col, lw=1.5),
-                    annotation_clip=False,
+                    "", xy=(x1, y_frac), xytext=(x0, y_frac),
+                    xycoords=("data", "axes fraction"), textcoords=("data", "axes fraction"),
+                    arrowprops=dict(arrowstyle="<->", color=note_col, lw=1.8),
+                    annotation_clip=False, zorder=13,
                 )
             except Exception:
                 pass
-            clean_label = html.unescape(re.sub(r"<br>", "\n", interval.get("label_html") or compact_note_label(interval.get("label", ""))))
             ax.text(
-                x_mid,
-                y_frac + 0.012,
-                clean_label,
-                transform=ax.get_xaxis_transform(),
-                fontsize=interval_font_size,
-                fontweight="bold",
-                ha="center",
-                va="bottom",
-                color=note_col,
-                bbox=dict(boxstyle="round,pad=0.20", fc=EXPORT_LABEL_BG, ec=note_col, alpha=0.96),
-                clip_on=False,
+                x_mid, min(0.992, y_frac + 0.018), str(interval.get("label", "")),
+                transform=ax.get_xaxis_transform(), fontsize=interval_font_size,
+                fontweight="bold", ha="center", va="bottom", color=note_col,
+                bbox=dict(boxstyle="round,pad=0.22", fc=EXPORT_LABEL_BG, ec=note_col, alpha=0.98),
+                clip_on=False, zorder=14,
             )
 
+        auto_vertical = event_label_style == "Auto staggered" and total_note_count() >= 3
+        vertical = event_label_style == "Vertical labels" or auto_vertical
+        base_frac = 0.84 if intervals else 0.92
         for idx, event in enumerate(events):
             level = int(event.get("level", 0) or 0)
-            note_col = note_color(idx + len(intervals))
-            y_frac = 1.035 + 0.085 * (interval_rows + level)
-            ax.axvline(event["plot_x"], color=note_col, linestyle="--", linewidth=1.4, alpha=0.64)
-            rotation = 0
-            ha = "center"
+            note_col = note_color(idx + len(plot_intervals or []))
+            y_frac = max(0.22, base_frac - 0.095 * min(level, 6)) if vertical else max(0.30, base_frac - 0.075 * min(level, 7))
+            ax.axvline(event["plot_x"], color=note_col, linestyle="--", linewidth=1.6, alpha=0.86, zorder=10)
+            rotation = 90 if vertical else 0
+            ha = "right" if vertical else "center"
+            va = "top" if vertical else "bottom"
             try:
                 x_shift_points = float(event.get("x_shift_px", 0) or 0) * 0.5
             except Exception:
                 x_shift_points = 0
-            clean_label = html.unescape(re.sub(r"<br>", "\n", event.get("label_html") or compact_note_label(event.get("label", ""))))
             ax.annotate(
-                clean_label,
-                xy=(event["plot_x"], y_frac),
-                xycoords=("data", "axes fraction"),
-                xytext=(x_shift_points, 0),
-                textcoords="offset points",
-                rotation=rotation,
-                va="bottom",
-                ha=ha,
-                fontsize=event_font_size,
-                color=note_col,
-                bbox=dict(boxstyle="round,pad=0.15", fc=EXPORT_LABEL_BG, ec=note_col, alpha=0.90),
-                clip_on=False,
-                annotation_clip=False,
+                str(event.get("label", "")),
+                xy=(event["plot_x"], y_frac), xycoords=("data", "axes fraction"),
+                xytext=(x_shift_points, 0), textcoords="offset points",
+                rotation=rotation, va=va, ha=ha, fontsize=event_font_size,
+                fontweight="bold", color=note_col,
+                bbox=dict(boxstyle="round,pad=0.16", fc=EXPORT_LABEL_BG, ec=note_col, alpha=0.96),
+                clip_on=False, annotation_clip=False, zorder=14,
             )
 
     def matplotlib_overview_export_bytes(df, features, fmt="png"):
@@ -6507,8 +6315,7 @@ if selected_features and not filtered.empty:
             fig_m.savefig(output, format="png", dpi=320, bbox_inches="tight", facecolor=CHART_PAPER_BG, edgecolor=CHART_PAPER_BG)
         plt.close(fig_m)
         output.seek(0)
-        raw_bytes = output.getvalue()
-        return make_resumable_pdf_v96(raw_bytes) if fmt == "pdf" else raw_bytes
+        return output.getvalue()
 
     def human_readable_multi_png_bytes(df, features):
         """Create one PNG byte stream per selected feature for phone-friendly separate downloads."""
@@ -6607,13 +6414,12 @@ if selected_features and not filtered.empty:
         # Theme is part of every key. A Light export can therefore never remain
         # visible or downloadable after the user switches to Dark, or vice versa.
         theme_key = re.sub(r"[^a-z0-9]+", "_", ACTIVE_THEME_NAME.lower()).strip("_")
-        resume_key = "resumable" if embed_resume_snapshot_v96 else "presentation"
-        bkey = f"export_bytes_{export_key}_{theme_key}_{resume_key}"
-        ekey = f"export_error_{export_key}_{theme_key}_{resume_key}"
+        bkey = f"export_bytes_{export_key}_{theme_key}"
+        ekey = f"export_error_{export_key}_{theme_key}"
         st.session_state.setdefault(bkey, None)
         st.session_state.setdefault(ekey, "")
 
-        if st.button(f"Prepare {fmt_label} ({ACTIVE_THEME_NAME})", key=f"prepare_{export_key}_{theme_key}_{resume_key}"):
+        if st.button(f"Prepare {fmt_label} ({ACTIVE_THEME_NAME})", key=f"prepare_{export_key}_{theme_key}"):
             for _k in list(st.session_state.keys()):
                 if _k.startswith("export_bytes_") and _k != bkey:
                     st.session_state.pop(_k, None)
@@ -6642,7 +6448,7 @@ if selected_features and not filtered.empty:
                         data=data_bytes,
                         file_name=fname,
                         mime="image/png",
-                        key=f"download_{export_key}_{theme_key}_{resume_key}_{i}",
+                        key=f"download_{export_key}_{theme_key}_{i}",
                     )
             else:
                 st.download_button(
@@ -6650,7 +6456,7 @@ if selected_features and not filtered.empty:
                     data=prepared,
                     file_name=file_name,
                     mime=mime,
-                    key=f"download_{export_key}_{theme_key}_{resume_key}",
+                    key=f"download_{export_key}_{theme_key}",
                 )
 
     dl1, dl2 = st.columns(2)
@@ -6670,7 +6476,7 @@ if selected_features and not filtered.empty:
             "single_pdf",
             "single chart PDF",
             lambda: matplotlib_overview_export_bytes(filtered, selected_features, fmt="pdf"),
-            f"production_test_single_chart_{ACTIVE_THEME_NAME.lower()}_{'resumable' if embed_resume_snapshot_v96 else 'presentation'}.pdf",
+            f"production_test_single_chart_{ACTIVE_THEME_NAME.lower()}.pdf",
             "application/pdf",
         )
 
@@ -6688,7 +6494,7 @@ if selected_features and not filtered.empty:
             "multi_pdf",
             "multi-charts PDF",
             lambda: human_readable_pdf_bytes(filtered, selected_features),
-            f"production_test_multi_charts_{ACTIVE_THEME_NAME.lower()}_{'resumable' if embed_resume_snapshot_v96 else 'presentation'}.pdf",
+            f"production_test_multi_charts_{ACTIVE_THEME_NAME.lower()}.pdf",
             "application/pdf",
         )
 else:
