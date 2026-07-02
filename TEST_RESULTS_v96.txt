@@ -1,0 +1,53 @@
+Production Test Dashboard v96 validation
+========================================
+
+Build
+-----
+PASS - app.py Python compilation
+PASS - tmu_parser.py Python compilation
+PASS - project_resume.py Python compilation
+PASS - parser build ID: v96-resumable-pdf-project-20260702
+PASS - UI build ID: v96-resumable-pdf-project-20260702
+
+Exact resumable PDF round trip
+------------------------------
+PASS - Created a PDF project attachment containing data, settings, events and intervals
+PASS - Reopened the PDF and detected source_kind=embedded_project
+PASS - Restored datetime, numeric and text columns with the original values
+PASS - Restored chart settings and event records
+PASS - PDF pages remained visually unchanged after embedding the project
+       Render comparison at 140 dpi changed approximately 0.000000109 of page pixels
+       with a maximum channel difference of 7 (PDF rewrite/render rounding only)
+
+Older dashboard PDF recovery
+-----------------------------
+PASS - Supplied one-page dashboard PDF detected as a legacy dashboard project
+PASS - Recovered 13 timestamped readings
+PASS - Recovered 9 plotted engineering signals
+PASS - Recovered the actual well title from the PDF
+PASS - Recovered start: 2026-06-30 19:00
+PASS - Recovered end:   2026-07-02 10:00
+PASS - Recovered 2 point events
+PASS - Recovered 1 operation interval
+PASS - Recovered the Dark theme, compressed-date timeline and signal order
+PASS - Final visible values, including the final oil-rate label, were retained
+
+Continuation test
+-----------------
+PASS - Added two later readings at 11:00 and 12:00 to the recovered test
+PASS - Combined result increased from 13 to 15 timestamped rows
+PASS - The latest timestamp became 2026-07-02 12:00
+PASS - Existing events and operation interval remained in the restored project state
+
+Privacy and dependency checks
+-----------------------------
+PASS - Resumable export has a clear confidentiality warning and can be disabled
+PASS - Presentation-only PDF option returns a PDF without the embedded project
+PASS - pypdf and PyMuPDF are declared in requirements.txt
+PASS - Runtime source contains no built-in customer well or company examples
+
+Environment limitation
+----------------------
+A live Streamlit browser session was not available in this artifact environment.
+Compilation, parser integration, exact PDF round trip, legacy PDF extraction,
+continuation merge, attachment inspection and render comparison all passed.

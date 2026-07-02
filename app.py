@@ -72,6 +72,7 @@ assign_test_ids = getattr(_tmu_parser, "assign_test_ids", lambda df, gap_hours=1
 normalize_ctu_ocr_signals = getattr(_tmu_parser, "normalize_ctu_ocr_signals", lambda df: df)
 
 from history_analysis import build_production_history
+from project_resume import build_project_bundle, embed_project_bundle
 
 DISPLAY_LABEL_FILE = Path(__file__).with_name("user_display_labels.json")
 
@@ -381,8 +382,114 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_UI_BUILD_ID = "v95-v92-sidebar-scroll-20260702"
+APP_UI_BUILD_ID = "v96-resumable-pdf-project-20260702"
 print(f"Starting Production Test Dashboard: {APP_UI_BUILD_ID} | parser={PARSER_BUILD_ID}")
+
+
+def _merge_unique_project_records_v96(existing, incoming, fields):
+    merged = []
+    seen = set()
+    for record in list(existing or []) + list(incoming or []):
+        if not isinstance(record, dict):
+            continue
+        normalized = dict(record)
+        for field in ("datetime", "start", "end"):
+            if field in normalized and normalized[field] not in (None, ""):
+                try:
+                    normalized[field] = pd.Timestamp(normalized[field])
+                except Exception:
+                    pass
+        key = tuple(str(normalized.get(field, "")) for field in fields)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(normalized)
+    return merged
+
+
+def _apply_pending_project_restore_v96():
+    """Apply a saved PDF project before any Streamlit widgets are created."""
+    pending = st.session_state.pop("pending_project_restore_v96", None)
+    if not isinstance(pending, dict):
+        return
+    signature = str(pending.get("signature", ""))
+    state = pending.get("state", {})
+    if not isinstance(state, dict):
+        return
+    chart = state.get("chart", {}) if isinstance(state.get("chart"), dict) else {}
+
+    allowed = {
+        "ui_theme": chart.get("theme"),
+        "analysis_view_v96": chart.get("analysis_view"),
+        "selected_wells_v96": chart.get("selected_wells"),
+        "selected_features_v58": chart.get("selected_features"),
+        "plot_signal_order_v92_state": chart.get("signal_order") or chart.get("selected_features"),
+        "pressure_display_unit_v58": chart.get("pressure_display_unit"),
+        "temperature_display_unit_v58": chart.get("temperature_display_unit"),
+        "x_axis_mode_v96": chart.get("x_axis_mode"),
+        "continuous_gap_hours_v96": chart.get("continuous_gap_hours"),
+        "compressed_gap_hours_v96": chart.get("compressed_gap_hours"),
+        "plot_mode_v96": chart.get("plot_mode"),
+        "show_points_v96": chart.get("show_points"),
+        "event_label_layout": chart.get("event_label_layout"),
+        "choke_plot_mode_v96": chart.get("choke_plot_mode"),
+        "choke_full_open_64_v96": chart.get("choke_full_open_64"),
+        "continue_current_test_v93": True,
+    }
+    if str(chart.get("analysis_view", "")) == "Production history":
+        allowed["history_value_label_mode"] = chart.get("value_label_mode")
+        allowed["history_value_label_step"] = chart.get("value_label_step")
+    else:
+        allowed["detail_value_label_mode_v96"] = chart.get("value_label_mode")
+        allowed["detail_value_label_step"] = chart.get("value_label_step")
+    for key, value in allowed.items():
+        if value is not None:
+            st.session_state[key] = value
+
+    if chart.get("chart_title") not in (None, ""):
+        st.session_state["_restored_chart_title_pending_v96"] = str(chart.get("chart_title"))
+    restored_y_ranges = chart.get("custom_y_ranges")
+    if isinstance(restored_y_ranges, dict) and restored_y_ranges:
+        st.session_state["_restored_custom_y_ranges_pending_v96"] = restored_y_ranges
+
+    aggregation = str(chart.get("time_aggregation", "") or "")
+    if aggregation:
+        known = {"Raw data", "5 minutes", "15 minutes", "30 minutes", "1 hour", "6 hours", "1 day", "1 month", "1 year"}
+        if aggregation in known:
+            st.session_state["time_aggregation_interval_preset"] = aggregation
+        elif aggregation.startswith("Custom:"):
+            st.session_state["time_aggregation_interval_preset"] = "Custom"
+            st.session_state["time_aggregation_interval_custom_value"] = aggregation.split(":", 1)[1].strip()
+
+    tick_scale = str(chart.get("x_axis_scale", "") or "")
+    if tick_scale:
+        known = {"Auto readable", "30 minutes", "1 hour", "3 hours", "6 hours", "12 hours", "1 day", "1 month", "1 year"}
+        if tick_scale in known:
+            st.session_state["x_axis_tick_interval_preset"] = tick_scale
+        elif tick_scale.startswith("Custom:"):
+            st.session_state["x_axis_tick_interval_preset"] = "Custom"
+            st.session_state["x_axis_tick_interval_custom_value"] = tick_scale.split(":", 1)[1].strip()
+
+    st.session_state["manual_events_table"] = _merge_unique_project_records_v96(
+        st.session_state.get("manual_events_table", []),
+        state.get("events", []),
+        ("datetime", "label", "target"),
+    )
+    st.session_state["operation_intervals_table"] = _merge_unique_project_records_v96(
+        st.session_state.get("operation_intervals_table", []),
+        state.get("intervals", []),
+        ("start", "end", "label", "target"),
+    )
+    st.session_state["_project_restore_applied_signature_v96"] = signature
+    exact = bool(state.get("exact_restore", state.get("source_kind") == "embedded_project"))
+    st.session_state["_project_restore_message_v96"] = (
+        "Saved PDF project restored exactly: data, selected signals, chart settings, and events are ready to continue."
+        if exact else
+        "Older dashboard PDF recovered from its visible chart values and event markers. Upload the later readings to extend it."
+    )
+
+
+_apply_pending_project_restore_v96()
 
 UI_THEME_PRESETS = {
     "Light": {
@@ -2165,19 +2272,24 @@ Pumping P= 849 Psi""",
 
 with st.sidebar.expander("2. Processing", expanded=False):
     continue_current_test = st.checkbox(
-        "Continue current test with new uploads",
+        "Continue current test or resume saved PDF",
         value=True,
         key="continue_current_test_v93",
         help=(
-            "When a later file belongs to the same well/test, the app appends it to the current analysis, "
-            "removes overlapping duplicate timestamps, and keeps your selected signals and chart settings."
+            "During the current session, later files are appended automatically. After closing the app, upload a PDF "
+            "previously exported by this dashboard to restore its data, selected signals, chart settings, and events, "
+            "then upload the later readings."
         ),
     )
+    st.caption("To continue after closing the app, upload the saved dashboard PDF together with, or before, the new readings.")
     if st.button("Start a new analysis", key="start_new_analysis_v93", use_container_width=True):
         for _key in (
             "continued_test_data_v93", "continued_upload_signatures_v93", "continued_batch_v93",
             "upload_parse_key_v83", "upload_parse_bundle_v83", "combined_data_key_v83", "combined_data_bundle_v83",
             "manual_events_table", "operation_intervals_table",
+            "pending_project_restore_v96", "_project_restore_applied_signature_v96",
+            "_project_restore_message_v96", "_restored_chart_title_pending_v96",
+            "_restored_custom_y_ranges_pending_v96",
         ):
             st.session_state.pop(_key, None)
         st.session_state["uploader_generation_v93"] = _uploader_generation_v93 + 1
@@ -2283,6 +2395,7 @@ def load_uploaded_file_once(file_name: str, file_bytes: bytes, parse_images: boo
 frames = []
 errors = []
 zip_media_summaries = []
+project_restore_states = []
 
 
 def _uploaded_file_identity_v58(uploaded_file):
@@ -2319,6 +2432,7 @@ if uploaded_files:
         frames.extend(cached_bundle.get("frames", []))
         errors.extend(list(cached_bundle.get("errors", [])))
         zip_media_summaries.extend(list(cached_bundle.get("zip_media_summaries", [])))
+        project_restore_states.extend(list(cached_bundle.get("project_restore_states", [])))
     else:
         # A new upload invalidates merged data and prepared reports immediately.
         # This prevents stale large objects from accumulating across file changes.
@@ -2326,6 +2440,7 @@ if uploaded_files:
         parsed_frames = []
         parsed_errors = []
         parsed_zip_media_summaries = []
+        parsed_project_restore_states = []
         upload_progress = st.progress(0.0, text="Reading uploaded files...") if len(uploaded_files) > 1 else None
         for upload_order, f in enumerate(uploaded_files):
             try:
@@ -2352,6 +2467,16 @@ if uploaded_files:
                     for table_order, table in enumerate(parsed_tables):
                         if table is None or table.empty:
                             continue
+                        project_state = dict(getattr(table, "attrs", {}).get("dashboard_project_state", {}) or {})
+                        if project_state:
+                            project_state["_uploaded_file_name"] = str(f.name)
+                            project_state["_project_source_kind"] = str(
+                                getattr(table, "attrs", {}).get("dashboard_project_source_kind", project_state.get("source_kind", "dashboard_pdf"))
+                            )
+                            project_state["exact_restore"] = bool(
+                                getattr(table, "attrs", {}).get("dashboard_project_exact", project_state.get("exact_restore", False))
+                            )
+                            parsed_project_restore_states.append(project_state)
                         table = table.copy(deep=False)
                         table["_upload_order"] = int(upload_order)
                         table["_table_order"] = int(table_order)
@@ -2384,10 +2509,12 @@ if uploaded_files:
             "frames": parsed_frames,
             "errors": list(parsed_errors),
             "zip_media_summaries": list(parsed_zip_media_summaries),
+            "project_restore_states": list(parsed_project_restore_states),
         }
         frames.extend(parsed_frames)
         errors.extend(parsed_errors)
         zip_media_summaries.extend(parsed_zip_media_summaries)
+        project_restore_states.extend(parsed_project_restore_states)
         gc.collect()
 else:
     # Removing all uploads should also release the previous workbook data and
@@ -2434,6 +2561,29 @@ for _zip_status in zip_media_summaries:
 
 if errors:
     st.warning("Some files/messages were skipped or could not be parsed:\n\n" + "\n".join(f"- {e}" for e in errors))
+
+# A dashboard PDF can restore a closed browser/session. Apply the state on the
+# next rerun so theme and all other widget defaults are set before widgets are
+# instantiated. The parsed PDF data remains cached and is reused immediately.
+if continue_current_test and project_restore_states:
+    selected_project_state = sorted(
+        project_restore_states,
+        key=lambda item: (bool(item.get("exact_restore", False)), len(item.get("chart", {}).get("selected_features", []))),
+        reverse=True,
+    )[0]
+    restore_signature = hashlib.sha1(
+        json.dumps(selected_project_state, sort_keys=True, default=str, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    if st.session_state.get("_project_restore_applied_signature_v96") != restore_signature:
+        st.session_state["pending_project_restore_v96"] = {
+            "signature": restore_signature,
+            "state": selected_project_state,
+        }
+        st.rerun()
+
+_project_restore_message = st.session_state.pop("_project_restore_message_v96", "")
+if _project_restore_message:
+    st.success(_project_restore_message)
 
 def _continuation_compatible_v93(previous: pd.DataFrame, incoming: pd.DataFrame) -> bool:
     """Return True when a new upload can safely extend the current analysis."""
@@ -3577,6 +3727,11 @@ def convert_intervals_for_plot(operation_intervals, df, x_axis_mode):
     return converted
 
 
+# Keep the canonical, unconverted engineering data for resumable PDF exports.
+# This snapshot is attached only when the user prepares a PDF, so normal chart
+# interaction remains lightweight.
+project_source_data_v96 = data.copy(deep=False)
+
 # ---------------------------------------------------------------------------
 # Display-unit conversion (v58)
 # ---------------------------------------------------------------------------
@@ -3650,6 +3805,7 @@ if _has_choke_pct or _has_choke_size or _has_choke_ambiguous:
                 "Creates one choke curve. Percentage rows and /64-inch rows are converted "
                 "to the selected unit. Original uploaded columns remain unchanged."
             ),
+            key="choke_plot_mode_v96",
         )
         choke_full_open_64 = st.number_input(
             "Full-open choke size (/64 in)",
@@ -3658,6 +3814,7 @@ if _has_choke_pct or _has_choke_size or _has_choke_ambiguous:
             value=128.0,
             step=1.0,
             help="Calibration used for conversion. Default: 100% = 128/64 in; therefore 50% = 64/64 in.",
+            key="choke_full_open_64_v96",
         )
         if _has_choke_ambiguous:
             ambiguous_choke_unit = st.selectbox(
@@ -3850,6 +4007,7 @@ with st.sidebar.expander("4. Analysis View", expanded=True):
             "Test detail shows every reading inside a short test. Production history shows one stabilized "
             "value per test across months or years."
         ),
+        key="analysis_view_v96",
     )
 
     if analysis_view == "Production history":
@@ -3892,6 +4050,7 @@ with st.sidebar.expander("4. Analysis View", expanded=True):
             "X-axis display mode",
             ["Real calendar time", "Compressed real dates - remove empty gaps"],
             index=0,
+            key="x_axis_mode_v96",
         )
         if is_compressed_real_date_mode(x_axis_mode):
             continuous_gap_hours = st.number_input(
@@ -3900,6 +4059,7 @@ with st.sidebar.expander("4. Analysis View", expanded=True):
                 max_value=24.0,
                 value=2.0,
                 step=0.5,
+                key="continuous_gap_hours_v96",
             )
             compressed_gap_hours = st.number_input(
                 "Visual gap shown after long gaps (hours)",
@@ -3907,6 +4067,7 @@ with st.sidebar.expander("4. Analysis View", expanded=True):
                 max_value=12.0,
                 value=0.75,
                 step=0.25,
+                key="compressed_gap_hours_v96",
             )
         else:
             continuous_gap_hours = 2.0
@@ -3942,7 +4103,12 @@ with st.sidebar.expander("5. Wells & Signals", expanded=True):
             all_wells = sorted(well_df["well"].dropna().astype(str).unique())
     else:
         all_wells = []
-    selected_wells = st.multiselect("Choose wells", all_wells, default=all_wells[:1] if all_wells else [])
+    _restored_wells_v96 = [w for w in st.session_state.get("selected_wells_v96", []) if w in all_wells]
+    if not _restored_wells_v96 and all_wells:
+        _restored_wells_v96 = all_wells[:1]
+    if st.session_state.get("selected_wells_v96") != _restored_wells_v96:
+        st.session_state["selected_wells_v96"] = _restored_wells_v96
+    selected_wells = st.multiselect("Choose wells", all_wells, key="selected_wells_v96")
 
     # Test/period filtering removed from the sidebar.
     # Tests are still detected internally and shown in the data preview/export,
@@ -4010,9 +4176,12 @@ with st.sidebar.expander("5. Wells & Signals", expanded=True):
         sort_keys=True,
         ensure_ascii=False,
     )
+    _restored_title_v96 = st.session_state.pop("_restored_chart_title_pending_v96", None)
     if st.session_state.get(chart_header_selection_key) != selection_signature:
-        st.session_state[chart_header_key] = auto_chart_header
+        st.session_state[chart_header_key] = str(_restored_title_v96 or auto_chart_header)
         st.session_state[chart_header_selection_key] = selection_signature
+    elif _restored_title_v96:
+        st.session_state[chart_header_key] = str(_restored_title_v96)
     elif chart_header_key in st.session_state:
         old_header = str(st.session_state.get(chart_header_key, ""))
         st.session_state[chart_header_key] = re.sub(r"(?i)^well\s+well\s+", "Well ", old_header).strip()
@@ -4024,6 +4193,22 @@ with st.sidebar.expander("5. Wells & Signals", expanded=True):
     )
 
 with st.sidebar.expander("6. Chart Options", expanded=False):
+    _restored_y_ranges_v96 = st.session_state.pop("_restored_custom_y_ranges_pending_v96", None)
+    if isinstance(_restored_y_ranges_v96, dict) and _restored_y_ranges_v96:
+        if analysis_view == "Production history":
+            st.session_state["history_use_custom_y_scale"] = True
+            _y_prefix_min, _y_prefix_max = "history_ymin_", "history_ymax_"
+        else:
+            st.session_state["detail_use_custom_y_scale_v96"] = True
+            _y_prefix_min, _y_prefix_max = "ymin_", "ymax_"
+        for _feature, _limits in _restored_y_ranges_v96.items():
+            try:
+                if isinstance(_limits, (list, tuple)) and len(_limits) >= 2:
+                    st.session_state[_y_prefix_min + feature_key_text(_feature)] = float(_limits[0])
+                    st.session_state[_y_prefix_max + feature_key_text(_feature)] = float(_limits[1])
+            except Exception:
+                pass
+
     if analysis_view == "Production history":
         # Keep only the two controls that materially improve a long-term history:
         # optional Y-axis limits and sparse value labels.
@@ -4112,6 +4297,7 @@ with st.sidebar.expander("6. Chart Options", expanded=False):
                 "Use custom Y-axis ranges",
                 value=False,
                 help="Set min/max for each selected graph, e.g. Gross Rate from 0 to 1000.",
+                key="detail_use_custom_y_scale_v96",
             )
 
             if use_custom_y_scale and selected_features:
@@ -4158,6 +4344,7 @@ with st.sidebar.expander("6. Chart Options", expanded=False):
             ["Separate panels like report", "Overlay actual values"],
             index=0,
             help="Use separate panels for normal reports. Use overlay to compare actual values on one axis.",
+            key="plot_mode_v96",
         )
 
         # Optional combined dual-axis charts.  These do not replace the normal
@@ -4208,7 +4395,7 @@ with st.sidebar.expander("6. Chart Options", expanded=False):
         # Keep markers off automatically on large datasets for speed/readability, but allow the user to turn them on.
         estimated_points_for_speed = int(len(data)) if "data" in globals() else 0
         default_markers = estimated_points_for_speed <= 350
-        show_points = st.checkbox("Show markers", value=default_markers)
+        show_points = st.checkbox("Show markers", value=default_markers, key="show_points_v96")
 
         _vl1, _vl2 = st.columns([1.45, 0.85], gap="small")
         with _vl1:
@@ -4227,6 +4414,7 @@ with st.sidebar.expander("6. Chart Options", expanded=False):
                     "Clean readable keeps labels to important/non-crowded points. "
                     "Choose Every N readings and type the required spacing beside it."
                 ),
+                key="detail_value_label_mode_v96",
             )
         with _vl2:
             custom_value_label_step = int(st.number_input(
@@ -5747,6 +5935,57 @@ if selected_features and not filtered.empty:
 
     render_section_title("Engineering Report Exports")
     st.caption(f"Downloads use the active {ACTIVE_THEME_NAME} theme.")
+    embed_resume_snapshot_v96 = st.checkbox(
+        "Make PDF resumable - embed data, chart settings, and events",
+        value=True,
+        key="embed_resume_snapshot_v96",
+        help=(
+            "A resumable PDF can be uploaded after closing the app to restore and extend the test. "
+            "Because it contains the underlying project data as an embedded attachment, treat it as confidential. "
+            "Turn this off for a presentation-only PDF."
+        ),
+    )
+
+    def current_project_state_v96():
+        return {
+            "schema_version": 1,
+            "source_kind": "embedded_project",
+            "exact_restore": True,
+            "app_build_id": APP_UI_BUILD_ID,
+            "parser_build_id": PARSER_BUILD_ID,
+            "exported_at": pd.Timestamp.utcnow().isoformat(),
+            "chart": {
+                "theme": ACTIVE_THEME_NAME,
+                "analysis_view": analysis_view,
+                "selected_wells": list(selected_wells),
+                "selected_features": list(selected_features),
+                "signal_order": list(selected_features),
+                "pressure_display_unit": pressure_display_unit,
+                "temperature_display_unit": temperature_display_unit,
+                "time_aggregation": time_aggregation,
+                "x_axis_scale": x_axis_scale,
+                "x_axis_mode": x_axis_mode,
+                "continuous_gap_hours": float(continuous_gap_hours),
+                "compressed_gap_hours": float(compressed_gap_hours),
+                "plot_mode": plot_mode,
+                "show_points": bool(show_points),
+                "value_label_mode": value_label_mode,
+                "value_label_step": int(custom_value_label_step),
+                "event_label_layout": event_label_style,
+                "chart_title": custom_chart_title,
+                "choke_plot_mode": choke_plot_mode,
+                "choke_full_open_64": float(choke_full_open_64),
+                "custom_y_ranges": custom_y_ranges,
+            },
+            "events": list(st.session_state.get("manual_events_table", [])),
+            "intervals": list(st.session_state.get("operation_intervals_table", [])),
+        }
+
+    def make_resumable_pdf_v96(raw_pdf_bytes):
+        if not embed_resume_snapshot_v96:
+            return raw_pdf_bytes
+        bundle = build_project_bundle(project_source_data_v96, current_project_state_v96())
+        return embed_project_bundle(raw_pdf_bytes, bundle)
 
     def chart_label_indices_for_export(g, feature):
         """Use the same readable label logic for exports as the interactive chart."""
@@ -5911,7 +6150,7 @@ if selected_features and not filtered.empty:
                 plt.close(fig_m)
 
         output.seek(0)
-        return output.getvalue()
+        return make_resumable_pdf_v96(output.getvalue())
 
     def human_readable_png_zip_bytes(df, features):
         """Create a ZIP containing one large PNG per selected feature."""
@@ -6268,7 +6507,8 @@ if selected_features and not filtered.empty:
             fig_m.savefig(output, format="png", dpi=320, bbox_inches="tight", facecolor=CHART_PAPER_BG, edgecolor=CHART_PAPER_BG)
         plt.close(fig_m)
         output.seek(0)
-        return output.getvalue()
+        raw_bytes = output.getvalue()
+        return make_resumable_pdf_v96(raw_bytes) if fmt == "pdf" else raw_bytes
 
     def human_readable_multi_png_bytes(df, features):
         """Create one PNG byte stream per selected feature for phone-friendly separate downloads."""
@@ -6367,12 +6607,13 @@ if selected_features and not filtered.empty:
         # Theme is part of every key. A Light export can therefore never remain
         # visible or downloadable after the user switches to Dark, or vice versa.
         theme_key = re.sub(r"[^a-z0-9]+", "_", ACTIVE_THEME_NAME.lower()).strip("_")
-        bkey = f"export_bytes_{export_key}_{theme_key}"
-        ekey = f"export_error_{export_key}_{theme_key}"
+        resume_key = "resumable" if embed_resume_snapshot_v96 else "presentation"
+        bkey = f"export_bytes_{export_key}_{theme_key}_{resume_key}"
+        ekey = f"export_error_{export_key}_{theme_key}_{resume_key}"
         st.session_state.setdefault(bkey, None)
         st.session_state.setdefault(ekey, "")
 
-        if st.button(f"Prepare {fmt_label} ({ACTIVE_THEME_NAME})", key=f"prepare_{export_key}_{theme_key}"):
+        if st.button(f"Prepare {fmt_label} ({ACTIVE_THEME_NAME})", key=f"prepare_{export_key}_{theme_key}_{resume_key}"):
             for _k in list(st.session_state.keys()):
                 if _k.startswith("export_bytes_") and _k != bkey:
                     st.session_state.pop(_k, None)
@@ -6401,7 +6642,7 @@ if selected_features and not filtered.empty:
                         data=data_bytes,
                         file_name=fname,
                         mime="image/png",
-                        key=f"download_{export_key}_{theme_key}_{i}",
+                        key=f"download_{export_key}_{theme_key}_{resume_key}_{i}",
                     )
             else:
                 st.download_button(
@@ -6409,7 +6650,7 @@ if selected_features and not filtered.empty:
                     data=prepared,
                     file_name=file_name,
                     mime=mime,
-                    key=f"download_{export_key}_{theme_key}",
+                    key=f"download_{export_key}_{theme_key}_{resume_key}",
                 )
 
     dl1, dl2 = st.columns(2)
@@ -6429,7 +6670,7 @@ if selected_features and not filtered.empty:
             "single_pdf",
             "single chart PDF",
             lambda: matplotlib_overview_export_bytes(filtered, selected_features, fmt="pdf"),
-            f"production_test_single_chart_{ACTIVE_THEME_NAME.lower()}.pdf",
+            f"production_test_single_chart_{ACTIVE_THEME_NAME.lower()}_{'resumable' if embed_resume_snapshot_v96 else 'presentation'}.pdf",
             "application/pdf",
         )
 
@@ -6447,7 +6688,7 @@ if selected_features and not filtered.empty:
             "multi_pdf",
             "multi-charts PDF",
             lambda: human_readable_pdf_bytes(filtered, selected_features),
-            f"production_test_multi_charts_{ACTIVE_THEME_NAME.lower()}.pdf",
+            f"production_test_multi_charts_{ACTIVE_THEME_NAME.lower()}_{'resumable' if embed_resume_snapshot_v96 else 'presentation'}.pdf",
             "application/pdf",
         )
 else:
