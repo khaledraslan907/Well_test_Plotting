@@ -396,7 +396,7 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_UI_BUILD_ID = "v97-portable-pdf-v92-events-20260702"
+APP_UI_BUILD_ID = "v98-legacy-vector-pdf-recovery-20260702"
 print(f"Starting Production Test Dashboard: {APP_UI_BUILD_ID} | parser={PARSER_BUILD_ID}")
 
 PORTABLE_STATE_MAGIC = "CORELYTIX_PRODUCTION_TEST_ANALYSIS"
@@ -677,6 +677,65 @@ def apply_portable_state_to_session(portable: dict, signature: str) -> bool:
         f"Restored {len(events)} point event(s), {len(intervals)} interval event(s), and the saved theme."
     )
     return True
+
+
+def apply_legacy_dashboard_state_to_session(state: dict, signature: str) -> bool:
+    """Restore theme, events, title and curve order recovered from a pre-v97 PDF."""
+    if not state or st.session_state.get("_legacy_dashboard_state_applied_v98") == signature:
+        return False
+
+    theme = str(state.get("theme") or "")
+    if theme in {"Light", "Dark"}:
+        st.session_state["ui_theme"] = theme
+
+    features = [str(x) for x in (state.get("selected_features") or []) if str(x)]
+    if features:
+        st.session_state["selected_features_v58"] = features
+        st.session_state["plot_signal_order_v92_state"] = features
+
+    well = str(state.get("well") or "").strip()
+    if well:
+        st.session_state["selected_wells_v97"] = [well]
+
+    st.session_state["analysis_view_v97"] = "Test detail"
+    x_mode = str(state.get("x_axis_mode") or "")
+    if x_mode in {"Real calendar time", "Compressed real dates - remove empty gaps"}:
+        st.session_state["x_axis_mode_v97"] = x_mode
+    st.session_state["event_label_layout"] = "Auto staggered"
+
+    events = []
+    for item in state.get("manual_events", []) or []:
+        if not isinstance(item, dict):
+            continue
+        restored = dict(item)
+        if restored.get("datetime"):
+            restored["datetime"] = pd.Timestamp(restored["datetime"])
+        events.append(restored)
+    intervals = []
+    for item in state.get("operation_intervals", []) or []:
+        if not isinstance(item, dict):
+            continue
+        restored = dict(item)
+        if restored.get("start"):
+            restored["start"] = pd.Timestamp(restored["start"])
+        if restored.get("end"):
+            restored["end"] = pd.Timestamp(restored["end"])
+        intervals.append(restored)
+    st.session_state["manual_events_table"] = events
+    st.session_state["operation_intervals_table"] = intervals
+
+    title = str(state.get("chart_title") or "").strip()
+    if title:
+        st.session_state["portable_chart_title_v97"] = title
+        st.session_state["portable_pdf_signature_v97"] = signature
+
+    st.session_state["_legacy_dashboard_state_applied_v98"] = signature
+    st.session_state["_portable_state_notice_v97"] = (
+        f"Recovered the older dashboard PDF from vector chart data: {len(features)} signal(s), "
+        f"{len(events)} point event(s), {len(intervals)} interval event(s), and the {theme or 'saved'} theme."
+    )
+    return True
+
 
 UI_THEME_PRESETS = {
     "Light": {
@@ -2478,6 +2537,7 @@ with st.sidebar.expander("2. Processing", expanded=False):
             "portable_pdf_data_v97", "portable_pdf_signature_v97",
             "portable_chart_title_v97", "_portable_state_applied_v97",
             "_portable_title_applied_token_v97", "_legacy_pdf_theme_applied_v97",
+            "_legacy_dashboard_state_applied_v98",
         ):
             st.session_state.pop(_key, None)
         st.session_state["uploader_generation_v93"] = _uploader_generation_v93 + 1
@@ -2669,7 +2729,7 @@ if uploaded_files:
                                     st.session_state["_legacy_pdf_theme_applied_v97"] = _legacy_signature
                                     st.session_state["_portable_state_notice_v97"] = (
                                         f"Detected the {_legacy_theme} theme from an older dashboard PDF. "
-                                        "Exact event recovery requires a PDF exported by v97 or later."
+                                        "The app will also attempt vector recovery of its readings and events."
                                     )
                                     st.rerun()
                         except Exception:
@@ -2677,6 +2737,17 @@ if uploaded_files:
                     parsed_tables = load_uploaded_file_once(
                         f.name, file_bytes, _parse_images_for_file, int(max_ocr_images), PARSER_BUILD_ID
                     )
+                    if _suffix == ".pdf" and parsed_tables:
+                        _legacy_state = None
+                        for _legacy_table in parsed_tables:
+                            if isinstance(_legacy_table, pd.DataFrame):
+                                _legacy_state = (_legacy_table.attrs or {}).get("legacy_dashboard_state")
+                                if _legacy_state:
+                                    break
+                        if _legacy_state:
+                            _legacy_signature = hashlib.sha1(file_bytes).hexdigest()
+                            if apply_legacy_dashboard_state_to_session(_legacy_state, _legacy_signature):
+                                st.rerun()
                 if _zip_media_summary is not None:
                     _zip_media_summary["ocr_rows"] = int(sum(
                         table.get("source_type", pd.Series(dtype=str)).astype(str).str.contains("ocr", case=False, na=False).sum()

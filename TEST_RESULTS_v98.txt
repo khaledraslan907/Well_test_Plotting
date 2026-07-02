@@ -1,0 +1,54 @@
+Production Test Dashboard v98 validation
+========================================
+
+Build IDs
+---------
+UI:     v98-legacy-vector-pdf-recovery-20260702
+Parser: v98-legacy-vector-pdf-recovery-20260702
+
+Compilation
+-----------
+PASS - app.py
+PASS - tmu_parser.py
+PASS - tmu_parser_compat.py
+PASS - tmu_parser_legacy.py
+PASS - smart_tabular_v75.py
+PASS - history_analysis.py
+PASS - legacy_dashboard_pdf.py
+
+Supplied legacy PDF
+-------------------
+PASS - BED-3-C18-7 Test Resuts(2).pdf recognized as a Matplotlib vector dashboard
+PASS - generic "No usable time-series table" failure removed
+PASS - 42 timestamped readings recovered
+PASS - first timestamp: 30-Jun-2026 19:00
+PASS - last timestamp: 02-Jul-2026 10:00
+PASS - well restored as B3C18-7
+PASS - Dark theme restored
+PASS - 9 plotted engineering signals recovered
+PASS - SIWHP 3300 PSI point event restored
+PASS - SIWHP 3100 PSI point event restored
+PASS - Closed the Well interval restored: 30-Jun-2026 20:30 to 01-Jul-2026 13:00
+PASS - no OCR used
+PASS - engineering liquid balance remains consistent within chart/source rounding
+PASS - parser review_required is false for recovered rows
+
+Synthetic vector-PDF regression
+-------------------------------
+PASS - dark Matplotlib dashboard generated without embedded attachment
+PASS - vector curves converted back to numeric readings
+PASS - compressed timestamp mapping restored
+PASS - point events and interval recovered
+PASS - facade load_tabular_file returns the recovered table
+
+Preserved v97 functionality
+---------------------------
+PASS - safe portable PDF state attachment round-trip
+PASS - saved theme/events/intervals/title/features/data restore
+PASS - v92-style inline horizontal Auto staggered events retained
+PASS - smart default Y-axis ranges retained
+PASS - continuation overlap retains newest uploaded value
+
+Environment limitation
+----------------------
+A live Streamlit browser session was unavailable because Streamlit is not installed in the validation container. Python compilation, parser execution, portable-PDF tests, vector-PDF tests, state restoration code checks, axis tests and continuation tests passed.

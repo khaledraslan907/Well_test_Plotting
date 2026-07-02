@@ -24,7 +24,7 @@ import pandas as pd
 import tmu_parser_compat as compat
 import smart_tabular_v75 as smart
 
-PARSER_BUILD_ID = "v91-ocr-continuity-canonical-pressure-20260628"
+PARSER_BUILD_ID = "v98-legacy-vector-pdf-recovery-20260702"
 
 COLUMN_LABELS: Dict[str, str] = dict(getattr(compat, "COLUMN_LABELS", {}))
 COLUMN_LABELS.update({
@@ -676,6 +676,28 @@ def _zip_member_is_chat_text(member_name: str, payload: bytes) -> bool:
 def load_tabular_file(uploaded_file, parse_images: bool = True, max_ocr_images: int = 1000) -> List[pd.DataFrame]:
     data, name = _bytes_and_name(uploaded_file)
     suffix = Path(name).suffix.lower()
+
+    # Older dashboard exports are vector charts rather than tabular PDFs. Read
+    # their Matplotlib paths directly before delegating to generic PDF tables.
+    if suffix == ".pdf":
+        try:
+            from legacy_dashboard_pdf import recover_legacy_dashboard_pdf
+            recovered = recover_legacy_dashboard_pdf(data, name)
+        except Exception:
+            recovered = None
+        if recovered is not None:
+            frame = recovered.get("data")
+            if isinstance(frame, pd.DataFrame) and not frame.empty:
+                frame = frame.copy(deep=False)
+                frame.attrs["legacy_dashboard_state"] = {
+                    key: recovered.get(key)
+                    for key in [
+                        "theme", "manual_events", "operation_intervals",
+                        "selected_features", "chart_title", "well", "x_axis_mode",
+                        "recovery_build_id",
+                    ]
+                }
+                return [assign_test_ids(_safe_postprocess(frame))]
 
     # Handle WhatsApp ZIP exports explicitly.  A valid export may contain only
     # ``_chat.txt`` and an unsupported audio file, so the chat must be parsed
